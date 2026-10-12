@@ -100,6 +100,19 @@ class TestWorkflow(unittest.TestCase):
         self.service.refresh_status()
         self.assertEqual(self.service.status["scratch_cleanup"]["removed"], 1)
 
+    def test_backend_reconnect_backoff_does_not_prevent_scratch_cleanup(self):
+        job = self.job()
+        directory = self.service.job_dir(job) / "attempt-1"
+        (directory / "tmp").mkdir(parents=True)
+        (directory / "tmp/cache").write_text("disposable")
+        self.store.update(job["id"], state="done")
+        self.service.backend = Mock(dead=True)
+        self.service.cooldown = time.monotonic() + 60
+        with patch("mo_bot.artifacts.referenced_jobs", return_value=set()):
+            self.service.tick()
+            self.service.artifacts.future.result(timeout=5)
+        self.assertFalse((directory / "tmp").exists())
+
     def test_repeated_scan_unique_and_newer_commit_supersedes(self):
         snap = {
             "heads": {"1": "a" * 40},

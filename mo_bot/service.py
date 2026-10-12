@@ -1397,6 +1397,17 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
         self.harness.poll()
         if self.stopping:
             return
+        # Maintenance must not depend on Codex being available: reclaiming disk
+        # may itself be necessary to start/recover the backend.
+        try:
+            if self.artifacts.due():
+                self.artifacts.poll(
+                    self.store.jobs(("done", "failed", "superseded")),
+                    {key for _, key in self.turns.values() if key},
+                )
+        except (OSError, ValueError) as error:
+            self.artifacts.status["errors"] = [str(error)]
+            LOG.warning("scratch cleanup deferred: %s", error)
         if not self.backend or self.backend.dead:
             if self.backend:
                 for turn, _ in self.turns.values():
@@ -1444,17 +1455,6 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
                 )
                 turn.stop()
             self.finish(slot_id, turn, key)
-        # Includes restart leftovers and newly terminal jobs; runs even while
-        # dispatch is drained or low disk prevents launching additional work.
-        try:
-            if self.artifacts.due():
-                self.artifacts.poll(
-                    self.store.jobs(("done", "failed", "superseded")),
-                    {key for _, key in self.turns.values() if key},
-                )
-        except (OSError, ValueError) as error:
-            self.artifacts.status["errors"] = [str(error)]
-            LOG.warning("scratch cleanup deferred: %s", error)
         if self.dispatch_control["paused"] or self.stopping:
             return
         if time.monotonic() >= self.next_scan:
