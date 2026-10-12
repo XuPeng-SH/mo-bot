@@ -1,0 +1,31 @@
+[service]
+id = "mo-bot-local"
+state_dir = "/home/xupeng/.local/state/mo-bot"
+poll_seconds = 60
+
+[review]
+repository = "matrixorigin/matrixone"
+reviewer = "XuPeng-SH"
+source_dir = "/home/xupeng/matrixone"
+queue_script = "/home/xupeng/.codex/skills/mo-pr-review-queue/scripts/list_review_queue.py"
+sessions = 2
+model = "gpt-6.1-sol"
+reasoning_effort = "xhigh"
+exclude = [26145]
+stale_ci_days = 14
+max_recoveries = 2
+job_timeout_seconds = 7200
+command_timeout_seconds = 45
+minimum_free_gib = 20
+codex = "/home/xupeng/.local/bin/codex"
+gh = "/bin/gh"
+
+[api]
+host = "127.0.0.1"
+port = 8989
+
+# Optional creation defaults for individual slots. SQLite preserves later API changes.
+# [[session]]
+# slot = 0
+# model = "gpt-6.1-sol"
+# reasoning_effort = "xhigh"

@@ -1,0 +1,1 @@
+../.agents/skills/mo-bot-service/references/api.md
