@@ -460,29 +460,6 @@ class TestWorker(unittest.TestCase):
         self.ws.worker_rebase.assert_not_called()
         self.assertEqual(self.s.backend.start.call_args.args[0]["effort"], "xhigh")
 
-    def test_blocked_implementation_preserves_source_and_can_resume(self):
-        job = self.phase(self.job())
-        job = self.phase(self.s.store.claim(2))
-        self.s.turns.clear()
-        self.s.backend.start.return_value.completed = True
-        job = self.phase(
-            self.s.store.claim(2),
-            classification="blocked",
-            accepted=False,
-            summary="temporarily unavailable native dependency",
-        )
-        self.assertEqual(job["state"], "failed")
-        self.ws.archive_worker.assert_called_once()
-        self.assertIn("workspace_archive", json.loads(job["data"]))
-        self.s.turns.clear()
-        self.s.command("retry_job", {"job_id": job["id"]})
-        updated = self.s.store.job(job["id"])
-        self.assertEqual(updated["state"], "queued")
-        self.assertEqual(updated["phase"], "implement")
-        self.ws.restore_worker.assert_called_once()
-        self.assertEqual(updated["slot_id"], self.slot["id"])
-        self.assertEqual(updated["comment_id"], job["comment_id"])
-
     def test_from_input_reenters_same_failed_job_without_resetting_lifetime_attempts(
         self,
     ):
@@ -645,7 +622,10 @@ class TestWorker(unittest.TestCase):
             accepted=False,
             summary="CI cause unknown",
         )
-        self.assertEqual(job["state"], "failed")
+        self.assertEqual((job["state"], job["phase"]), ("queued", "design"))
+        self.assertIn(
+            "CI cause unknown", json.loads(job["data"])["coordinator_feedback"]
+        )
         self.assertFalse(self.gh.writes)
         self.ws.worker_finalize.assert_not_called()
 
@@ -746,6 +726,82 @@ class TestWorker(unittest.TestCase):
         self.assertEqual((job["state"], job["phase"]), ("queued", "implement"))
         self.assertEqual(json.loads(job["data"])["correction_stalls"], 0)
         self.assertIsNone(job["error"])
+        self.assertFalse(self.gh.writes)
+
+    def test_incomplete_design_continues_its_gate_with_feedback(self):
+        self.phase(self.job())
+        job = self.phase(
+            self.s.store.claim(2),
+            classification="blocked",
+            accepted=False,
+            validation_complete=False,
+            summary="Need an isolated SQL fixture plan",
+            limitations=["Port owned by unrelated process"],
+        )
+        self.assertEqual((job["state"], job["phase"]), ("queued", "design"))
+        self.w.launch(self.slot, self.s.store.claim(2))
+        prompt = self.s.backend.start.call_args.args[3]
+        self.assertIn("Need an isolated SQL fixture plan", prompt)
+        self.assertIn("Port owned by unrelated process", prompt)
+        self.ws.worker_finalize.assert_not_called()
+        self.assertFalse(self.gh.writes)
+
+    def test_blocked_implementation_preserves_edits_backs_off_and_resumes(self):
+        self.phase(self.job())
+        self.phase(self.s.store.claim(2))
+        job = self.s.store.claim(2)
+        self.w.launch(self.slot, job)
+        job = self.s.store.job(job["id"])
+        before = self.ws.worker_state.return_value
+        self.ws.worker_state.return_value = {
+            **before,
+            "source": "uncommitted-fix",
+            "status": " M source.py",
+        }
+        blocked = dict(
+            classification="blocked",
+            accepted=False,
+            validation_complete=False,
+            summary="Complete remaining SQL controls",
+            limitations=["Full SQL suite unexecuted"],
+        )
+        self.w.consume(
+            job, self.slot, result(job, before, **blocked), "gpt-6.1-sol", "low"
+        )
+        job = self.s.store.job(job["id"])
+        self.assertEqual((job["state"], job["phase"]), ("queued", "implement"))
+        self.ws.worker_finalize.assert_not_called()
+        self.ws.archive_worker.assert_not_called()
+
+        job = self.phase(self.s.store.claim(2), **blocked)
+        self.assertEqual((job["state"], job["slot_id"]), ("queued", None))
+        self.assertGreater(job["retry_at"], time.time())
+        self.assertIsNone(self.s.store.claim(2))
+        self.ws.archive_worker.assert_called_once()
+        self.assertIn("workspace_archive", json.loads(job["data"]))
+        self.assertFalse(self.gh.writes)
+
+        self.s.store.update(job["id"], retry_at=0)
+        job = self.s.store.claim(2)
+        self.w.launch(self.slot, job)
+        self.ws.restore_worker.assert_called_once()
+        self.assertIn(
+            "Full SQL suite unexecuted", self.s.backend.start.call_args.args[3]
+        )
+        job = self.s.store.job(job["id"])
+        before = self.ws.worker_state.return_value
+        self.ws.worker_state.return_value = {**before, "source": "further-fix"}
+        self.w.consume(
+            job, self.slot, result(job, before, **blocked), "gpt-6.1-sol", "low"
+        )
+        job = self.s.store.job(job["id"])
+        self.assertEqual(json.loads(job["data"])["correction_stalls"], 0)
+        self.assertIsNone(job["error"])
+        self.ws.worker_finalize.assert_not_called()
+        # Acceptance is still required before committing and entering final QA.
+        job = self.phase(self.s.store.claim(2))
+        self.assertEqual(job["phase"], "final_review")
+        self.ws.worker_finalize.assert_called_once()
         self.assertFalse(self.gh.writes)
 
     def test_metadata_mutation_rejected_even_in_implementation(self):

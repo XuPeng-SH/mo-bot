@@ -1490,8 +1490,11 @@ Return every schema field. causes holds independently proven environment/flaky a
         if phase != "final_review" and (
             result["classification"] == "blocked" or not result["accepted"]
         ):
-            self.checkpoint(job, data)
-            self.fail(job, result["summary"])
+            # A model's incomplete assessment is work to continue, not a
+            # transport/ownership failure. Triage hands off to the design gate;
+            # design and implementation retain their current responsibilities.
+            next_phase = "design" if phase == "triage" else phase
+            self.continue_gap(job, slot, data, result, after, next_phase)
             return
         if phase == "triage":
             next_phase = "design"
@@ -1552,35 +1555,8 @@ Return every schema field. causes holds independently proven environment/flaky a
             ):
                 data["corrections"] = data.get("corrections", 0) + 1
                 next_phase = "design" if is_environment else "implement"
-                progress = digest(
-                    [
-                        after["head"],
-                        result["validation_complete"],
-                        sorted(result["findings"]),
-                        sorted(result["limitations"]),
-                    ]
-                )
-                stalled = (
-                    data.get("correction_stalls", 0) + 1
-                    if data.get("correction_progress") == progress
-                    else 0
-                )
-                data.update(correction_progress=progress, correction_stalls=stalled)
-                if stalled:
-                    # Preserve the candidate and release capacity during backoff.
-                    # The existing queue/claim path restores it on the next turn.
-                    data["workspace_archive"] = self.ws.archive_worker(slot["id"], job)
-                    self.checkpoint(
-                        job,
-                        data,
-                        phase=next_phase,
-                        state="queued",
-                        slot_id=None,
-                        error="Repeated final-review gaps without candidate progress: "
-                        + result["summary"],
-                        retry_at=time.time() + min(3600, 60 * 2 ** min(stalled - 1, 6)),
-                    )
-                    return
+                self.continue_gap(job, slot, data, result, after, next_phase)
+                return
             else:
                 data["candidate"] = after["head"]
                 data["worker_slot"] = slot["id"]
@@ -1590,6 +1566,48 @@ Return every schema field. causes holds independently proven environment/flaky a
                 )
                 return
         self.checkpoint(job, data, phase=next_phase, state="queued", error=None)
+
+    def continue_gap(self, job, slot, data, result, after, next_phase):
+        """Keep incomplete model work recoverable without spinning on a gap."""
+        progress = digest(
+            [
+                job["phase"],
+                after["head"],
+                after["source"],
+                result["validation_complete"],
+                sorted(result["findings"]),
+                sorted(result["limitations"]),
+            ]
+        )
+        stalled = (
+            data.get("correction_stalls", 0) + 1
+            if data.get("correction_progress") == progress
+            else 0
+        )
+        feedback = (
+            result["summary"]
+            + "\n"
+            + "\n".join(result["findings"] + result["limitations"])
+        )
+        data.update(
+            correction_progress=progress,
+            correction_stalls=stalled,
+            coordinator_feedback=feedback[:4000],
+        )
+        if stalled:
+            # Preserve uncommitted changes and release capacity during backoff.
+            data["workspace_archive"] = self.ws.archive_worker(slot["id"], job)
+            self.checkpoint(
+                job,
+                data,
+                phase=next_phase,
+                state="queued",
+                slot_id=None,
+                error="Repeated acceptance gaps without source progress: " + feedback,
+                retry_at=time.time() + min(3600, 60 * 2 ** min(stalled - 1, 6)),
+            )
+        else:
+            self.checkpoint(job, data, phase=next_phase, state="queued", error=None)
 
     def retry(self, job, error):
         job = self.store.job(job["id"])

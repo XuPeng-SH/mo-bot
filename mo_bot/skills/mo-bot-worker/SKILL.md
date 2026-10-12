@@ -31,6 +31,8 @@ gate must confirm the same per-failure dispositions and issue/rerun plan. Supply
 
 A noop requires evidence the requested problem is already solved or inapplicable. The final gate still verifies a noop or infrastructure diagnosis.
 
+An incomplete model assessment is a continuation checkpoint, not a terminal task failure. Blocked triage moves to the separate design gate; incomplete design or implementation continues in that phase with its concrete gaps. Design accepts an executable plan, not completed product validation. When validation is missing, plan and execute the missing checks instead of repeating unchanged triage or requesting evidence the worker can produce. Diagnose fixture prerequisites, use an isolated supported setup, and never kill unrelated processes or weaken acceptance to obtain a pass. Implementation may return blocked with preserved edits and precise next actions; the coordinator keeps them and feeds the gaps into the next turn. Identical source/gap checkpoints back off and release capacity. A plan disproved by implementation must be reported explicitly and corrected before further source work; do not silently bypass the accepted design.
+
 ## Implement and challenge
 
 Only implement may edit assigned source. Respect repository instructions and domain skills. The coordinator owns Git metadata, rebase invocation/continuation, index, commits, pushes and all GitHub mutations. Never execute those yourself; resolve provided conflict markers in source and return a Conventional Commit title for the coordinator. Never modify credentials, Git configuration, hooks, other worktrees or retained artifacts of unrelated jobs.
