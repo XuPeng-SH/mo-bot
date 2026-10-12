@@ -12,6 +12,7 @@ query Queue($owner: String!, $repo: String!, $endCursor: String) {
       nodes {
         number title url isDraft updatedAt headRefOid mergeable reviewDecision
         author { login }
+        labels(first: 100) { nodes { name } }
         reviews(last: 100) { nodes { author { login } state commit { oid } submittedAt } }
         statusCheckRollup {
           contexts(first: 100) {
@@ -32,6 +33,24 @@ query Queue($owner: String!, $repo: String!, $endCursor: String) {
 PASSING_CONCLUSIONS = {"SUCCESS", "SKIPPED", "NEUTRAL"}
 NON_EXECUTION_CHECKS = {"Summary", "Mergify Merge Protections", "Mergify Merge Queue"}
 DECISIVE_REVIEW_STATES = {"APPROVED", "CHANGES_REQUESTED"}
+
+
+class OwnerWip(ValueError):
+    """Owner's WIP label is an admission wait, not a task failure."""
+
+
+def owner_wip(pr, reviewer):
+    author = pr.get("author") or pr.get("user") or {}
+    if (author.get("login") or "").casefold() != reviewer.casefold():
+        return False
+    labels = pr.get("labels") or []
+    if isinstance(labels, dict):
+        labels = labels.get("nodes") or []
+    return any(
+        (label.get("name", "") if isinstance(label, dict) else label).casefold()
+        == "do-not-merge/wip"
+        for label in labels
+    )
 
 
 def stabilize_mergeability(
@@ -174,6 +193,8 @@ def classify(
 ) -> tuple[str, str, dict[str, Any] | None]:
     if pr["number"] in exclusions:
         return "excluded", "explicitly-excluded", None
+    if owner_wip(pr, reviewer):
+        return "excluded", "owner-wip", None
     if pr["isDraft"]:
         return "excluded", "draft", None
     if (pr.get("author") or {}).get("login") == reviewer:

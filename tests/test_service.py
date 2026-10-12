@@ -113,6 +113,63 @@ class TestWorkflow(unittest.TestCase):
             self.service.artifacts.future.result(timeout=5)
         self.assertFalse((directory / "tmp").exists())
 
+    def test_owner_wip_blocks_review_launch_and_publication_before_writes(self):
+        job = self.job()
+        self.gh.pr.return_value["user"] = {"login": "me"}
+        self.gh.pr.return_value["labels"] = [{"name": "do-not-merge/wip"}]
+        self.service.launch(self.store.slots()[0], job)
+        self.assertEqual(self.store.job(job["id"])["state"], "queued")
+        self.gh.ensure_comment.assert_not_called()
+        self.workspace.prepare.assert_not_called()
+        self.service.save_result(
+            job, self.store.slots()[0], assessment(job), "fake", "xhigh"
+        )
+        self.service.eligible.add(job["id"])
+        self.service.publish(self.store.job(job["id"]))
+        self.gh.submit_review.assert_not_called()
+        self.assertEqual(self.store.job(job["id"])["state"], "publishing")
+        self.gh.pr.return_value["labels"] = []
+        self.service.publish(self.store.job(job["id"]))
+        self.assertEqual(self.store.job(job["id"])["state"], "done")
+
+    def test_owner_wip_interrupt_is_a_resumable_wait_even_for_forced_review(self):
+        job = self.job()
+        self.store.update(job["id"], state="reviewing", slot_id=0, attempts=99)
+        turn = Mock(completed=True, model="fake", effort="xhigh")
+        turn.result.side_effect = RuntimeError("owner-wip")
+        self.service.turns[0] = (turn, job["id"])
+        self.service.scan(
+            {
+                "heads": {"1": job["head"]},
+                "candidates": [],
+                "admission": {
+                    "1": {
+                        "head": job["head"],
+                        "reason": "owner-wip",
+                        "state": "excluded",
+                    }
+                },
+            }
+        )
+        turn.stop.assert_called_once()
+        self.assertNotIn(job["id"], self.service.eligible)
+        self.service.finish(0, turn, job["id"])
+        self.assertEqual(self.store.job(job["id"])["state"], "queued")
+        self.service.scan(
+            {
+                "heads": {"1": job["head"]},
+                "candidates": [candidate()],
+                "admission": {
+                    "1": {
+                        "head": job["head"],
+                        "reason": "own-unreviewed",
+                        "state": "candidate",
+                    }
+                },
+            }
+        )
+        self.assertIn(job["id"], self.service.eligible)
+
     def test_repeated_scan_unique_and_newer_commit_supersedes(self):
         snap = {
             "heads": {"1": "a" * 40},

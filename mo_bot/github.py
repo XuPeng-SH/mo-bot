@@ -4,7 +4,7 @@ import re
 import subprocess
 import sys
 from urllib.parse import urlencode
-from .review_queue import Queue
+from .review_queue import Queue, owner_wip
 
 
 MARKER = re.compile(r"<!-- mo-bot-review:v1 (\{[^\n]+\}) -->\s*\Z")
@@ -32,6 +32,8 @@ def discover(config):
         state, ci, prior = queue.classify(
             pr, config.reviewer, set(config.exclude), config.stale_ci_days
         )
+        if owner_wip(pr, config.reviewer):
+            state, ci = "excluded", "owner-wip"
         # Own PRs need a current-head published review, independently of CI.
         # Other authors continue through the authoritative green-CI predicate.
         own_unreviewed = False
@@ -123,6 +125,7 @@ def discover(config):
             == config.reviewer.casefold()
             and not p.get("isDraft")
             and p["number"] not in config.exclude
+            and not owner_wip(p, config.reviewer)
         ],
         "assigned_issues": assigned_issues,
         "assigned_issue_error": assigned_issue_error,

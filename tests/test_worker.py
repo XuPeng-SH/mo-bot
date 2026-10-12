@@ -299,6 +299,40 @@ class TestWorker(unittest.TestCase):
         self.w.consume(job, self.slot, value, model, effort)
         return self.s.store.job(job["id"])
 
+    def test_owner_wip_admission_and_publication_are_blocked_without_writes(self):
+        job = self.job()
+        for _ in range(4):
+            job = self.phase(job)
+        self.gh.prs[1]["labels"] = [{"name": "do-not-merge/wip"}]
+        with self.assertRaisesRegex(ValueError, "owner-wip"):
+            self.w.pr_candidate(1, explicit=True)
+        writes = list(self.gh.writes)
+        self.w.publish(job)
+        self.assertEqual(self.gh.writes, writes)
+        kept = self.s.store.job(job["id"])
+        self.assertEqual(kept["state"], "publishing")
+        self.assertEqual(kept["error"], "owner-wip")
+        self.assertFalse(json.loads(kept["data"]).get("manual_reconciliation"))
+
+    def test_owner_wip_retry_preserves_source_releases_slot_and_resumes_admission(self):
+        job = self.job()
+        self.w.launch(self.slot, job)
+        self.s.turns[self.slot["id"]][0].completed = True
+        job = self.s.store.job(job["id"])
+        self.w.retry(job, RuntimeError("owner-wip"))
+        waiting = self.s.store.job(job["id"])
+        data = json.loads(waiting["data"])
+        self.assertEqual(waiting["state"], "queued")
+        self.assertIsNone(waiting["slot_id"])
+        self.assertEqual(data["workspace_archive"], str(self.root / "saved-source"))
+        self.assertEqual(data.get("recoveries", 0), 0)
+        self.s.admission["1"] = {"reason": "owner-wip"}
+        self.w.refresh_eligible()
+        self.assertNotIn(job["id"], self.s.eligible)
+        self.s.admission["1"] = {"reason": "own-unreviewed"}
+        self.w.refresh_eligible()
+        self.assertIn(job["id"], self.s.eligible)
+
     def test_four_phases_reuse_session_real_gate_model_params_and_fence(self):
         job = self.job()
         seen = []

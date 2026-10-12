@@ -29,6 +29,12 @@ Default config is `~/.config/mo-bot/config.toml`. Override with `--config PATH` 
 
 ## Review policy
 
+Configured-owner PRs with `do-not-merge/wip` are excluded from both review and
+repair. Admission, task launch and publication recheck the policy; explicit
+enqueue/repair does not bypass it. An active task waits with its source and
+assessment retained, and label removal allows normal admission again. Operator
+paused tasks still need the existing explicit resume control.
+
 Review commentary and assessment reports are written in English, as required by the repository review/worker skills. Existing published assessments are not rewritten solely to change language.
 
 The repository's [mo-bot-review skill](../mo-bot-review/SKILL.md) owns reviewer prompt guidance and the decision/publication contract. The coordinator reads it for every new assigned review and snapshots the prompt for recovery. Edit that skill to change review guidance; do not maintain a parallel prompt in this operator skill. `scripts/install.py` installs both repository skills into agent discovery paths.

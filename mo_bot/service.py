@@ -29,6 +29,7 @@ from .worker import Worker
 from .discovery import Discovery
 from .config import CLASSIFIER_EFFORT, CLASSIFIER_MODEL
 from .artifacts import Artifacts
+from .review_queue import OwnerWip, owner_wip
 
 
 LOG = logging.getLogger("mo-bot")
@@ -324,6 +325,14 @@ class Service:
         )
         heads = snapshot["heads"]
         for job in self.store.jobs(("queued", "reviewing", "publishing")):
+            status = admission.get(str(job["pr"]), {})
+            if status.get("reason") == "owner-wip":
+                self.eligible.discard(job["id"])
+                for turn, key in self.turns.values():
+                    if key == job["id"]:
+                        turn.error = "owner-wip"
+                        turn.stop()
+                continue
             if job["kind"] == "work":
                 continue  # Worker validates immutable identities per phase/effect.
             forced = json.loads(job["metadata"]).get("forced")
@@ -363,6 +372,7 @@ class Service:
             for j in self.store.jobs(("queued", "reviewing", "publishing"))
             if json.loads(j["metadata"]).get("forced")
             and heads.get(str(j["pr"])) == j["head"]
+            and admission.get(str(j["pr"]), {}).get("reason") != "owner-wip"
         )
         self.last_scan_at = time.time()
         self.scan_error = None
@@ -404,6 +414,12 @@ class Service:
             return self.worker.launch(slot, job)
         if job:
             pr = self.github.pr(job)
+            if owner_wip(pr, self.config.reviewer):
+                self.eligible.discard(job["id"])
+                self.store.update(
+                    job["id"], state="queued", slot_id=None, error="owner-wip"
+                )
+                return
             if self.store.uncertain_pr(
                 job["repo"],
                 pr["head"]["sha"],
@@ -643,8 +659,11 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
                     if job["state"] == "canceling"
                     else (
                         "queued"
-                        if job["attempts"] <= self.config.max_recoveries
-                        and not isinstance(error, SourceChanged)
+                        if message == "owner-wip"
+                        or (
+                            job["attempts"] <= self.config.max_recoveries
+                            and not isinstance(error, SourceChanged)
+                        )
                         else "failed"
                     )
                 )
@@ -676,6 +695,9 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
         if job["kind"] == "work":
             return self.worker.publish(job)
         pr = self.github.pr(job)
+        if owner_wip(pr, self.config.reviewer):
+            self.store.update(job["id"], error="owner-wip", retry_at=time.time() + 60)
+            return
         if pr["state"] != "open" or pr["head"]["sha"] != job["head"]:
             self.github.patch_comment(
                 job,
@@ -1264,6 +1286,8 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
             if args.get("force") is not True:
                 raise ValueError("manual admission requires explicit force=true")
             pr = self.github.api(f"repos/{self.config.repository}/pulls/{pr_number}")
+            if owner_wip(pr, self.config.reviewer):
+                raise OwnerWip("owner-wip")
             if pr["state"] != "open":
                 raise ValueError("only open PRs can be queued")
             candidate = {
@@ -1532,7 +1556,9 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
                     except Exception as error:
                         if job["kind"] == "work":
                             # Worker admission/capability failures do not stall the review pool.
-                            if isinstance(error, ValueError):
+                            if isinstance(error, ValueError) and not isinstance(
+                                error, OwnerWip
+                            ):
                                 self.worker.fail(job, error)
                             else:
                                 self.worker.retry(job, error)

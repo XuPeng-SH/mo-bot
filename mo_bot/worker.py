@@ -11,6 +11,7 @@ from pathlib import Path
 from .codex import SourceChanged, completed_result
 from .config import CLASSIFIER_EFFORT, CLASSIFIER_MODEL
 from .discovery import Discovery
+from .review_queue import OwnerWip, owner_wip
 
 LOG = logging.getLogger("mo-bot")
 SKILL = Path(__file__).parent / "skills/mo-bot-worker/SKILL.md"
@@ -234,6 +235,8 @@ class Worker:
                 "worker admits only configured owner open non-draft non-excluded PRs"
             )
         head_repo = pr["head"]["repo"]
+        if owner_wip(pr, self.config.reviewer):
+            raise OwnerWip("owner-wip")
         if not head_repo:
             raise ValueError("PR head repository unavailable")
         personal = head_repo["owner"]["id"] == actor["id"]
@@ -632,7 +635,17 @@ class Worker:
     def refresh_eligible(self):
         active = self.store.jobs(("queued", "reviewing", "publishing", "canceling"))
         self.s.eligible.intersection_update(j["id"] for j in active)
-        self.s.eligible.update(j["id"] for j in active if j["kind"] == "work")
+        self.s.eligible.update(
+            j["id"]
+            for j in active
+            if j["kind"] == "work"
+            and self.s.admission.get(str(j["pr"]), {}).get("reason") != "owner-wip"
+        )
+        self.s.eligible.difference_update(
+            j["id"]
+            for j in active
+            if self.s.admission.get(str(j["pr"]), {}).get("reason") == "owner-wip"
+        )
 
     def scan(self, own_prs, assigned_issues=(), issue_error=None):
         self.refresh_eligible()
@@ -1636,6 +1649,28 @@ Return every schema field. causes holds independently proven environment/flaky a
     def retry(self, job, error):
         job = self.store.job(job["id"])
         data = json.loads(job["data"])
+        if isinstance(error, OwnerWip) or str(error) == "owner-wip":
+            if (
+                job["slot_id"] is not None
+                and data.get("before")
+                and not data.get("workspace_archive")
+            ):
+                try:
+                    data["workspace_archive"] = self.ws.archive_worker(
+                        job["slot_id"], job
+                    )
+                except (OSError, ValueError, RuntimeError) as preservation_error:
+                    self.fail(job, preservation_error)
+                    return
+            self.checkpoint(
+                job,
+                data,
+                state="queued",
+                slot_id=None,
+                error="owner-wip",
+                retry_at=time.time() + 60,
+            )
+            return
         data["recoveries"] = data.get("recoveries", 0) + 1
         if data["recoveries"] > self.config.max_recoveries:
             # Escalate repeated execution/protocol failures to coordination,
@@ -2204,6 +2239,9 @@ Return every schema field. causes holds independently proven environment/flaky a
                         job["id"],
                         error,
                     )
+        except OwnerWip:
+            data["publication_next_at"] = time.time() + 60
+            self.checkpoint(job, data, error="owner-wip")
         except Exception as error:
             if (
                 isinstance(error, WorkerInputChanged)

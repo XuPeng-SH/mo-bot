@@ -2,6 +2,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from mo_bot.github import GitHub, discover, marker
+from mo_bot.review_queue import owner_wip
 
 
 class TestFormalReviews(unittest.TestCase):
@@ -68,12 +69,13 @@ class TestFormalReviews(unittest.TestCase):
 
 
 class TestOwnPRDiscovery(unittest.TestCase):
-    def own_snapshot(self, reviews, ci="not-green", mergeable="MERGEABLE"):
+    def own_snapshot(self, reviews, ci="not-green", mergeable="MERGEABLE", labels=()):
         queue = Mock()
         queue.all_prs.return_value = [
             {
                 "number": 1,
                 "author": {"login": "me"},
+                "labels": {"nodes": [{"name": label} for label in labels]},
                 "headRefOid": "a" * 40,
                 "updatedAt": "now",
                 "mergeable": mergeable,
@@ -99,6 +101,24 @@ class TestOwnPRDiscovery(unittest.TestCase):
             snapshot = self.own_snapshot([], mergeable=mergeable)
             self.assertFalse(snapshot["candidates"])
             self.assertEqual(snapshot["indeterminate"], unknown)
+
+    def test_owner_wip_excludes_both_pools_and_rest_schema_matches_graphql(self):
+        snapshot = self.own_snapshot([], labels=["do-not-merge/wip"])
+        self.assertFalse(snapshot["candidates"])
+        self.assertFalse(snapshot["own_prs"])
+        self.assertEqual(snapshot["admission"]["1"]["reason"], "owner-wip")
+        self.assertTrue(
+            owner_wip(
+                {"user": {"login": "ME"}, "labels": [{"name": "do-not-merge/wip"}]},
+                "me",
+            )
+        )
+        self.assertFalse(
+            owner_wip(
+                {"user": {"login": "other"}, "labels": [{"name": "do-not-merge/wip"}]},
+                "me",
+            )
+        )
 
     def test_formal_review_is_scoped_to_exact_head_and_ignores_drafts(self):
         for state in ("APPROVED", "CHANGES_REQUESTED", "COMMENTED"):

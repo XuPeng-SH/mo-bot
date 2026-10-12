@@ -204,6 +204,13 @@ a stopped task without deleting evidence or bypassing uncertain-write fences.
 Rerun follows the approved frozen plan, cause issues and current-head/latest-run
 budget checks. Repeated publication/Actions operations reconcile prior effects.
 
+Configured-owner PRs labelled `do-not-merge/wip` are excluded from review and
+repair, including explicit enqueue/repair. Labels are checked at discovery,
+launch and publication. Adding the label interrupts an active turn through the
+existing source-preserving retry path; queued tasks wait without consuming a
+model slot. Removing it permits normal admission; operator-paused tasks still
+require explicit resume.
+
 All phases and retries of a task share its Go build/module caches. Stage `tmp`
 and task `cache` are disposable: save validation logs, reports and evidence in
 the stage directory outside them. Once a job is done, failed or superseded and
