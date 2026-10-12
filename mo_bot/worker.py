@@ -54,7 +54,11 @@ SCHEMA = {
         "accepted": {"type": "boolean"},
         "summary": {"type": "string"},
         "evidence": {"type": "array", "items": {"type": "string"}},
-        "limitations": {"type": "array", "items": {"type": "string"}},
+        "limitations": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Unresolved material acceptance gaps. Put acknowledged nonblocking caveats in evidence or summary; an accepted final result must have no blocking gaps.",
+        },
         "findings": {"type": "array", "items": {"type": "string"}},
         "rebase": {"type": "boolean"},
         "candidate_head": {"type": "string"},
@@ -1200,7 +1204,7 @@ class Worker:
             job = self.store.job(job["id"])
             self.check_input(job, refresh_evidence=True)
         if (
-            job["phase"] == "design"
+            job["phase"] in ("triage", "design")
             and job["target_type"] == "pr"
             and not data.get("rebase_target")
         ):
@@ -1253,7 +1257,7 @@ class Worker:
             if target["repo"] != job["repo"] or target["ref"] != identity["base_ref"]:
                 raise SourceChanged("rebase target repository/ref changed")
         path = self.ws.worker_prepare(slot["id"], job)
-        if job["phase"] == "design" and data.get("rebase_target"):
+        if job["phase"] in ("triage", "design") and data.get("rebase_target"):
             self.ws.worker_fetch_target(
                 slot["id"], job["repo"], data["rebase_target"]["sha"]
             )
@@ -1451,6 +1455,9 @@ Return every schema field. causes holds independently proven environment/flaky a
         }
         phase = job["phase"]
         data["recoveries"] = 0
+        # Preserve accepted output before coordinator commit/rebase actions, so
+        # a recoverable handoff error cannot erase the completed model work.
+        self.checkpoint(job, data)
         skip_rebase = (phase == "design" and not result["rebase"]) or (
             phase == "final_review"
             and data.get("candidate", job["head"]) == job["head"]

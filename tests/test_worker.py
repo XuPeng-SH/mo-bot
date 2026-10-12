@@ -430,6 +430,22 @@ class TestWorker(unittest.TestCase):
             self.w.launch(self.slot, self.s.store.job(job["id"]))
         self.s.backend.start.assert_not_called()
 
+    def test_coordinator_failure_retains_completed_implementation_output(self):
+        job = self.phase(self.job())
+        job = self.phase(self.s.store.claim(2))
+        self.ws.worker_finalize.side_effect = RuntimeError("coordinator commit failed")
+        with self.assertRaisesRegex(RuntimeError, "coordinator commit failed"):
+            self.phase(
+                self.s.store.claim(2),
+                commit_message="perf(planner): verified improvement",
+            )
+        saved = json.loads(self.s.store.job(job["id"])["data"])
+        self.assertTrue(saved["implement"]["result"]["accepted"])
+        self.assertEqual(
+            saved["implement"]["result"]["commit_message"],
+            "perf(planner): verified improvement",
+        )
+
     def test_legacy_rebase_checkpoint_returns_to_design(self):
         job = self.job()
         self.s.store.update(
@@ -464,6 +480,7 @@ class TestWorker(unittest.TestCase):
         self.assertEqual(updated["state"], "queued")
         self.assertEqual(updated["phase"], "implement")
         self.ws.restore_worker.assert_called_once()
+        self.assertEqual(updated["slot_id"], self.slot["id"])
         self.assertEqual(updated["comment_id"], job["comment_id"])
 
     def test_from_input_reenters_same_failed_job_without_resetting_lifetime_attempts(
@@ -1932,6 +1949,18 @@ class TestIndependentGit(unittest.TestCase):
             (ws.worker_path(2) / "file").read_text(), "target and feature\n"
         )
         self.assertEqual(ws.worker_rebase_status(2, target), "complete")
+
+    def test_performance_conventional_commit_can_finalize_real_source(self):
+        ws, _, original, _ = self.rebase_fixture()
+        (ws.worker_path(2) / "file").write_text("optimized source\n")
+        candidate = ws.worker_finalize(2, "perf(planner): normalize disjunctions")
+        self.assertNotEqual(candidate, original)
+        self.assertEqual(
+            ws.worker_git(2, "log", "-1", "--format=%s"),
+            "perf(planner): normalize disjunctions",
+        )
+        with self.assertRaisesRegex(ValueError, "Conventional Commit"):
+            ws.worker_finalize(2, "perf(planner): title\nother line")
 
     def test_reentry_keeps_old_archive_and_can_preserve_new_dirty_source(self):
         ws, _, original, _ = self.rebase_fixture()

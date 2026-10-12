@@ -463,8 +463,10 @@ class Workspace:
         if (
             "\n" in message
             or len(message) > 200
-            or not message.startswith(
-                ("fix:", "fix(", "feat:", "feat(", "test:", "test(")
+            or any(ord(c) < 32 for c in message)
+            or not re.fullmatch(
+                r"(?:fix|feat|test|perf|refactor|docs|build|ci|style|chore|revert)(?:\([^()\r\n]+\))?!?: .+",
+                message,
             )
         ):
             raise ValueError("worker commit needs a Conventional Commit title")

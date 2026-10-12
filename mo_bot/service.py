@@ -1736,7 +1736,10 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
                 free = next(
                     (
                         s
-                        for s in self.store.slots()
+                        for s in sorted(
+                            self.store.slots(),
+                            key=lambda s: s["id"] != data.get("worker_slot"),
+                        )
                         if s["role"] == "worker"
                         and s["enabled"]
                         and s["ready"]
