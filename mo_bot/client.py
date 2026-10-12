@@ -26,7 +26,7 @@ def main():
     p.add_argument("slot", type=int)
     p.add_argument("model")
     p.add_argument("--effort", default="xhigh")
-    for name in ["history", "interrupt"]:
+    for name in ["history", "interrupt", "progress"]:
         p = commands.add_parser(name)
         p.add_argument("slot", type=int)
     args = parser.parse_args()
@@ -38,11 +38,38 @@ def main():
         .read_text()
         .strip()
     )
+    opener = build_opener(ProxyHandler({}))
+    if args.command == "progress":
+        query = Request(
+            base + "/api/sessions", headers={"Authorization": "Bearer " + token}
+        )
+        with opener.open(query, timeout=10) as response:
+            sessions = json.load(response)
+        session = next((s for s in sessions if s["id"] == args.slot), None)
+        if not session:
+            parser.error("unknown session slot")
+        if not session["turn_id"]:
+            print(
+                json.dumps(
+                    {
+                        "session": session,
+                        "message": "No running turn; no model call started.",
+                    },
+                    indent=2,
+                )
+            )
+            return
     endpoint = "/api/" + args.command
     body = None
     if args.command == "enqueue":
         endpoint = "/api/jobs"
         body = {"pr": args.pr, "force": True}
+    elif args.command == "progress":
+        endpoint = f"/api/sessions/{args.slot}/messages"
+        body = {
+            "expected_turn_id": session["turn_id"],
+            "text": "请仅以简短 commentary 汇报当前任务的 PR/commit、已完成的检查和证据、正在做什么、剩余验证和阻塞点。不要改变评审目标，不要终止评审，不要重复已完成的工作，汇报后继续当前评审。",
+        }
     elif args.command == "chat":
         endpoint = f"/api/sessions/{args.slot}/messages"
         body = {"text": args.text}

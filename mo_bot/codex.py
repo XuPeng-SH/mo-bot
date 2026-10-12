@@ -163,6 +163,7 @@ def broken_session(message):
         text in lower
         for text in (
             "no session found",
+            "no rollout found",
             "session not found",
             "thread not found",
             "invalid session",

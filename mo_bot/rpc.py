@@ -149,6 +149,7 @@ class Backend:
                 for turn in self.turns.values():
                     turn.error = "Codex backend disconnected"
                     turn.completed = True
+                    turn.completion.set()
 
     def session(self, slot, workspace):
         slot = dict(slot)
@@ -207,6 +208,7 @@ class Turn:
         self.events_path = directory / "events.jsonl"
         self.events_path.touch()
         self.completed, self.error, self.turn_id = False, None, None
+        self.completion = threading.Event()
         self.started = time.monotonic()
         self.final = None
         self.model = slot["model"] or backend.config.model
@@ -282,6 +284,8 @@ class Turn:
                 stream.write(encoded)
         else:
             self.error = "turn event log limit exceeded"
+        if self.completed:
+            self.completion.set()
 
     def result(self):
         if not self.completed:

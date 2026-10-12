@@ -12,10 +12,10 @@ Default address: `http://127.0.0.1:8989`. Every request requires `Authorization:
 | `GET /api/events?after=CURSOR&thread=THREAD_ID` | SSE native text/tool/status notifications, sequence IDs and heartbeat |
 | `POST /api/jobs` with `{"pr":123,"force":true}` | Force admission of current open PR/head; `enqueued:false` and existing job for duplicates |
 | `POST /api/sessions/0/messages` with `{"text":"..."}` | Steer active turn or start idle operator chat in the same thread |
-| `POST /api/sessions/0/model` with `{"model":"gpt-6.1-sol","reasoning_effort":"medium"}` | Persist selection for the next turn, preserve history/session ID |
+| `POST /api/sessions/0/model` with `{"model":"gpt-6.1-sol","reasoning_effort":"medium"}` | Interrupt/continue active work with the new model, preserve job/comment and history/session ID |
 | `POST /api/sessions/0/interrupt` with `{}` | Interrupt active turn; its review task becomes superseded |
 
-Slot IDs are zero-based. Creation defaults come from `[review] model/reasoning_effort`; optional `[[session]]` blocks override individual slots. Later API selection is stored in SQLite and survives restart, taking precedence over creation defaults. A busy turn retains its original model and effort. Start another turn after completion to use the new selection. Invalid model/effort is rejected before persisting it.
+Slot IDs are zero-based. Creation defaults come from `[review] model/reasoning_effort`; optional `[[session]]` blocks override individual slots. Later API selection is stored in SQLite and survives restart, taking precedence over creation defaults. A busy turn is interrupted and, after native completion confirms cancellation, its same logical review continues with the new model. An idle session starts a short confirmation turn. The API returns `native_turn_started` and the new turn ID; failed interruption cannot start overlapping work. Invalid model/effort is rejected before persisting it.
 
 SSE keeps 1024 events, with individual payloads capped at 64 KiB. Missing buffered events cause an explicit `gap`; oversized payloads produce `event/oversize`. Reload thread history for full content. SSE is not durable conversation storage. Reconnect with `Last-Event-ID` or `after`; event sequence uses a wall-time epoch to distinguish service restarts.
 

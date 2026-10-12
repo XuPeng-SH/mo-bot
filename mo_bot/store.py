@@ -28,7 +28,7 @@ class Store:
                     ('queued','reviewing','publishing','canceling','done','failed','superseded')),
                 metadata TEXT NOT NULL, created REAL NOT NULL, updated REAL NOT NULL,
                 slot_id INTEGER REFERENCES slots(id), comment_id INTEGER, comment_state TEXT,
-                attempts INTEGER NOT NULL DEFAULT 0, error TEXT, result TEXT, claim_attempted INTEGER NOT NULL DEFAULT 0,
+                attempts INTEGER NOT NULL DEFAULT 0, error TEXT, result TEXT, turn_dir TEXT, claim_attempted INTEGER NOT NULL DEFAULT 0,
                 UNIQUE(repo,pr,head)
             );
             CREATE UNIQUE INDEX IF NOT EXISTS active_slot ON jobs(slot_id)
@@ -36,6 +36,9 @@ class Store:
             CREATE UNIQUE INDEX IF NOT EXISTS active_pr ON jobs(repo,pr)
                 WHERE state IN ('reviewing','publishing','canceling');
         """)
+        if "turn_dir" not in {r[1] for r in self.db.execute("PRAGMA table_info(jobs)")}:
+            self.db.execute("ALTER TABLE jobs ADD COLUMN turn_dir TEXT")
+            self.db.commit()
         existing = self.db.execute(
             "SELECT value FROM meta WHERE key='service_id'"
         ).fetchone()
@@ -111,6 +114,7 @@ class Store:
             "error",
             "metadata",
             "result",
+            "turn_dir",
             "claim_attempted",
             "comment_state",
         }

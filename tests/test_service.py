@@ -171,28 +171,92 @@ class TestWorkflow(unittest.TestCase):
         turn.steer.assert_called_once()
         self.service.backend.start.assert_not_called()
 
-    def test_model_switch_persists_without_replacing_or_interrupting_session(self):
+    def test_stale_progress_request_does_not_start_idle_conversation(self):
+        self.service.backend = Mock(dead=False)
+        with self.assertRaises(ValueError):
+            self.service.command(
+                "message",
+                {"slot": 0, "expected_turn_id": "old-turn", "text": "progress"},
+            )
+        self.service.backend.start.assert_not_called()
+
+    def test_model_switch_interrupts_and_continues_same_job_in_same_thread(self):
         self.service.models = [
             {
-                "model": "gpt-6.1-sol",
-                "supportedReasoningEfforts": [
-                    {"reasoningEffort": "medium"},
-                    {"reasoningEffort": "xhigh"},
-                ],
+                "model": "gpt-6-astra",
+                "supportedReasoningEfforts": [{"reasoningEffort": "xhigh"}],
             }
         ]
-        active = Mock(model="gpt-6.1-sol", effort="xhigh", turn_id="turn-1")
-        self.service.turns[0] = (active, None)
-        result = self.service.command(
-            "model", {"slot": 0, "model": "gpt-6.1-sol", "reasoning_effort": "medium"}
+        self.service.backend = Mock(dead=False)
+        job = self.job()
+        job = self.store.claim(0)
+        self.store.update(job["id"], comment_id=99)
+        old_dir = self.root / "old-turn"
+        old_dir.mkdir()
+        (old_dir / "prompt.txt").write_text("Frozen review scope " + job["head"])
+        old = Mock(
+            model="gpt-6.1-sol",
+            effort="xhigh",
+            turn_id="old-turn",
+            completed=False,
+            directory=old_dir,
         )
-        self.assertEqual(result["effective"], "next_turn")
+        old.completion.wait.return_value = True
+        self.service.turns[0] = (old, job["id"])
+        new = Mock(model="gpt-6-astra", effort="xhigh", turn_id="new-turn", started=0)
+        self.service.backend.start.return_value = new
+        result = self.service.command(
+            "model", {"slot": 0, "model": "gpt-6-astra", "reasoning_effort": "xhigh"}
+        )
+        self.assertEqual(result["effective"], "native_turn_started")
+        self.assertEqual(result["continued_job"], job["id"])
+        old.stop.assert_called_once()
+        old.completion.wait.assert_called_once_with(10)
+        self.assertEqual(
+            self.service.backend.start.call_args.args[0]["session_id"], "thread-0"
+        )
+        self.assertEqual(
+            self.service.backend.start.call_args.args[0]["model"], "gpt-6-astra"
+        )
+        self.assertIn(job["head"], self.service.backend.start.call_args.args[3])
+        self.assertEqual(len(self.store.jobs()), 1)
+        self.assertEqual(self.store.job(job["id"])["comment_id"], 99)
+        self.gh.ensure_comment.assert_not_called()
         self.assertEqual(self.store.slots()[0]["session_id"], "thread-0")
-        self.assertEqual(self.store.slots()[0]["effort"], "medium")
-        active.stop.assert_not_called()
         with self.assertRaises(ValueError):
             self.service.command("model", {"slot": 0, "model": "invalid"})
-        self.assertEqual(self.store.slots()[0]["effort"], "medium")
+
+    def test_failed_native_interruption_fences_model_switch(self):
+        self.service.models = [
+            {
+                "model": "gpt-6-astra",
+                "supportedReasoningEfforts": [{"reasoningEffort": "xhigh"}],
+            }
+        ]
+        self.service.backend = Mock(dead=False)
+        old = Mock(model="gpt-6.1-sol", effort="xhigh", completed=False)
+        old.completion.wait.return_value = False
+        self.service.turns[0] = (old, None)
+        with self.assertRaises(RuntimeError):
+            self.service.command(
+                "model",
+                {"slot": 0, "model": "gpt-6-astra", "reasoning_effort": "xhigh"},
+            )
+        self.service.backend.start.assert_not_called()
+        self.service.backend.close.assert_called_once()
+
+    def test_actual_review_entry_includes_core_contract(self):
+        from mo_bot.service import REVIEW_PROMPT
+
+        self.service.backend = Mock(dead=False)
+        self.gh.evidence.return_value = {"comments": []}
+        job = self.job()
+        self.store.update(job["id"], comment_id=99)
+        self.service.launch(self.store.slots()[0], self.store.job(job["id"]))
+        prompt = self.service.backend.start.call_args.args[3]
+        self.assertIn(REVIEW_PROMPT, prompt)
+        self.assertIn(job["head"], prompt)
+        self.assertIn(job["id"], prompt)
 
     def test_service_id_cannot_silently_change(self):
         with self.assertRaises(ValueError):

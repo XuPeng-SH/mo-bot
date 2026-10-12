@@ -5,6 +5,7 @@ import fcntl
 import json
 import logging
 import os
+from pathlib import Path
 import shutil
 import signal
 import subprocess
@@ -18,6 +19,7 @@ from .store import Store
 
 
 LOG = logging.getLogger("mo-bot")
+REVIEW_PROMPT = Path(__file__).with_name("review_prompt.txt").read_text()
 WARMUP_SCHEMA = {
     "type": "object",
     "properties": {"ready": {"type": "boolean"}},
@@ -130,8 +132,10 @@ class Service:
             else:
                 # Recover a fully materialized result before considering another turn.
                 result_path = (
-                    self.job_dir(job) / f"attempt-{job['attempts']}" / "result.json"
-                )
+                    Path(job["turn_dir"])
+                    if job["turn_dir"]
+                    else self.job_dir(job) / f"attempt-{job['attempts']}"
+                ) / "result.json"
                 events_path = result_path.parent / "events.jsonl"
                 slot = self.store.db.execute(
                     "SELECT * FROM slots WHERE id=?", (job["slot_id"],)
@@ -294,7 +298,9 @@ class Service:
             evidence = self.github.evidence(job, pr)
             (directory / "evidence.json").write_text(json.dumps(evidence, indent=2))
             workspace, merge_base = self.workspace.prepare(slot_id, job, pr, directory)
-            prompt = f"""You are mo-bot reusable review slot {slot_id}, generation {slot["generation"]}.
+            prompt = (
+                REVIEW_PROMPT
+                + f"""\nYou are mo-bot reusable review slot {slot_id}, generation {slot["generation"]}.
 CURRENT TASK replaces any previous PR task: job={job["id"]}, repository={job["repo"]},
 PR={job["pr"]}, HEAD={job["head"]}, merge-base={merge_base}. Only these frozen sources
 and {directory}/evidence.json establish facts for this PR. Earlier PR facts are not evidence.
@@ -311,6 +317,7 @@ Return the required JSON with job_id={job["id"]} and head_sha={job["head"]}; no 
 This is attempt {attempt} of the SAME logical job; consult earlier attempt artifacts in
 {directory.parent} to recover completed evidence instead of repeating it blindly.
 """
+            )
             schema = SCHEMA
         else:
             directory = (
@@ -322,6 +329,8 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
             workspace = self.workspace.ensure(slot_id)
             prompt = f"You are persistent mo-bot review slot {slot_id}. Future turns provide a new exact PR scope. Do not inspect files, run tools, or contact GitHub. Reply only with JSON ready=true."
             schema = WARMUP_SCHEMA
+        if job:
+            self.store.update(job["id"], turn_dir=str(directory))
         turn = self.backend.start(slot, directory, workspace, prompt, schema)
         self.turns[slot_id] = (turn, None if job is None else job["id"])
         self.refresh_status()
@@ -431,8 +440,8 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
             session_id=response["thread"]["id"],
             generation=slot["generation"] + int(replaced),
             ready=1,
-            model=response["model"],
-            effort=response.get("reasoningEffort"),
+            model=slot["model"],
+            effort=slot["effort"],
         )
         if response["thread"]["id"] != slot["session_id"]:
             updated = next(s for s in self.store.slots() if s["id"] == slot["id"])
@@ -520,13 +529,86 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
                 raise ValueError(
                     f"unsupported reasoning effort; available: {supported}"
                 )
+            if not self.backend or self.backend.dead or not slot["session_id"]:
+                raise ValueError("native session unavailable; model was not changed")
+            current = self.turns.get(slot["id"])
+            if current and current[0].completed:
+                self.finish(slot["id"], *current)
+                current = self.turns.get(slot["id"])
+            if current and (current[0].model, current[0].effort) == (model, effort):
+                return {
+                    "slot": slot["id"],
+                    "session_id": slot["session_id"],
+                    "model": model,
+                    "reasoning_effort": effort,
+                    "effective": "current_turn",
+                    "turn_id": current[0].turn_id,
+                }
+            job = self.store.job(current[1]) if current and current[1] else None
+            if current:
+                current[0].stop()
+                if not current[0].completion.wait(10):
+                    self.backend.close()
+                    raise RuntimeError(
+                        "native interruption timed out; no replacement turn started"
+                    )
+                if self.backend.dead:
+                    raise RuntimeError(
+                        "backend disconnected; no replacement turn started"
+                    )
+                current[0].release()
+                self.turns.pop(slot["id"], None)
+            if job:
+                pr = self.github.pr(job)
+                if (
+                    job["state"] == "canceling"
+                    or pr["state"] != "open"
+                    or pr["head"]["sha"] != job["head"]
+                ):
+                    self.store.update(
+                        job["id"],
+                        state="superseded",
+                        slot_id=None,
+                        error="head changed during model switch",
+                    )
+                    job = None
             self.store.slot_update(slot["id"], model=model, effort=effort)
+            selected = next(s for s in self.store.slots() if s["id"] == slot["id"])
+            if job:
+                # Same job/head/comment; resume frozen evidence in the SAME thread.
+                old = current[0]
+                directory = self.job_dir(job) / f"model-switch-{time.time_ns()}"
+                prompt = (old.directory / "prompt.txt").read_text() + (
+                    f"\nThe coordinator interrupted the previous turn to change model. Continue the SAME job. "
+                    f"Recover previous evidence from {old.directory}; do not repeat completed checks unnecessarily."
+                )
+                self.store.update(job["id"], turn_dir=str(directory))
+                try:
+                    turn = self.backend.start(
+                        selected,
+                        directory,
+                        self.workspace.ensure(slot["id"]),
+                        prompt,
+                        SCHEMA,
+                    )
+                    self.turns[slot["id"]] = (turn, job["id"])
+                except Exception as error:
+                    self.store.update(
+                        job["id"], state="queued", slot_id=None, error=str(error)
+                    )
+                    raise
+            else:
+                self.launch(selected)
+            turn = self.turns[slot["id"]][0]
+            self.refresh_status()
             return {
                 "slot": slot["id"],
                 "session_id": slot["session_id"],
                 "model": model,
                 "reasoning_effort": effort,
-                "effective": "next_turn",
+                "effective": "native_turn_started",
+                "turn_id": turn.turn_id,
+                "continued_job": job["id"] if job else None,
             }
         if action == "enqueue":
             pr_number = args.get("pr")
@@ -594,6 +676,11 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
                     current[0].error = "operator interrupted"
                     current[0].stop()
                 return {"interrupted": bool(current)}
+            expected = args.get("expected_turn_id")
+            if expected is not None and (not current or current[0].turn_id != expected):
+                raise ValueError(
+                    "active turn changed; no message or idle conversation started"
+                )
             text = args.get("text")
             if not isinstance(text, str) or not text.strip() or len(text) > 16000:
                 raise ValueError("text must contain 1..16000 characters")

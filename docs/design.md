@@ -33,3 +33,9 @@ Only the scheduler mutates SQLite and starts/steers turns. HTTP producers submit
 Review turns run with only their diagnostic directory writable, source outside it read-only. Network access permits dependency downloads; this is an authenticated local tool running with the owner's Codex/gh identity, not an isolation boundary suitable for adversarial repositories or credentials. Source/comments are explicitly untrusted evidence. No GitHub review event, approval, merge, push or CI rerun is issued by the coordinator.
 
 Ambiguous initial comment creation is fenced durably before the POST. If marker reconciliation cannot find it, the job fails closed for manual inspection; it does not repeat the POST. Completed results remain in SQLite during GitHub outages. A fixed service ID must be used by only one deployment with this state directory; GitHub comment APIs do not provide a distributed compare-and-swap across independently running instances.
+
+## Native model switching and progress
+
+A loaded thread/resume can ignore model overrides (verified with CLI 0.162.0), so its response is not used to overwrite the selected model. Dynamic switching waits for interruption completion, retains thread/job/comment identity, and submits the continued task through turn/start with explicit model/effort. Idle switching starts a bounded confirmation turn. Success reports a native turn ID. Interruption failure fences replacement; opaque start failures use backend recovery. SQLite records the actual turn artifact directory for crash checkpoint recovery.
+
+Operator progress queries use turn/steer with expected turn ID. The review continues, and a commentary reply is available in native history/SSE; acknowledgement is not treated as evidence of progress.

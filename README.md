@@ -28,7 +28,8 @@ systemctl --user status mo-bot.service
 journalctl --user -u mo-bot.service -f
 mo-botctl status
 mo-botctl enqueue 12345
-mo-botctl chat 0 'Explain the current review progress'
+mo-botctl progress 0
+mo-botctl history 0
 mo-botctl model 0 gpt-6.1-sol --effort medium
 mo-botctl events
 ```
@@ -48,3 +49,5 @@ ruff format --check mo_bot tests
 ```
 
 Tests exercise SQLite uniqueness/fences, remote marker recovery, ambiguous writes, saved publication checkpoints, head changes, result validation, native JSON-RPC turn reuse/replacement/disconnection, live message steering, model persistence and HTTP authentication. Fake GitHub tests never write to real PRs. Real native session/restart probes are separate operational validation.
+
+Each review includes the maintained core requirements in [review_prompt.txt](mo_bot/review_prompt.txt): design/ownership, systemic closure, all comment concerns, senior QA, unhappy paths, performance and implementation/test/documentation deltas; subagents are prohibited.
