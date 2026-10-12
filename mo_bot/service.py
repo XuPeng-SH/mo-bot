@@ -1552,6 +1552,72 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
             job = self.store.job(job["id"])
             data = json.loads(job["data"])
             current = None
+        if "from_input" in args and type(args["from_input"]) is not bool:
+            raise ValueError("from_input must be a boolean")
+        if args.get("from_input"):
+            if (
+                action != "retry_job"
+                or job["kind"] != "work"
+                or job["state"] != "failed"
+            ):
+                raise ValueError("from_input requires a failed worker task")
+            if current or job["state"] == "canceling":
+                raise ValueError("wait for native/tool cleanup before reentry")
+            if self.store.db.execute(
+                "SELECT 1 FROM effects WHERE job_id=? AND attempted=1", (job["id"],)
+            ).fetchone():
+                raise ValueError(
+                    "remote effects exist; reconcile them before restarting from input"
+                )
+            self.worker.check_input(job)
+            # Preserve an available owned source, including dirty edits. Legacy
+            # failures may have released their clone without archiving it; an
+            # explicit from-input retry never borrows another task's source.
+            slot_id = data.get("worker_slot")
+            if not data.get("workspace_archive") and slot_id is not None:
+                path = self.workspace.worker_path(slot_id)
+                owner = path.parent / "worker-owner.json"
+                if owner.is_file() and path.exists():
+                    identity = json.loads(owner.read_text())
+                    if identity.get("job") == job["id"]:
+                        if slot_id in self.turns:
+                            raise ValueError("owned workspace is still in use")
+                        data["workspace_archive"] = self.workspace.archive_worker(
+                            slot_id, job
+                        )
+            if data.get("workspace_archive"):
+                data["workspace_archive"] = self.workspace.retire_worker_archive(
+                    job, data["workspace_archive"]
+                )
+            record = (
+                self.job_dir(job) / f"reentry-{job['attempts']}-{time.time_ns()}.json"
+            )
+            record.parent.mkdir(parents=True, exist_ok=True)
+            record.write_text(json.dumps(data, indent=2))
+            triage = data.get("triage", {})
+            data = {
+                "reentry_record": str(record),
+                "reentry_attempts_base": job["attempts"],
+                "recoveries": 0,
+                "paused": False,
+            }
+            if triage.get("result", {}).get("accepted"):
+                data["triage"] = triage
+            self.store.update(
+                job["id"],
+                state="queued",
+                slot_id=None,
+                phase="design" if data.get("triage") else "triage",
+                data=json.dumps(data),
+                result=None,
+                error=None,
+                retry_at=0,
+            )
+            self.eligible.add(job["id"])
+            LOG.warning(
+                "job reentry from frozen input job=%s preserved=%s", job["id"], record
+            )
+            return self.command("job", {"job_id": job["id"]})
         if action == "rerun_job":
             if self.dispatch_control["paused"]:
                 raise ValueError("service is draining; resume dispatch before rerun")
@@ -1701,7 +1767,9 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
                 raise ValueError(
                     "failed workspace needs explicit preservation/cleanup before resume"
                 )
-            data.update(paused=False, recoveries=0)
+            data.update(
+                paused=False, recoveries=0, reentry_attempts_base=job["attempts"]
+            )
             data.pop("manual_reconciliation", None)
             data.pop("publication_next_at", None)
             data.pop("publication_failures", None)

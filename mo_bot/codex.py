@@ -1,5 +1,6 @@
 import os
 import json
+import re
 import hashlib
 from pathlib import Path
 import signal
@@ -298,6 +299,24 @@ class Workspace:
         path.rename(destination)
         return str(destination)
 
+    def retire_worker_archive(self, job, archive):
+        expected = self.config.state_dir / "jobs" / job["id"] / "saved-source"
+        if Path(archive) != expected or expected.is_symlink():
+            raise SourceChanged("invalid archived source path")
+        if not expected.exists():
+            return archive  # Retain the missing-checkpoint reference as evidence.
+        owner = expected.parent / "saved-source-owner.json"
+        identity = json.loads(owner.read_text())
+        if (
+            identity.get("service") != self.config.service_id
+            or identity.get("job") != job["id"]
+        ):
+            raise SourceChanged("archived source ownership mismatch")
+        destination = expected.with_name("saved-source-reentry-" + str(time.time_ns()))
+        expected.rename(destination)
+        owner.rename(destination.with_name(destination.name + "-owner.json"))
+        return str(destination)
+
     def restore_worker(self, slot, job, archive):
         expected = self.config.state_dir / "jobs" / job["id"] / "saved-source"
         if Path(archive) != expected or expected.is_symlink():
@@ -398,6 +417,38 @@ class Workspace:
                 self.worker_git(slot, "diff", "HEAD", "--binary").encode()
             ).hexdigest(),
         }
+
+    def worker_fetch_target(self, slot, repository, target):
+        if not re.fullmatch(r"[0-9a-f]{40}", target):
+            raise ValueError("invalid rebase target SHA")
+        if self.worker_git(
+            slot, "cat-file", "-e", target + "^{commit}", check=False
+        ).returncode:
+            self.worker_git(
+                slot,
+                "fetch",
+                "--no-tags",
+                "https://github.com/" + repository + ".git",
+                target,
+            )
+        self.worker_git(slot, "cat-file", "-e", target + "^{commit}")
+
+    def worker_rebase_status(self, slot, target):
+        path = self.worker_path(slot)
+        for name in ("rebase-merge", "rebase-apply"):
+            state = path / ".git" / name
+            if state.exists():
+                if (state / "onto").read_text().strip() != target:
+                    raise SourceChanged(
+                        "active rebase target differs from approved target"
+                    )
+                return "conflicts"
+        result = self.worker_git(
+            slot, "merge-base", "--is-ancestor", target, "HEAD", check=False
+        )
+        if result.returncode not in (0, 1):
+            raise RuntimeError(result.stderr.strip()[:2000])
+        return "complete" if result.returncode == 0 else "pending"
 
     def worker_rebase(self, slot, base):
         result = self.worker_git(slot, "rebase", base, check=False)

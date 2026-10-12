@@ -146,7 +146,7 @@ class FakeGitHub:
         if endpoint == "repos/me/repo":
             return FORK
         if "/branches/" in endpoint:
-            return {"commit": {"sha": BASE}}
+            return {"commit": {"sha": getattr(self, "branch_sha", BASE)}}
         if "/pulls/" in endpoint:
             if endpoint.endswith("/reviews"):
                 return self.reviews
@@ -383,6 +383,120 @@ class TestWorker(unittest.TestCase):
         self.assertEqual(
             prompt.count(ISSUE_SKILL.read_text().split("---", 2)[2].strip()), 1
         )
+
+    def test_rebase_uses_actual_branch_target_and_keeps_it_pinned(self):
+        target = "d" * 40
+        self.gh.branch_sha = target
+        job = self.phase(self.job(), rebase=True)
+        job = self.s.store.claim(2)
+        job = self.phase(job, rebase=True)
+        data = json.loads(job["data"])
+        self.assertEqual(data["rebase_target"]["sha"], target)
+        self.assertEqual(json.loads(job["metadata"])["identity"]["base_sha"], BASE)
+        self.gh.branch_sha = "e" * 40
+        self.ws.worker_rebase_status.side_effect = ["pending", "conflicts"]
+        self.w.launch(self.slot, self.s.store.claim(2))
+        self.ws.worker_rebase.assert_called_once_with(2, target)
+        data = json.loads(self.s.store.job(job["id"])["data"])
+        self.assertFalse(data["rebased"])
+        self.assertEqual(data["rebase_status"], "conflicts")
+
+    def test_reentry_verifies_stale_success_flag_and_reuses_conflict_stop(self):
+        job = self.job()
+        data = {
+            "needs_rebase": True,
+            "rebased": True,
+            "rebase_target": {"repo": job["repo"], "ref": "main", "sha": NEW},
+        }
+        self.s.store.update(job["id"], phase="implement", data=json.dumps(data))
+        self.ws.worker_rebase_status.side_effect = ["pending", "conflicts"]
+        self.w.launch(self.slot, self.s.store.job(job["id"]))
+        self.ws.worker_rebase.assert_called_once_with(2, NEW)
+        self.ws.worker_rebase.reset_mock()
+        self.ws.worker_rebase_status.side_effect = None
+        self.ws.worker_rebase_status.return_value = "conflicts"
+        self.w.launch(self.slot, self.s.store.job(job["id"]))
+        self.ws.worker_rebase.assert_not_called()
+
+    def test_false_rebase_success_does_not_launch_worker(self):
+        job = self.job()
+        data = {
+            "needs_rebase": True,
+            "rebase_target": {"repo": job["repo"], "ref": "main", "sha": NEW},
+        }
+        self.s.store.update(job["id"], phase="implement", data=json.dumps(data))
+        self.ws.worker_rebase_status.return_value = "pending"
+        with self.assertRaisesRegex(RuntimeError, "neither approved target"):
+            self.w.launch(self.slot, self.s.store.job(job["id"]))
+        self.s.backend.start.assert_not_called()
+
+    def test_legacy_rebase_checkpoint_returns_to_design(self):
+        job = self.job()
+        self.s.store.update(
+            job["id"],
+            phase="implement",
+            data=json.dumps({"needs_rebase": True, "rebased": True}),
+        )
+        self.w.launch(self.slot, self.s.store.job(job["id"]))
+        updated = self.s.store.job(job["id"])
+        self.assertEqual(updated["phase"], "design")
+        self.assertNotIn("rebased", json.loads(updated["data"]))
+        self.ws.worker_rebase.assert_not_called()
+        self.assertEqual(self.s.backend.start.call_args.args[0]["effort"], "xhigh")
+
+    def test_blocked_implementation_preserves_source_and_can_resume(self):
+        job = self.phase(self.job())
+        job = self.phase(self.s.store.claim(2))
+        self.s.turns.clear()
+        self.s.backend.start.return_value.completed = True
+        job = self.phase(
+            self.s.store.claim(2),
+            classification="blocked",
+            accepted=False,
+            summary="temporarily unavailable native dependency",
+        )
+        self.assertEqual(job["state"], "failed")
+        self.ws.archive_worker.assert_called_once()
+        self.assertIn("workspace_archive", json.loads(job["data"]))
+        self.s.turns.clear()
+        self.s.command("retry_job", {"job_id": job["id"]})
+        updated = self.s.store.job(job["id"])
+        self.assertEqual(updated["state"], "queued")
+        self.assertEqual(updated["phase"], "implement")
+        self.ws.restore_worker.assert_called_once()
+        self.assertEqual(updated["comment_id"], job["comment_id"])
+
+    def test_from_input_reenters_same_failed_job_without_resetting_lifetime_attempts(
+        self,
+    ):
+        job = self.phase(self.job())
+        self.s.turns.clear()
+        self.ws.worker_path.return_value = self.root / "missing-old-source"
+        self.s.store.update(job["id"], state="failed", slot_id=None, attempts=99)
+        self.s.command("retry_job", {"job_id": job["id"], "from_input": True})
+        updated = self.s.store.job(job["id"])
+        self.assertEqual(updated["attempts"], 99)
+        self.assertEqual(updated["phase"], "design")
+        self.assertEqual(updated["comment_id"], job["comment_id"])
+        data = json.loads(updated["data"])
+        self.assertEqual(data["reentry_attempts_base"], 99)
+        self.assertTrue(Path(data["reentry_record"]).is_file())
+        self.assertNotIn("before", data)
+        self.w.launch(self.slot, self.s.store.claim(2))
+        self.assertEqual(self.s.store.job(job["id"])["attempts"], 100)
+
+    def test_from_input_refuses_attempted_remote_effects_and_completed_jobs(self):
+        job = self.job()
+        self.s.store.update(job["id"], state="failed", slot_id=None)
+        effect = self.s.store.prepare_effect(
+            "effect", job["id"], "push", {"candidate": NEW}
+        )
+        self.s.store.effect_update(effect["key"], attempted=1)
+        with self.assertRaisesRegex(ValueError, "remote effects exist"):
+            self.s.command("retry_job", {"job_id": job["id"], "from_input": True})
+        self.s.store.update(job["id"], state="done")
+        with self.assertRaisesRegex(ValueError, "failed worker task"):
+            self.s.command("retry_job", {"job_id": job["id"], "from_input": True})
 
     def classifier_candidate(self, number=6):
         candidate = copy.deepcopy(self.w.issue_candidate(5))
@@ -657,6 +771,18 @@ class TestWorker(unittest.TestCase):
                 for a in self.s.status["alerts"]
             )
         )
+
+    def test_explicit_admission_can_reenter_after_automatic_budget_exhaustion(self):
+        self.failed_conflict_attempts()
+        candidate = self.w.pr_candidate(1, explicit=True)
+        self.assertIsNotNone(candidate)
+        self.assertTrue(self.s.store.enqueue(candidate))
+        # A repeated explicit request reuses the same queued identity.
+        repeated = self.w.pr_candidate(1, explicit=True)
+        self.assertEqual(
+            self.s.store.work_key(candidate), self.s.store.work_key(repeated)
+        )
+        self.assertFalse(self.s.store.enqueue(repeated))
 
     def test_new_input_can_reconsider_previously_blocked_conflict(self):
         self.failed_conflict_attempts()
@@ -1752,6 +1878,96 @@ class TestStoreWorker(unittest.TestCase):
 
 
 class TestIndependentGit(unittest.TestCase):
+    def rebase_fixture(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        root = Path(temp.name)
+        source = root / "source"
+        source.mkdir()
+
+        def git(*args):
+            return subprocess.run(
+                ["git", "-C", str(source), *args],
+                check=True,
+                text=True,
+                capture_output=True,
+            ).stdout.strip()
+
+        git("init", "-b", "main")
+        git("config", "user.name", "test")
+        git("config", "user.email", "test@example.invalid")
+        (source / "file").write_text("base\n")
+        git("add", ".")
+        git("commit", "-m", "base")
+        base = git("rev-parse", "HEAD")
+        git("checkout", "-b", "feature")
+        (source / "file").write_text("feature\n")
+        git("commit", "-am", "feature")
+        original = git("rev-parse", "HEAD")
+        git("checkout", "main")
+        (source / "file").write_text("target\n")
+        git("commit", "-am", "target")
+        target = git("rev-parse", "HEAD")
+        ws = Workspace(Config("test", root / "state", "o/r", "me", source))
+        ws.worker_ensure(2)
+        ws.worker_git(2, "config", "user.name", "test")
+        ws.worker_git(2, "config", "user.email", "test@example.invalid")
+        ws.worker_git(2, "checkout", "-b", "mo-bot/work/job", original)
+        return ws, base, original, target
+
+    def test_real_git_old_ancestor_is_noop_but_target_rebase_stops_and_resumes(self):
+        ws, base, original, target = self.rebase_fixture()
+        self.assertTrue(ws.worker_rebase(2, base))
+        self.assertEqual(ws.worker_git(2, "rev-parse", "HEAD"), original)
+        self.assertEqual(ws.worker_rebase_status(2, target), "pending")
+        self.assertFalse(ws.worker_rebase(2, target))
+        self.assertEqual(ws.worker_rebase_status(2, target), "conflicts")
+        with self.assertRaisesRegex(SourceChanged, "target differs"):
+            ws.worker_rebase_status(2, base)
+        (ws.worker_path(2) / "file").write_text("target and feature\n")
+        candidate = ws.worker_finalize(2, "fix: resolve target conflict")
+        self.assertNotEqual(candidate, original)
+        self.assertEqual(ws.worker_rebase_status(2, target), "complete")
+        self.assertEqual(
+            (ws.worker_path(2) / "file").read_text(), "target and feature\n"
+        )
+        self.assertEqual(ws.worker_rebase_status(2, target), "complete")
+
+    def test_reentry_keeps_old_archive_and_can_preserve_new_dirty_source(self):
+        ws, _, original, _ = self.rebase_fixture()
+
+        def own():
+            owner = ws.worker_path(2).parent / "worker-owner.json"
+            data = json.loads(owner.read_text())
+            data["job"] = "job"
+            owner.write_text(json.dumps(data))
+
+        own()
+        (ws.worker_path(2) / "file").write_text("old unfinished edit")
+        archive = ws.archive_worker(2, {"id": "job"})
+        retired = ws.retire_worker_archive({"id": "job"}, archive)
+        self.assertEqual(Path(retired, "file").read_text(), "old unfinished edit")
+        self.assertFalse(Path(archive).exists())
+        ws.worker_ensure(2)
+        own()
+        ws.worker_git(2, "checkout", "-b", "mo-bot/work/job", original)
+        (ws.worker_path(2) / "file").write_text("new unfinished edit")
+        current = ws.archive_worker(2, {"id": "job"})
+        self.assertEqual(Path(current, "file").read_text(), "new unfinished edit")
+        self.assertEqual(Path(retired, "file").read_text(), "old unfinished edit")
+
+    def test_real_git_missing_target_and_dirty_source_are_not_success(self):
+        ws, _, original, target = self.rebase_fixture()
+        with self.assertRaises(RuntimeError):
+            ws.worker_rebase_status(2, "f" * 40)
+        with self.assertRaisesRegex(ValueError, "invalid rebase target"):
+            ws.worker_fetch_target(2, "o/r", "--invalid")
+        (ws.worker_path(2) / "file").write_text("unfinished\n")
+        with self.assertRaises(RuntimeError):
+            ws.worker_rebase(2, target)
+        self.assertEqual(ws.worker_git(2, "rev-parse", "HEAD"), original)
+        self.assertEqual((ws.worker_path(2) / "file").read_text(), "unfinished\n")
+
     def test_archive_restore_dirty_source_and_idempotent_crash_recovery(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

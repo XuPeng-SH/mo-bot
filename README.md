@@ -204,6 +204,10 @@ a stopped task without deleting evidence or bypassing uncertain-write fences.
 Rerun follows the approved frozen plan, cause issues and current-head/latest-run
 budget checks. Repeated publication/Actions operations reconcile prior effects.
 
+Rebase design pins the actual target branch tip separately from the PR's historical base SHA. Implementation fetches that exact commit and verifies either a stopped rebase onto it or its ancestry in the candidate; an old `rebased=true` flag is never sufficient.
+
+Failed workers preserve owned source for `retry`/`resume`. For legacy failures without a recoverable source, `mo-botctl retry JOB_ID --from-input` retains diagnostics and restarts the same task from its frozen input, requiring new design and validation. It rejects active tools, completed tasks and attempted remote effects. Explicit reentry renews bounded attempt capacity while keeping lifetime counters; explicit repair is not blocked by the automatic admission budget.
+
 For deployment, drain first and wait for `dispatch_control.drained=true`:
 
 ```bash

@@ -101,3 +101,5 @@ the original host's native thread. A disconnected node pauses its dispatch while
 other nodes continue. Local tools must be reaped before remote lease release;
 unconfirmed cleanup exposes a node fence. Endpoint changes cannot move leased
 slots. Transport is stdio over SSH; REST remains loopback local.
+
+For a failed worker, `POST /api/jobs/JOB_ID/retry` with `{"from_input":true}` preserves prior diagnostics/source archives and restarts the same job/comment from its frozen input at design or triage. Existing implementation/final validation is not reused. Active tools, done/superseded tasks and attempted remote effects are rejected. Omit `from_input` to restore a preserved source at its existing phase.

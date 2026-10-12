@@ -44,6 +44,12 @@ def _main():
         p.add_argument("job_id")
         if name == "rerun":
             p.add_argument("--run-id", type=int, required=True)
+        if name == "retry":
+            p.add_argument(
+                "--from-input",
+                action="store_true",
+                help="retain diagnostics and restart a failed worker from its frozen source",
+            )
     for name in ["drain", "resume-service"]:
         p = commands.add_parser(name)
         p.add_argument("--reason", default="operator request")
@@ -100,6 +106,8 @@ def _main():
     elif args.command in ("pause", "resume", "retry", "cleanup", "rerun"):
         endpoint = f"/api/jobs/{args.job_id}/{args.command}"
         body = {"run_id": args.run_id} if args.command == "rerun" else {}
+        if args.command == "retry" and args.from_input:
+            body["from_input"] = True
     elif args.command == "job":
         endpoint = f"/api/jobs/{args.job_id}"
     elif args.command == "enqueue":

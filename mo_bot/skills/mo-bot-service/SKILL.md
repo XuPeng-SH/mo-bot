@@ -122,7 +122,7 @@ the checkpoint in a free slot. Failed source without a preserved owned checkpoin
 cannot be blindly restored. Publication retry reconciles the existing outbox;
 it does not repeat the model task. Cleanup cancels a stopped task and frees its
 lease/ref, retaining diagnostics/source evidence. It refuses uncertain remote
-effects; reconcile first. Completed/superseded tasks cannot be replayed. Rerun
+effects; reconcile first. Completed/superseded tasks cannot be replayed. Ordinary `retry` restores a preserved failed source and retains the current phase. If an older failure lacks a recoverable source checkpoint, explicitly use `mo-botctl retry JOB_ID --from-input`: it retains prior diagnostics/source archives, restarts the same job/comment at design (or triage) on the frozen input, and invalidates subsequent implementation/validation. It refuses attempted remote effects and live tools. Explicit retries receive a fresh bounded turn budget while preserving lifetime attempt numbers; automatic admission remains bounded. An explicit `repair PR` can reconsider input after the automatic admission budget is exhausted and reuses an already active matching task. Rerun
 requires the actual frozen xhigh gate, approved run ID, verified cause issues,
 current head/latest attempt and budget; repeated requests reconcile the same effect.
 
