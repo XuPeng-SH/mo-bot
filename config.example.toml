@@ -9,7 +9,7 @@ reviewer = "XuPeng-SH"
 source_dir = "/home/xupeng/matrixone"
 queue_script = "/home/xupeng/.codex/skills/mo-pr-review-queue/scripts/list_review_queue.py"
 sessions = 2
-model = "gpt-6.1-sol"
+model = "gpt-6-astra"
 reasoning_effort = "xhigh"
 exclude = [26145]
 stale_ci_days = 14
@@ -27,5 +27,5 @@ port = 8989
 # Optional creation defaults for individual slots. SQLite preserves later API changes.
 # [[session]]
 # slot = 0
-# model = "gpt-6.1-sol"
+# model = "gpt-6-astra"
 # reasoning_effort = "xhigh"

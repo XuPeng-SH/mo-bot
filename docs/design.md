@@ -24,7 +24,7 @@ On shutdown, cancel only owned process groups and retain recoverable workflow st
 
 Use SQLite transactions and fake GitHub and native JSON-RPC processes to test duplicate scans, two reusable slots across multiple PRs, lost sessions, restart during review/publication, ambiguous comment writes, source/head changes, timeouts and shutdown. Exercise real Codex session creation/resume and current GitHub discovery separately. No test posts to a real PR. Live service publication is authorized by the requested journey and begins only after these checks.
 
-Configuration selects slot count, model, discovery interval and limits. A token-authenticated loopback REST API exposes status, queue, sessions, models, force admission, conversation history, live messages and interruption; SSE streams bounded native notifications. Force admission bypasses eligibility filters, never commit uniqueness. Default local deployment: two sessions, one-minute discovery, gpt-6.1-sol/xhigh. No broker, generic plugin framework or second state machine is needed.
+Configuration selects slot count, model, discovery interval and limits. A token-authenticated loopback REST API exposes status, queue, sessions, models, force admission, conversation history, live messages and interruption; SSE streams bounded native notifications. Force admission bypasses eligibility filters, never commit uniqueness. Default local deployment: two sessions, one-minute discovery, gpt-6-astra/xhigh. No broker, generic plugin framework or second state machine is needed.
 
 ## REST and turn admission
 

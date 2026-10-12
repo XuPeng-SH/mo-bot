@@ -15,7 +15,7 @@ class Config:
     queue_script: Path
     sessions: int = 2
     poll_seconds: int = 60
-    model: str = "gpt-6.1-sol"
+    model: str = "gpt-6-astra"
     reasoning_effort: str = "xhigh"
     exclude: tuple[int, ...] = (26145,)
     stale_ci_days: int = 14

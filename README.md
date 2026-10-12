@@ -33,7 +33,7 @@ mo-botctl model 0 gpt-6.1-sol --effort medium
 mo-botctl events
 ```
 
-Read [API behavior](docs/api.md), [design and failure boundaries](docs/design.md), and the repo-local [operator skill](.agents/skills/mo-bot-service/SKILL.md). Defaults: two sessions, 60-second discovery, gpt-6.1-sol/xhigh. Per-slot creation models and dynamic selection are supported.
+Read [API behavior](docs/api.md), [design and failure boundaries](docs/design.md), and the repo-local [operator skill](.agents/skills/mo-bot-service/SKILL.md). Defaults: two sessions, 60-second discovery, gpt-6-astra/xhigh. Per-slot creation models and dynamic selection are supported.
 
 The service creates/updates PR issue comments with commit/service markers. It does not submit GitHub approvals or requested-changes review events. Reviews run against detached frozen checkouts; only diagnostic directories are writable by the model. It is a trusted local automation using the owner's identities, not a multi-tenant security boundary.
 
