@@ -416,7 +416,9 @@ class Store:
                 'publication_failures',json_extract(data,'$.publication_failures'),
                 'publication_started_at',json_extract(data,'$.publication_started_at'),
                 'phase_started_at',json_extract(data,'$.phase_started_at'),
-                'paused',json_extract(data,'$.paused')) AS data,
+                'paused',json_extract(data,'$.paused'),
+                'harness_request',json_extract(data,'$.harness_request'),
+                'harness_result',json_extract(data,'$.harness_result')) AS data,
             CASE WHEN result IS NULL THEN NULL ELSE json_object(
                 'assessment',json_object('decision',json_extract(result,'$.assessment.decision'),
                     'summary',json_extract(result,'$.assessment.summary')),
@@ -519,7 +521,12 @@ class Store:
                 (slot,),
             ).fetchone()
             if reserved:
-                if json.loads(reserved["data"]).get("paused"):
+                data = json.loads(reserved["data"])
+                request = data.get("harness_request", {})
+                if data.get("paused") or (
+                    request.get("status") in ("pending", "running")
+                    and request.get("expires_at", 0) > time.time()
+                ):
                     return None
                 if reserved["retry_at"] > time.time() or (
                     eligible is not None and reserved["id"] not in eligible
@@ -538,9 +545,10 @@ class Store:
                 choices = self.db.execute(
                     """SELECT j.* FROM jobs j WHERE j.state='queued' AND j.kind=? AND j.retry_at<=? AND (j.slot_id IS NULL OR j.slot_id=?)
                     AND COALESCE(json_extract(j.data,'$.paused'),0)=0
+                    AND NOT (COALESCE(json_extract(j.data,'$.harness_request.status'),'') IN ('pending','running') AND COALESCE(json_extract(j.data,'$.harness_request.expires_at'),0)>?)
                     AND NOT EXISTS(SELECT 1 FROM jobs a WHERE a.id<>j.id AND a.repo=j.repo AND (a.pr=j.pr OR (a.target_type='issue' AND j.target_type='issue' AND (a.target_number=j.target_number OR EXISTS(SELECT 1 FROM issue_members am JOIN issue_members jm ON jm.repo=am.repo AND jm.number=am.number WHERE am.job_id=a.id AND jm.job_id=j.id)))) AND
                     (a.state IN ('reviewing','publishing','canceling') OR (a.kind='work' AND a.state='queued' AND a.slot_id IS NOT NULL))) ORDER BY j.created""",
-                    (kind, time.time(), slot),
+                    (kind, time.time(), slot, time.time()),
                 ).fetchall()
                 job = next(
                     (

@@ -22,6 +22,7 @@ from .codex import (
 from .rpc import Backend, Events
 from .nodes import Nodes
 from .remote import CleanupPending, recover_host_tools
+from .harness import Harness
 from .github import GitHub
 from .store import Store
 from .worker import Worker
@@ -195,6 +196,7 @@ class Service:
         self.cooldown = 0.0
         self.stopping = False
         self.worker = Worker(self)
+        self.harness = Harness(self)
         self.discovery = Discovery(config, "review-discovery")
         self.admission = {}
         self.scan_error = None
@@ -657,7 +659,9 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
             if not job and slot["role"] != "classifier":
                 self.cooldown = time.monotonic() + 60
             if job and self.store.job(key)["state"] == "queued":
-                self.store.update(key, retry_at=time.time() + 60)
+                self.store.update(
+                    key, retry_at=max(self.store.job(key)["retry_at"], time.time() + 60)
+                )
             LOG.error("turn failed slot=%s job=%s error=%s", slot_id, key, message)
         finally:
             if turn.completed and not cleanup_pending:
@@ -821,10 +825,17 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
             job["metadata"] = json.loads(job["metadata"])
             job["data"] = json.loads(job["data"])
             job["result"] = json.loads(job["result"]) if job["result"] else None
+            harness_request = job["data"].get("harness_request") or {}
+            harness_result = job["data"].get("harness_result") or {}
+            harness_waiting = (
+                harness_request.get("status") in ("pending", "running")
+                and harness_request.get("expires_at", 0) > time.time()
+            )
             job["dispatchable"] = (
                 job["state"] == "queued"
                 and not self.dispatch_control["paused"]
                 and not job["data"].get("paused")
+                and not harness_waiting
                 and job["id"] in self.eligible
                 and job["retry_at"] <= time.time()
             )
@@ -836,6 +847,8 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
                     if job["data"].get("paused")
                     else "service draining"
                     if self.dispatch_control["paused"]
+                    else "semantic harness coordination"
+                    if harness_waiting
                     else "retry backoff"
                     if job["retry_at"] > time.time()
                     else status.get("reason", "awaiting successful discovery")
@@ -844,6 +857,10 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
                 )
             job["attention_required"] = bool(
                 job["data"].get("paused")
+                or (
+                    harness_result.get("status") in ("needs_input", "error")
+                    and harness_result.get("request_id") == harness_request.get("id")
+                )
                 or (
                     job["error"]
                     and job["state"] in ("queued", "publishing", "failed", "canceling")
@@ -861,7 +878,9 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
                 "job_id": j["id"],
                 "pr": j["pr"],
                 "state": j["state"],
-                "reason": j["error"],
+                "reason": j["error"]
+                or (j["data"].get("harness_result") or {}).get("guidance")
+                or (j["data"].get("harness_result") or {}).get("rationale"),
                 "manual_required": j["manual_required"],
                 "next_retry_at": j["next_retry_at"],
             }
@@ -1073,6 +1092,11 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
             "rerun_job",
         ):
             return self.control_job(action, args)
+        if action == "guide_job":
+            request = self.harness.request(
+                args.get("job_id"), "operator", args.get("text", "")
+            )
+            return {"job_id": args.get("job_id"), "request": request}
         if action == "job":
             job = self.store.job(args["job_id"])
             if job is None:
@@ -1367,6 +1391,7 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
 
     def tick(self):
         self.handle_commands()
+        self.harness.poll()
         if self.stopping:
             return
         if not self.backend or self.backend.dead:

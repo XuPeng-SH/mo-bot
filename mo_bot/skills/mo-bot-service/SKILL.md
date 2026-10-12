@@ -64,6 +64,14 @@ New same-head feedback invalidates a frozen worker assessment. Before any remote
 
 If `mo-botctl` is missing from PATH, try `~/.local/bin/mo-botctl`. If neither exists, report installation missing; do not guess a running service or silently start a replacement daemon. The source installer is `python3 scripts/install.py`; packaged installs use `mo-bot install`.
 
+## Exceptional coordination and task intent
+
+The existing local `classifier` slot shares its reusable `gpt-6-luna/xhigh` session between issue grouping and harness advice; it is not another worker or approval authority. Normal worker phases do not call it. Blocked checkpoints, repeated execution/protocol errors and five minutes without native activity may request advice. Silence alone never authorizes interruption; an inactivity decision is rate limited to ten minutes per task. Requests bind job/head/phase/attempt/native turn, expire after three minutes and survive restart. Queued tasks await a pending decision only until that deadline. Timeout, unavailable model, disabled pool or invalid advice releases that wait and preserves diagnostics and original guidance. Repeated execution failures retain source and use backoff rather than exhausting a lifetime task budget; ownership/cleanup/write uncertainty remains fenced.
+
+Use `mo-botctl guide JOB_ID 'continue the missing validation / revise the invalid plan / pause …'` for task-level natural-language guidance. `POST /api/jobs/JOB_ID/guide` accepts `{"text":"…"}`. It applies to queued, running or failed worker tasks, never publishing/terminal completed tasks or attempted remote effects. Existing `chat SLOT`, `pause`, `resume`, `retry --hint` remain direct controls; prefer them for an urgent deterministic operation or when the semantic model is unavailable.
+
+Harness may steer the exact active turn, suggest continuation, return a preserved queued implementation to the mandatory read-only xhigh design gate, ask for concrete missing input, or route an explicit operator pause/resume through existing controls. Automatic advice cannot pause; no recommendation approves, publishes, reruns CI or changes a frozen target. Replanning an active implementation asks it to preserve a blocked checkpoint first. Low-confidence advice asks instead of acting. Questions appear as attention alerts without imposing a permanent queue fence; worker guidance requires independent progress and forbids assuming an unanswered prerequisite. Check `job.data.harness_request` and `harness_result` for IDs, reason, deadline, action, explanation and execution status, also exposed in status summaries and `harness/result` events. An acknowledgement only queues advice; it is not proof that a suggested action ran. After an error or `decided` status inspect the native/job state before resubmitting guidance; uncertain steering is not blindly replayed.
+
 ## Delivery pool
 
 Operate the shared worker queue using `mo-botctl repair PR` (configured owner's

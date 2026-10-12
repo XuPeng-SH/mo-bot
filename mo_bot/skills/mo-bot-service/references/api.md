@@ -17,6 +17,7 @@ Default address: `http://127.0.0.1:8989`. Every request requires `Authorization:
 | `POST /api/jobs/JOB_ID/pause` / `resume` / `retry` with `{}` | Checkpoint pause/resume or reconcile saved publication; worker resume/retry accept optional `{"hint":"…"}` for the next model turn |
 | `POST /api/jobs/JOB_ID/cleanup` with `{}` | Cancel stopped task, free resources, retain evidence; uncertain effects are refused |
 | `POST /api/jobs/JOB_ID/rerun` with `{"run_id":123}` | Frozen approved current-head Actions rerun, with cause issues and outbox/budget guards |
+| `POST /api/jobs/JOB_ID/guide` with `{"text":"…"}` | Durable worker task guidance through shared Luna xhigh harness; inspect `data.harness_request` / `harness_result` for eventual action, question or fallback |
 | `GET /api/sessions/0/history` | Latest 20 native history items; continue using `?cursor=NEXT_CURSOR` (bounded pagination) |
 | `GET /api/events?after=CURSOR&thread=THREAD_ID` | SSE native text/tool/status notifications, sequence IDs and heartbeat |
 | `POST /api/jobs` with `{"pr":123,"force":true}` | Force admission of current open PR/head; `enqueued:false` and existing job for duplicates |

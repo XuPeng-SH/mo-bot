@@ -240,6 +240,22 @@ class TestHTTP(unittest.TestCase):
                 service.request.assert_called_once_with(
                     "resize_pool", {"role": "worker", "sessions": 4}
                 )
+                c.request(
+                    "POST",
+                    "/api/jobs/job-A/guide",
+                    '{"text":"Continue validation","job_id":"wrong"}',
+                    headers,
+                )
+                r = c.getresponse()
+                self.assertEqual(r.status, 200)
+                self.assertEqual(
+                    json.loads(r.read()),
+                    {
+                        "action": "guide_job",
+                        "job_id": "job-A",
+                        "text": "Continue validation",
+                    },
+                )
                 c.request("GET", "/api/pools", headers=headers)
                 r = c.getresponse()
                 self.assertEqual(r.status, 200)

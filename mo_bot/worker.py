@@ -774,6 +774,8 @@ class Worker:
         return compatible[:8]
 
     def dispatch_classifier(self, slot):
+        if self.s.harness.dispatch(slot):
+            return
         if not self.classification_queue:
             return
         candidate = self.classification_queue.pop(0)
@@ -878,6 +880,9 @@ class Worker:
             self.discovery_errors[f"issue:{candidate['number']}"] = str(error)[:2000]
 
     def classifier_complete(self, slot_id, result):
+        if slot_id in self.s.harness.pending:
+            self.s.harness.complete(slot_id, result)
+            return
         pending = self.classifications.pop(slot_id, None)
         if not pending:
             return
@@ -904,6 +909,7 @@ class Worker:
             self.enqueue_issue_singleton(candidate)
 
     def classifier_failed(self, slot_id, error):
+        self.s.harness.failed(slot_id, error)
         pending = self.classifications.pop(slot_id, None)
         if pending:
             self.enqueue_issue_singleton(pending[0])
@@ -1594,7 +1600,8 @@ Return every schema field. causes holds independently proven environment/flaky a
             correction_stalls=stalled,
             coordinator_feedback=feedback[:4000],
         )
-        if stalled:
+        coordinate = self.s.harness.enabled
+        if stalled or coordinate:
             # Preserve uncommitted changes and release capacity during backoff.
             data["workspace_archive"] = self.ws.archive_worker(slot["id"], job)
             self.checkpoint(
@@ -1603,18 +1610,53 @@ Return every schema field. causes holds independently proven environment/flaky a
                 phase=next_phase,
                 state="queued",
                 slot_id=None,
-                error="Repeated acceptance gaps without source progress: " + feedback,
-                retry_at=time.time() + min(3600, 60 * 2 ** min(stalled - 1, 6)),
+                error="Repeated acceptance gaps without source progress: " + feedback
+                if stalled
+                else None,
+                retry_at=time.time() + min(3600, 60 * 2 ** min(stalled - 1, 6))
+                if stalled
+                else 0,
             )
         else:
             self.checkpoint(job, data, phase=next_phase, state="queued", error=None)
+        if coordinate:
+            self.s.harness.request(job["id"], "blocked", feedback)
 
     def retry(self, job, error):
         job = self.store.job(job["id"])
         data = json.loads(job["data"])
         data["recoveries"] = data.get("recoveries", 0) + 1
         if data["recoveries"] > self.config.max_recoveries:
-            self.fail(job, error)
+            # Escalate repeated execution/protocol failures to coordination,
+            # retaining the checkpoint instead of exhausting the task forever.
+            if job["slot_id"] is not None and not data.get("workspace_archive"):
+                try:
+                    data["workspace_archive"] = self.ws.archive_worker(
+                        job["slot_id"], job
+                    )
+                except (OSError, ValueError, RuntimeError) as preservation_error:
+                    self.fail(
+                        job,
+                        str(error)
+                        + "; source preservation: "
+                        + str(preservation_error),
+                    )
+                    return
+            data["coordinator_feedback"] = str(error)[:4000]
+            self.checkpoint(
+                job,
+                data,
+                state="queued",
+                slot_id=None,
+                error=str(error),
+                retry_at=time.time()
+                + min(
+                    3600,
+                    60
+                    * 2 ** min(data["recoveries"] - self.config.max_recoveries - 1, 6),
+                ),
+            )
+            self.s.harness.request(job["id"], "execution_error", str(error)[:4000])
         else:
             self.checkpoint(job, data, state="queued", error=str(error))
 

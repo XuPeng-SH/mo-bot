@@ -545,6 +545,324 @@ class TestWorker(unittest.TestCase):
         self.s.command("resize_pool", {"role": "classifier", "sessions": 1})
         return next(s for s in self.s.store.slots() if s["role"] == "classifier")
 
+    def harness_slot(self):
+        self.s.models.append(
+            {
+                "model": "gpt-6-luna",
+                "supportedReasoningEfforts": [{"reasoningEffort": "xhigh"}],
+            }
+        )
+        return self.classifier_slot()
+
+    def harness_advice(self, request, action="continue", **changes):
+        return {
+            "request_id": request["id"],
+            "action": action,
+            "confidence": 95,
+            "rationale": "Missing validation needs execution",
+            "guidance": "Run the missing SQL controls",
+            **changes,
+        }
+
+    def test_harness_blocked_checkpoint_uses_shared_luna_and_preserves_source(self):
+        semantic = self.harness_slot()
+        self.phase(self.job())
+        self.phase(self.s.store.claim(2))
+        job = self.phase(
+            self.s.store.claim(2),
+            classification="blocked",
+            accepted=False,
+            validation_complete=False,
+            limitations=["SQL controls unexecuted"],
+        )
+        request = json.loads(job["data"])["harness_request"]
+        self.assertEqual((job["state"], job["slot_id"]), ("queued", None))
+        self.ws.archive_worker.assert_called_once()
+        self.assertIsNone(self.s.store.claim(2))
+        self.s.refresh_status()
+        status = next(j for j in self.s.status["jobs"] if j["id"] == job["id"])
+        self.assertEqual(status["wait_reason"], "semantic harness coordination")
+        self.w.dispatch_classifier(semantic)
+        selected = self.s.backend.start.call_args.args[0]
+        self.assertEqual(
+            (selected["model"], selected["effort"], selected["source_write"]),
+            ("gpt-6-luna", "xhigh", False),
+        )
+        self.w.classifier_complete(semantic["id"], self.harness_advice(request))
+        job = self.s.store.claim(2)
+        self.w.launch(self.slot, job)
+        self.ws.restore_worker.assert_called_once()
+        self.assertIn(
+            "Run the missing SQL controls", self.s.backend.start.call_args.args[3]
+        )
+        self.ws.worker_finalize.assert_not_called()
+        self.assertFalse(self.gh.writes)
+
+    def test_harness_invalidated_design_returns_to_read_only_gate(self):
+        semantic = self.harness_slot()
+        self.phase(self.job())
+        self.phase(self.s.store.claim(2))
+        job = self.phase(
+            self.s.store.claim(2),
+            classification="blocked",
+            accepted=False,
+            summary="Fixture disproves accepted design",
+        )
+        data = json.loads(job["data"])
+        self.w.dispatch_classifier(semantic)
+        self.w.classifier_complete(
+            semantic["id"], self.harness_advice(data["harness_request"], "replan")
+        )
+        job = self.s.store.claim(2)
+        self.assertEqual(job["phase"], "design")
+        self.assertEqual(
+            json.loads(job["data"])["workspace_archive"], data["workspace_archive"]
+        )
+        self.assertNotIn("design", json.loads(job["data"]))
+        self.w.launch(self.slot, job)
+        selected = self.s.backend.start.call_args.args[0]
+        self.assertEqual(
+            (selected["model"], selected["effort"], selected["source_write"]),
+            ("gpt-6.1-sol", "xhigh", False),
+        )
+        self.ws.worker_finalize.assert_not_called()
+        self.assertFalse(self.gh.writes)
+
+    def test_harness_running_guidance_targets_exact_turn_and_stale_advice_is_ignored(
+        self,
+    ):
+        semantic = self.harness_slot()
+        job = self.job()
+        turn = Mock(completed=False, turn_id="turn-A", directory=self.root)
+        self.s.turns[2] = (turn, job["id"])
+        request = self.s.command(
+            "guide_job",
+            {"job_id": job["id"], "text": "Focus on performance validation"},
+        )["request"]
+        self.w.dispatch_classifier(semantic)
+        self.w.classifier_complete(semantic["id"], self.harness_advice(request))
+        turn.steer.assert_called_once()
+        self.assertIn("Focus on performance validation", turn.steer.call_args.args[0])
+        self.assertEqual(self.s.store.job(job["id"])["state"], "reviewing")
+        request = self.s.harness.request(job["id"], "operator", "Now check cleanup")
+        self.s.turns.pop(semantic["id"], None)
+        self.w.dispatch_classifier(semantic)
+        turn.turn_id = "turn-B"
+        self.w.classifier_complete(
+            semantic["id"], self.harness_advice(request, "pause")
+        )
+        self.assertEqual(turn.steer.call_count, 1)
+        turn.stop.assert_not_called()
+        self.assertEqual(
+            json.loads(self.s.store.job(job["id"])["data"])["harness_result"]["status"],
+            "stale",
+        )
+
+    def test_harness_new_operator_input_supersedes_pending_advice(self):
+        semantic = self.harness_slot()
+        job = self.job()
+        self.s.store.update(job["id"], state="queued", slot_id=None)
+        first = self.s.harness.request(job["id"], "operator", "Review performance")
+        self.w.dispatch_classifier(semantic)
+        second = self.s.harness.request(job["id"], "operator", "Pause instead")
+        duplicate = self.s.harness.request(job["id"], "operator", "Pause instead")
+        self.assertEqual(second["id"], duplicate["id"])
+        self.w.classifier_complete(semantic["id"], self.harness_advice(first))
+        data = json.loads(self.s.store.job(job["id"])["data"])
+        self.assertEqual(data["operator_hint"], "Pause instead")
+        self.assertEqual(data["harness_request"]["id"], second["id"])
+        self.assertEqual(data["harness_request"]["status"], "pending")
+        self.assertNotIn("coordinator_feedback", data)
+
+    def test_harness_expiry_restart_and_disabled_pool_release_queue(self):
+        semantic = self.harness_slot()
+        job = self.job()
+        self.s.store.update(job["id"], state="queued", slot_id=None)
+        self.s.harness.request(job["id"], "blocked", "Need SQL tests")
+        self.w.dispatch_classifier(semantic)
+        self.s.harness.pending.clear()
+        self.s.harness.poll()
+        data = json.loads(self.s.store.job(job["id"])["data"])
+        self.assertEqual(data["harness_request"]["status"], "pending")
+        self.assertIsNone(self.s.store.claim(2))
+        data["harness_request"]["expires_at"] = time.time() - 1
+        self.s.store.update(job["id"], data=json.dumps(data))
+        self.s.harness.next_poll = 0
+        self.s.harness.poll()
+        self.assertEqual(
+            json.loads(self.s.store.job(job["id"])["data"])["harness_result"]["status"],
+            "fallback",
+        )
+        self.s.store.claim(2)
+        self.s.store.update(job["id"], state="queued", slot_id=None)
+        self.s.harness.request(job["id"], "blocked")
+        self.s.command("resize_pool", {"role": "classifier", "sessions": 0})
+        self.s.harness.next_poll = 0
+        self.s.harness.poll()
+        self.assertIsNotNone(self.s.store.claim(2))
+
+    def test_harness_invalid_output_and_automatic_pause_cannot_stop_work(self):
+        semantic = self.harness_slot()
+        job = self.job()
+        self.s.store.update(job["id"], state="queued", slot_id=None)
+        for changes in (
+            {"request_id": "wrong"},
+            {"confidence": True},
+            {"guidance": "x" * 4001},
+            {"action": "pause"},
+        ):
+            request = self.s.harness.request(job["id"], "blocked", "Missing checks")
+            self.w.dispatch_classifier(semantic)
+            self.w.classifier_complete(
+                semantic["id"], self.harness_advice(request, **changes)
+            )
+            data = json.loads(self.s.store.job(job["id"])["data"])
+            self.assertEqual(data["harness_result"]["status"], "fallback")
+            self.assertFalse(data.get("paused"))
+            self.assertIsNotNone(self.s.store.claim(2))
+            self.s.store.update(job["id"], state="queued", slot_id=None)
+        self.assertFalse(self.gh.writes)
+
+    def test_harness_native_start_failure_falls_back_without_losing_task(self):
+        semantic = self.harness_slot()
+        job = self.job()
+        self.s.store.update(job["id"], state="queued", slot_id=None)
+        self.s.harness.request(job["id"], "operator", "Execute missing tests")
+        self.s.backend.start.side_effect = RuntimeError("provider unavailable")
+        self.w.dispatch_classifier(semantic)
+        data = json.loads(self.s.store.job(job["id"])["data"])
+        self.assertEqual(data["operator_hint"], "Execute missing tests")
+        self.assertEqual(data["harness_result"]["status"], "fallback")
+        self.assertFalse(self.s.harness.pending)
+        self.assertIsNotNone(self.s.store.claim(2))
+
+    def test_harness_inactivity_is_bounded_and_not_normal_path(self):
+        self.harness_slot()
+        job = self.job()
+        turn = Mock(
+            completed=False,
+            turn_id="long-turn",
+            last_activity_at=time.time(),
+            directory=self.root,
+        )
+        self.s.turns[2] = (turn, job["id"])
+        self.s.harness.poll()
+        self.assertNotIn(
+            "harness_request", json.loads(self.s.store.job(job["id"])["data"])
+        )
+        turn.last_activity_at -= 301
+        self.s.harness.next_poll = 0
+        self.s.harness.poll()
+        request = json.loads(self.s.store.job(job["id"])["data"])["harness_request"]
+        self.assertEqual(request["reason"], "inactive")
+        self.s.harness.next_poll = 0
+        self.s.harness.poll()
+        self.assertEqual(
+            json.loads(self.s.store.job(job["id"])["data"])["harness_request"]["id"],
+            request["id"],
+        )
+        turn.stop.assert_not_called()
+        self.s.backend.start.assert_not_called()
+
+    def test_harness_ask_is_visible_without_permanent_dispatch_gate(self):
+        semantic = self.harness_slot()
+        job = self.job()
+        self.s.store.update(job["id"], state="queued", slot_id=None)
+        self.s.eligible.add(job["id"])
+        request = self.s.harness.request(job["id"], "operator", "Use another machine")
+        self.w.dispatch_classifier(semantic)
+        self.w.classifier_complete(
+            semantic["id"],
+            self.harness_advice(
+                request, "ask", confidence=50, guidance="Which supported SSH node?"
+            ),
+        )
+        self.s.refresh_status()
+        item = next(j for j in self.s.status["jobs"] if j["id"] == job["id"])
+        self.assertTrue(item["attention_required"])
+        self.assertTrue(item["dispatchable"])
+        self.assertEqual(
+            item["data"]["harness_result"]["guidance"], "Which supported SSH node?"
+        )
+        self.assertIsNotNone(self.s.store.claim(2))
+
+    def test_harness_operator_resume_uses_existing_checkpoint_controls(self):
+        semantic = self.harness_slot()
+        job = self.job()
+        self.s.store.update(
+            job["id"],
+            state="failed",
+            slot_id=None,
+            data=json.dumps({"workspace_archive": str(self.root / "saved-source")}),
+            error="Missing SQL validation",
+        )
+        request = self.s.command(
+            "guide_job",
+            {"job_id": job["id"], "text": "Continue and execute missing checks"},
+        )["request"]
+        self.w.dispatch_classifier(semantic)
+        self.w.classifier_complete(semantic["id"], self.harness_advice(request))
+        restored = self.s.store.job(job["id"])
+        self.assertEqual(restored["state"], "queued")
+        self.ws.restore_worker.assert_called_once()
+        self.assertIn(
+            "Run the missing SQL controls",
+            json.loads(restored["data"])["coordinator_feedback"],
+        )
+        self.assertEqual(restored["id"], job["id"])
+        self.assertFalse(self.gh.writes)
+
+    def test_harness_attempted_effects_and_terminal_jobs_refuse_guidance(self):
+        self.harness_slot()
+        job = self.job()
+        effect = self.s.store.prepare_effect(
+            "delivery", job["id"], "push", {"candidate": NEW}
+        )
+        self.s.store.effect_update(effect["key"], attempted=1)
+        with self.assertRaisesRegex(ValueError, "reconciliation"):
+            self.s.command("guide_job", {"job_id": job["id"], "text": "Continue"})
+        self.s.store.update(job["id"], state="done")
+        with self.assertRaises(ValueError):
+            self.s.command("guide_job", {"job_id": job["id"], "text": "Continue"})
+        self.assertNotIn(
+            "harness_request", json.loads(self.s.store.job(job["id"])["data"])
+        )
+
+    def test_repeated_execution_failure_escalates_without_terminal_budget(self):
+        self.harness_slot()
+        job = self.job()
+        self.s.store.update(
+            job["id"], data=json.dumps({"recoveries": self.s.config.max_recoveries})
+        )
+        self.w.retry(
+            self.s.store.job(job["id"]), RuntimeError("final action plan mismatch")
+        )
+        job = self.s.store.job(job["id"])
+        data = json.loads(job["data"])
+        self.assertEqual((job["state"], job["slot_id"]), ("queued", None))
+        self.assertEqual(data["harness_request"]["reason"], "execution_error")
+        self.assertGreater(job["retry_at"], time.time())
+        self.ws.archive_worker.assert_called_once()
+        self.assertEqual(data["coordinator_feedback"], "final action plan mismatch")
+        self.assertFalse(self.gh.writes)
+
+    def test_harness_explicit_operator_pause_and_resume_use_safe_controls(self):
+        semantic = self.harness_slot()
+        job = self.job()
+        self.s.store.update(job["id"], state="queued", slot_id=None)
+        request = self.s.harness.request(job["id"], "operator", "Pause this task")
+        self.w.dispatch_classifier(semantic)
+        self.w.classifier_complete(
+            semantic["id"], self.harness_advice(request, "pause")
+        )
+        self.assertTrue(json.loads(self.s.store.job(job["id"])["data"])["paused"])
+        request = self.s.harness.request(job["id"], "operator", "Continue now")
+        self.w.dispatch_classifier(semantic)
+        self.w.classifier_complete(semantic["id"], self.harness_advice(request))
+        self.assertFalse(json.loads(self.s.store.job(job["id"])["data"])["paused"])
+        self.assertEqual(self.s.store.job(job["id"])["state"], "queued")
+        self.assertFalse(self.gh.writes)
+
     def test_semantic_grouping_uses_luna_xhigh(self):
         target = self.w.issue_candidate(5)
         self.s.store.enqueue(target)

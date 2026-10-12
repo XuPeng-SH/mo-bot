@@ -57,6 +57,9 @@ def _main():
     for name in ["drain", "resume-service"]:
         p = commands.add_parser(name)
         p.add_argument("--reason", default="operator request")
+    p = commands.add_parser("guide")
+    p.add_argument("job_id")
+    p.add_argument("text")
     p = commands.add_parser("chat")
     p.add_argument("slot", type=int)
     p.add_argument("text")
@@ -114,6 +117,9 @@ def _main():
             body["from_input"] = True
         if args.command in ("resume", "retry") and args.hint is not None:
             body["hint"] = args.hint
+    elif args.command == "guide":
+        endpoint = f"/api/jobs/{args.job_id}/guide"
+        body = {"text": args.text}
     elif args.command == "job":
         endpoint = f"/api/jobs/{args.job_id}"
     elif args.command == "enqueue":

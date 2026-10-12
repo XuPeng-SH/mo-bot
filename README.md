@@ -252,3 +252,25 @@ Individual failed checks/statuses can enqueue repair before the overall workflow
 finishes. Review and repair queue independently but the shared PR fence prevents
 concurrent execution; failure evidence prevents repeated enqueue. Pending CI is
 never reported as passed, and actual reruns still require a terminal failed run.
+
+### Harness guidance
+
+The optional classifier pool shares one reusable `gpt-6-luna/xhigh` session for
+issue grouping and exceptional worker coordination. Normal tasks run directly;
+blocked checkpoints, repeated execution failures and native inactivity may ask
+for a bounded next-step recommendation. SQLite retains requests and outcomes.
+Model failure or timeout releases the coordination wait without approving work.
+
+```bash
+mo-botctl resize classifier 1
+mo-botctl guide JOB_ID 'Continue from the preserved source and execute missing SQL checks'
+mo-botctl job JOB_ID
+```
+
+Task guidance can steer a running turn, resume a failed/paused checkpoint, or
+return an invalid implementation plan to the independent design gate. Only an
+explicit operator request can pause a task. Direct `chat`, `pause`, `resume` and
+`retry --hint` remain available. Inspect `data.harness_request` and
+`data.harness_result`: admission is not execution, stale advice is discarded,
+and missing input is reported as an attention alert. No advice bypasses source
+ownership, tool cleanup or publication fences.

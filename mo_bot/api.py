@@ -120,7 +120,8 @@ class API:
                     if (
                         parts[:2] == ["api", "jobs"]
                         and len(parts) == 4
-                        and parts[3] in ("pause", "resume", "retry", "cleanup", "rerun")
+                        and parts[3]
+                        in ("pause", "resume", "retry", "cleanup", "rerun", "guide")
                     ):
                         self.dispatch(parts[3] + "_job", {**body, "job_id": parts[2]})
                         return
