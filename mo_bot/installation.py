@@ -16,6 +16,7 @@ import tempfile
 from .config import Config
 
 PACKAGE = Path(__file__).resolve().parent
+SKILL_NAMES = ("mo-bot-service", "mo-bot-review", "mo-bot-worker", "issue-to-pr")
 DEFAULT_CONFIG = Path.home() / ".config/mo-bot/config.toml"
 
 
@@ -130,7 +131,7 @@ def doctor(path):
             "detail": f"{available:.1f} GiB free; requires {config.minimum_free_gib} GiB",
         }
     )
-    for name in ("mo-bot-service", "mo-bot-review", "mo-bot-worker"):
+    for name in SKILL_NAMES:
         checks.append(
             {
                 "check": name + " packaged skill",
@@ -221,7 +222,7 @@ def install(
             plan[prefix / "bin" / name] = {"link": str(source)}
     for directory in skill_dirs:
         directory = Path(directory).expanduser().resolve()
-        for name in ("mo-bot-service", "mo-bot-review", "mo-bot-worker"):
+        for name in SKILL_NAMES:
             source = PACKAGE / "skills" / name
             if not (source / "SKILL.md").is_file():
                 raise ValueError(f"packaged skill missing: {name}")

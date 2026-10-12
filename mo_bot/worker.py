@@ -14,6 +14,7 @@ from .discovery import Discovery
 
 LOG = logging.getLogger("mo-bot")
 SKILL = Path(__file__).parent / "skills/mo-bot-worker/SKILL.md"
+ISSUE_SKILL = Path(__file__).parent / "skills/issue-to-pr/SKILL.md"
 PHASES = ("triage", "design", "implement", "final_review")
 FAILURES = {"failure", "timed_out", "action_required", "startup_failure"}
 ISSUE_GROUP_SCHEMA = {
@@ -1241,8 +1242,12 @@ class Worker:
                 slot["id"], "diff", "--find-renames", merge_base, state["head"]
             )
         )
-        prompt = SKILL.read_text().split("---", 2)[2].strip()
-        if self.config.issue_skill:
+        prompt = ISSUE_SKILL.read_text().split("---", 2)[2].strip()
+        prompt += "\n\n" + SKILL.read_text().split("---", 2)[2].strip()
+        if (
+            self.config.issue_skill
+            and self.config.issue_skill.resolve() != ISSUE_SKILL.resolve()
+        ):
             prompt += "\n\n" + self.config.issue_skill.read_text()
         prompt += f"""\nAssigned issue-to-PR task. CURRENT scope replaces earlier tasks: job={job["id"]}, input_head={job["head"]}, phase={job["phase"]}, target={job["repo"]}#{job["target_number"]} ({job["target_type"]}).
 Actual model/effort for this phase: {selected["model"]}/{selected["effort"]}. Coordinator runs the separate design and final_review native gates. No delegation. Frozen evidence: {directory}/evidence.json and semantic atoms in {directory}/task-input.json; accepted stage/evidence ledger: {directory}/checkpoint.json and {directory.parent}/task.json. Reuse earlier exact-input evidence. Candidate currently HEAD={state["head"]}; merge-base={merge_base}. Complete delta: {directory}/change.patch.

@@ -21,4 +21,4 @@ mo-botctl = "mo_bot.client:main"
 include = ["mo_bot*"]
 
 [tool.setuptools.package-data]
-mo_bot = ["skills/*/SKILL.md", "skills/*/references/*.md"]
+mo_bot = ["skills/*/SKILL.md", "skills/*/references/*.md", "skills/*/agents/*.yaml"]

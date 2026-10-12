@@ -68,9 +68,10 @@ class TestInstallation(unittest.TestCase):
         with patch("mo_bot.installation.subprocess.run") as command:
             self.assertEqual(installed, self.deploy())
             command.assert_not_called()
-        for name in ("mo-bot-service", "mo-bot-review", "mo-bot-worker"):
+        for name in ("mo-bot-service", "mo-bot-review", "mo-bot-worker", "issue-to-pr"):
             self.assertTrue((self.skills / name / "SKILL.md").is_file())
         self.assertTrue((self.skills / "mo-bot-service/references/api.md").is_file())
+        self.assertTrue((self.skills / "issue-to-pr/agents/openai.yaml").is_file())
         self.assertEqual(uninstall(self.prefix), [])
         self.assertTrue(all(not Path(name).is_symlink() for name in installed))
         self.assertEqual(self.config.read_text(), "user config")
@@ -86,6 +87,17 @@ class TestInstallation(unittest.TestCase):
         self.assertFalse((self.prefix / "bin/mo-bot").exists())
         self.assertFalse(manifest_path(self.prefix).exists())
         self.assertEqual((foreign / "SKILL.md").read_text(), "custom instructions")
+
+    def test_foreign_issue_workflow_is_preserved_without_partial_install(self):
+        foreign = self.skills / "issue-to-pr"
+        foreign.mkdir(parents=True)
+        (foreign / "SKILL.md").write_text("operator workflow")
+        with self.assertRaisesRegex(ValueError, "unowned"):
+            self.deploy()
+        self.assertFalse((self.prefix / "bin/mo-bot").exists())
+        self.assertFalse((self.skills / "mo-bot-worker").exists())
+        self.assertFalse(manifest_path(self.prefix).exists())
+        self.assertEqual((foreign / "SKILL.md").read_text(), "operator workflow")
 
     def test_interrupted_installation_can_be_retried(self):
         original = Path.symlink_to

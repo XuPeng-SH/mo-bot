@@ -359,6 +359,30 @@ class TestWorker(unittest.TestCase):
         self.assertEqual(selected["effort"], "low")
         self.assertFalse(selected["source_write"])
         self.assertEqual(self.s.store.job(job["id"])["phase"], "triage")
+        from mo_bot.worker import ISSUE_SKILL
+
+        workflow = ISSUE_SKILL.read_text().split("---", 2)[2].strip()
+        prompt = self.s.backend.start.call_args.args[3]
+        self.assertEqual(prompt.count(workflow), 1)
+        self.assertNotIn("Explicit issue-to-pr gate", prompt)
+
+    def test_custom_workflow_supplements_bundled_workflow(self):
+        from mo_bot.worker import ISSUE_SKILL
+
+        self.w.launch(self.slot, self.job(issue=True))
+        prompt = self.s.backend.start.call_args.args[3]
+        self.assertIn(ISSUE_SKILL.read_text().split("---", 2)[2].strip(), prompt)
+        self.assertIn("Explicit issue-to-pr gate", prompt)
+
+    def test_configured_bundled_workflow_is_not_loaded_twice(self):
+        from mo_bot.worker import ISSUE_SKILL
+
+        self.w.config = replace(self.w.config, issue_skill=ISSUE_SKILL)
+        self.w.launch(self.slot, self.job(issue=True))
+        prompt = self.s.backend.start.call_args.args[3]
+        self.assertEqual(
+            prompt.count(ISSUE_SKILL.read_text().split("---", 2)[2].strip()), 1
+        )
 
     def classifier_candidate(self, number=6):
         candidate = copy.deepcopy(self.w.issue_candidate(5))

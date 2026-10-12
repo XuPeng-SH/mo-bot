@@ -72,8 +72,9 @@ same-root-cause matches into a compatible, early task (maximum three issues).
 Uncertain matches and classifier/model failures remain separate issue jobs.
 Inspect role, phase, error and native session in jobs/sessions.
 `[worker] sessions` controls delivery capacity; its default model is
-gpt-6.1-sol/low. Worker instructions live in repo-owned mo-bot-worker; issue-to-pr
-actual xhigh design/final gates are mandatory. Do not bypass default-ref guards
+gpt-6.1-sol/low. Worker assignments live in repo-owned mo-bot-worker; the bundled
+issue-to-pr workflow owns shared requirements and mandatory xhigh design/final
+gates. Do not bypass default-ref guards
 or retry uncertain GitHub writes manually.
 
 ## SSH session nodes

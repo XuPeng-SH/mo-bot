@@ -18,7 +18,7 @@ mo-bot serve
 
 The reviewer defaults to the authenticated GitHub user. `init --reviewer LOGIN` selects another reviewer's queue; `--worker-sessions 2` enables repairs for the authenticated owner. Existing config is never overwritten. The default config is `~/.config/mo-bot/config.toml`; `--config PATH` works before or after the server subcommand. The old `mo-bot --config PATH` server invocation remains supported.
 
-Alternatively, install a Python package with `python3 -m pip install .` (or `-e .` for development), then run `mo-bot install` to install its skills. Wheels include the operator, reviewer and worker skills and API reference. Source installs link CLI/skills to the checkout, so keep that checkout in place. Package installs link skills to the installed package. No source compilation is required.
+Alternatively, install a Python package with `python3 -m pip install .` (or `-e .` for development), then run `mo-bot install` to install its skills. Wheels include the operator, reviewer, worker and shared issue-to-pr skills, their invocation metadata and API reference. Source installs link CLI/skills to the checkout, so keep that checkout in place. Package installs link skills to the installed package. No source compilation is required.
 
 Skills install into both `~/.codex/skills` and `~/.claude/skills` by default. Use `--agent codex`, `--agent claude`, or repeated `--skill-dir PATH` for custom agent directories. Restart/reload the agent's skill discovery after installation. The `mo-bot-service` skill tells an agent how to configure, preflight, start and operate the service. Its API reference and the worker/reviewer policy ship with the same package.
 
@@ -73,8 +73,12 @@ The existing five-minute scan automatically admits only the configured reviewer'
 open non-draft, non-excluded PRs with new review feedback, conflicts or failed CI.
 It does not require green CI. Other authors' PRs remain review-only.
 
-Every task uses the bundled `mo-bot-worker` skill. An optional `issue_skill`
-configuration supplies supplementary instructions. Triage → actual `gpt-6.1-sol/xhigh` design → writable
+Every task uses the bundled `issue-to-pr` workflow and `mo-bot-worker` assignment
+contract. The installer provides both skills; no file under an operator's home is
+required. An optional `issue_skill` configuration supplies additional custom
+instructions; omit it for the bundled workflow. Existing external skills are not
+overwritten by installation: preserve or relocate them before migrating to the
+bundled skill. Triage → actual `gpt-6.1-sol/xhigh` design → writable
 implementation → actual `gpt-6.1-sol/xhigh` overall review run as native turns in
 one retained session. Corrections are bounded; mandatory gates cannot be lowered
 by changing the session default. Unknown CI causes and unavailable validation
