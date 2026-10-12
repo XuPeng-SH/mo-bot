@@ -31,6 +31,12 @@ ISSUE_GROUP_SCHEMA = {
 ISSUE_GROUP_LIMIT = 3
 ISSUE_MERGE_MAX_AGE = 15 * 60
 ISSUE_MERGE_PHASE_AGE = 5 * 60
+
+
+class WorkerInputChanged(SourceChanged):
+    """A new PR head or evidence invalidates the frozen assessment."""
+
+
 SCHEMA = {
     "type": "object",
     "additionalProperties": False,
@@ -1094,11 +1100,10 @@ class Worker:
                 effect = self.store.effect("push:" + job["id"])
                 if effect and effect["attempted"]:
                     expected_heads.add(json.loads(effect["intent"])["candidate"])
-            if (
-                any(identity[k] != v for k, v in actual.items())
-                or pr["head"]["sha"] not in expected_heads
-            ):
-                raise SourceChanged("PR identity or input head changed")
+            if any(identity[k] != v for k, v in actual.items()):
+                raise SourceChanged("PR identity changed")
+            if pr["head"]["sha"] not in expected_heads:
+                raise WorkerInputChanged("PR input head changed")
             if refresh_evidence and pr["head"]["sha"] == job["head"]:
                 latest = self.gather_candidate(job["pr"])
                 known = set(
@@ -1107,7 +1112,7 @@ class Worker:
                     )
                 )
                 if any(a["key"] not in known for a in latest["atoms"]):
-                    raise SourceChanged(
+                    raise WorkerInputChanged(
                         "new same-head PR feedback/CI evidence requires a fresh task"
                     )
         else:
@@ -1190,6 +1195,8 @@ class Worker:
         )
         job = self.store.job(job["id"])
         data = json.loads(job["data"])
+        if job["error"] and not data.get("paused"):
+            data["coordinator_feedback"] = job["error"][:4000]
         if job["phase"] not in PHASES:
             raise ValueError("invalid worker phase")
         # Legacy checkpoints did not distinguish the historical base from the
@@ -1313,6 +1320,16 @@ Only implement may edit assigned source; all phases may write diagnostic artifac
 Return every schema field. causes holds independently proven environment/flaky actions even when classification=pr_defect and source repair is also needed. In design, failure_dispositions must cover every failed-CI atom key from the task metadata/evidence: classify each with concrete causal evidence, and associate environment/flaky keys with causes[].evidence_keys. Unknown or mixed unresolved causes block; never discard one failure because another is fixed. Final_review must confirm the same per-failure/causes plan. job_id={job["id"]}, head_sha={job["head"]}, phase={job["phase"]}, candidate_head={state["head"]} (implementation returns pre-coordinator HEAD). Empty irrelevant fields. accepted means this phase actually meets its evidence/validation requirements. Never classify unknown CI as flaky/environment. Supply concrete logs/control evidence and stable cause_signature excluding PR/head/run/time for proven environment/flaky. Recommend only current-head failed Actions run IDs from frozen evidence; coordinator verifies latest attempts/budgets. Rebase only for actual conflict/dependency; propose in design. checkpoint.rebase_target is the coordinator-pinned actual target; base_sha/merge-base may be historical ancestors. An accepted rebase design must use that exact target, never select another SHA in an unstructured artifact. Design must accept an implementable plan; implementation needs regression/SCA/relevant UT and race checks (or justified inapplicability) with retained commands/results. Final_review reads complete exact committed candidate, checks required validation and returns findings/limitations; unavailable checks mean accepted=false/validation_complete=false. Include Conventional commit_message, final PR template body and issue descriptions when applicable. No speculative blockers.
 """
         prompt += "\nFor issue tasks, covered_issues must exactly list every issue number in frozen evidence. For PR repair tasks, covered_issues is empty. Do not advance while a member issue is omitted.\n"
+        if data.get("coordinator_feedback"):
+            prompt += (
+                "\nCoordinator feedback from the previous attempt; resolve the handoff or report its concrete blocker:\n"
+                + data["coordinator_feedback"]
+            )
+        if data.get("operator_hint"):
+            prompt += (
+                "\nOperator guidance for this task, within its frozen target and assigned phase:\n"
+                + data["operator_hint"]
+            )
         self.checkpoint(
             job, data, attempts=attempt, turn_dir=str(directory), error=None
         )
@@ -1455,6 +1472,7 @@ Return every schema field. causes holds independently proven environment/flaky a
         }
         phase = job["phase"]
         data["recoveries"] = 0
+        data.pop("coordinator_feedback", None)
         # Preserve accepted output before coordinator commit/rebase actions, so
         # a recoverable handoff error cannot erase the completed model work.
         self.checkpoint(job, data)
@@ -2100,13 +2118,28 @@ Return every schema field. causes holds independently proven environment/flaky a
                         error,
                     )
         except Exception as error:
+            if (
+                isinstance(error, WorkerInputChanged)
+                and not self.store.db.execute(
+                    "SELECT 1 FROM effects WHERE job_id=? AND attempted=1", (job["id"],)
+                ).fetchone()
+            ):
+                # Nothing was sent: there is no ambiguous write to reconcile.
+                # Retain result/ref evidence while releasing the old PR fence.
+                data.pop("manual_reconciliation", None)
+                data.pop("publication_next_at", None)
+                data.pop("publication_failures", None)
+                self.store.dispose_evidence(job, "superseded")
+                self.checkpoint(
+                    job, data, state="superseded", slot_id=None, error=str(error)
+                )
+                LOG.info("worker unpublished assessment superseded job=%s", job["id"])
+                return
             # Retain target + slot fence for uncertain effects or changed candidates.
             data["publication_failures"] = data.get("publication_failures", 0) + 1
-            manual = (
-                isinstance(error, (ValueError, SourceChanged))
-                or "manual reconciliation" in str(error)
-                or data["publication_failures"] > self.config.max_recoveries
-            )
+            manual = isinstance(
+                error, (ValueError, SourceChanged)
+            ) or "manual reconciliation" in str(error)
             data["manual_reconciliation"] = manual
             data["publication_next_at"] = time.time() + min(
                 300, 60 * data["publication_failures"]

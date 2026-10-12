@@ -515,6 +515,46 @@ class TestWorker(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "failed worker task"):
             self.s.command("retry_job", {"job_id": job["id"], "from_input": True})
 
+    def test_retry_hint_and_rejection_reach_next_turn_without_cross_job_leak(self):
+        job = self.phase(self.job())
+        self.s.turns.clear()
+        self.ws.worker_path.return_value = self.root / "missing-old-source"
+        self.s.store.update(
+            job["id"],
+            state="failed",
+            slot_id=None,
+            error="missing grouped cause fields",
+        )
+        hint = "Reuse the completed checks; inspect the coordinator handoff first."
+        self.s.command(
+            "retry_job", {"job_id": job["id"], "from_input": True, "hint": hint}
+        )
+        restored = self.s.store.job(job["id"])
+        self.assertEqual(restored["comment_id"], job["comment_id"])
+        self.w.launch(self.slot, self.s.store.claim(2))
+        prompt = self.s.backend.start.call_args.args[3]
+        self.assertIn(hint, prompt)
+        self.assertIn("missing grouped cause fields", prompt)
+        data = json.loads(self.s.store.job(job["id"])["data"])
+        self.assertEqual(data["operator_hint"], hint)
+
+        self.s.store.enqueue(self.w.pr_candidate(2, explicit=True))
+        other = self.s.store.claim(3)
+        slot = next(s for s in self.s.store.slots() if s["id"] == 3)
+        self.w.launch(slot, other)
+        prompt = self.s.backend.start.call_args.args[3]
+        self.assertNotIn(hint, prompt)
+        self.assertNotIn("missing grouped cause fields", prompt)
+
+    def test_invalid_hint_does_not_mutate_or_start_a_turn(self):
+        job = self.job()
+        before = dict(job)
+        for hint in (42, "x" * 8001):
+            with self.assertRaisesRegex(ValueError, "hint must be text"):
+                self.s.command("retry_job", {"job_id": job["id"], "hint": hint})
+        self.assertEqual(dict(self.s.store.job(job["id"])), before)
+        self.s.backend.start.assert_not_called()
+
     def classifier_candidate(self, number=6):
         candidate = copy.deepcopy(self.w.issue_candidate(5))
         candidate["number"] = number
@@ -1194,6 +1234,14 @@ class TestWorker(unittest.TestCase):
         self.w.publish(job)
         held = self.s.store.job(job["id"])
         self.assertEqual((held["state"], held["slot_id"]), ("publishing", None))
+        # Transient reads keep backing off even after the old attempt limit.
+        for _ in range(self.s.config.max_recoveries + 1):
+            data = json.loads(held["data"])
+            data["publication_next_at"] = 0
+            self.s.store.update(job["id"], data=json.dumps(data))
+            self.w.publish(self.s.store.job(job["id"]))
+            held = self.s.store.job(job["id"])
+        self.assertFalse(json.loads(held["data"])["manual_reconciliation"])
         self.s.store.enqueue(
             {"repo": "matrixorigin/repo", "number": 1, "headRefOid": HEAD}
         )
@@ -1452,6 +1500,60 @@ class TestWorker(unittest.TestCase):
         )
         with self.assertRaisesRegex(SourceChanged, "same-head"):
             self.w.check_input(job, refresh_evidence=True)
+        self.assertFalse(self.gh.writes)
+
+    def publication_with_new_feedback(self, head=HEAD):
+        self.phase(self.job())
+        self.phase(self.s.store.claim(2))
+        self.phase(self.s.store.claim(2))
+        self.ws.worker_state.return_value = {
+            **self.ws.worker_state.return_value,
+            "head": NEW,
+        }
+        job = self.phase(self.s.store.claim(2))
+        self.s.turns.clear()
+        self.gh.prs[1]["head"]["sha"] = head
+        self.gh.comments_data.append(
+            {"id": 7, "user": {"id": 9}, "body": "another material causal bug"}
+        )
+        candidate = self.w.pr_candidate(1, explicit=True)
+        self.s.store.enqueue(candidate)
+        return job, self.s.store.work_key(candidate)
+
+    def test_unpublished_stale_assessment_releases_pr_fence(self):
+        job, next_id = self.publication_with_new_feedback()
+        self.assertIsNone(self.s.store.claim(3))
+        self.w.publish(job)
+        old = self.s.store.job(job["id"])
+        self.assertEqual((old["state"], old["slot_id"]), ("superseded", None))
+        data = json.loads(old["data"])
+        self.assertNotIn("manual_reconciliation", data)
+        self.assertEqual(data["candidate"], NEW)
+        self.assertIn("publication_ref", data)
+        self.assertIsNotNone(old["result"])
+        self.assertFalse(self.gh.writes)
+        self.assertEqual(self.s.store.claim(3)["id"], next_id)
+
+    def test_stale_assessment_with_attempted_write_keeps_pr_fence(self):
+        job, _ = self.publication_with_new_feedback()
+        self.s.store.prepare_effect(
+            "push:" + job["id"], job["id"], "push", {"candidate": NEW}
+        )
+        self.s.store.effect_update("push:" + job["id"], attempted=1)
+        self.w.publish(job)
+        old = self.s.store.job(job["id"])
+        self.assertEqual(old["state"], "publishing")
+        self.assertTrue(json.loads(old["data"])["manual_reconciliation"])
+        self.assertIsNone(self.s.store.claim(3))
+        self.assertFalse(self.gh.writes)
+
+    def test_unpublished_assessment_on_old_head_releases_pr_fence(self):
+        job, next_id = self.publication_with_new_feedback(head="d" * 40)
+        self.w.publish(job)
+        old = self.s.store.job(job["id"])
+        self.assertEqual(old["state"], "superseded")
+        self.assertNotIn("manual_reconciliation", json.loads(old["data"]))
+        self.assertEqual(self.s.store.claim(3)["id"], next_id)
         self.assertFalse(self.gh.writes)
 
     def test_issue_base_default_change_rejected_but_sha_drift_is_recorded(self):

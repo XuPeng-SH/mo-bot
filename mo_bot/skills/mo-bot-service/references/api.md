@@ -14,7 +14,7 @@ Default address: `http://127.0.0.1:8989`. Every request requires `Authorization:
 | `GET /api/nodes` | Transport/endpoint, connectivity or cleanup fence, remote model catalogs |
 | `GET /api/alerts` | Publication errors/manual fences and native inactivity warnings |
 | `POST /api/service/drain` / `resume` with `{"reason":"…"}` | Persisted dispatch/publication pause; active turns finish into checkpoints |
-| `POST /api/jobs/JOB_ID/pause` / `resume` / `retry` with `{}` | Checkpoint pause/resume or reconcile saved publication; no gate bypass |
+| `POST /api/jobs/JOB_ID/pause` / `resume` / `retry` with `{}` | Checkpoint pause/resume or reconcile saved publication; worker resume/retry accept optional `{"hint":"…"}` for the next model turn |
 | `POST /api/jobs/JOB_ID/cleanup` with `{}` | Cancel stopped task, free resources, retain evidence; uncertain effects are refused |
 | `POST /api/jobs/JOB_ID/rerun` with `{"run_id":123}` | Frozen approved current-head Actions rerun, with cause issues and outbox/budget guards |
 | `GET /api/sessions/0/history` | Latest 20 native history items; continue using `?cursor=NEXT_CURSOR` (bounded pagination) |
@@ -103,3 +103,5 @@ unconfirmed cleanup exposes a node fence. Endpoint changes cannot move leased
 slots. Transport is stdio over SSH; REST remains loopback local.
 
 For a failed worker, `POST /api/jobs/JOB_ID/retry` with `{"from_input":true}` preserves prior diagnostics/source archives and restarts the same job/comment from its frozen input at design or triage. Existing implementation/final validation is not reused. Active tools, done/superseded tasks and attempted remote effects are rejected. Omit `from_input` to restore a preserved source at its existing phase.
+
+Worker resume/retry accept `hint` (up to 8,000 characters); it is task-scoped, durable across turns, and an empty string clears it. Active turns use session chat/steer. Publishing has no model turn and refuses hints; write reconciliation remains separate. Transport failures retain automatic publication backoff. A new PR head or new same-head evidence supersedes an unpublished assessment when no remote effect was attempted, preserving its result/ref and releasing its PR fence.

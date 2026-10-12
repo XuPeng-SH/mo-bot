@@ -1537,6 +1537,17 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
         if job is None:
             raise ValueError("unknown job")
         data = json.loads(job["data"])
+        if "hint" in args:
+            if action not in ("resume_job", "retry_job") or job["kind"] != "work":
+                raise ValueError("hint requires a worker resume or retry")
+            if not isinstance(args["hint"], str) or len(args["hint"]) > 8000:
+                raise ValueError("hint must be text of at most 8000 characters")
+        guidance = args.get("hint", data.get("operator_hint"))
+        feedback = (
+            job["error"]
+            if job["kind"] == "work" and not data.get("paused")
+            else data.get("coordinator_feedback")
+        )
         current = next(
             (
                 (slot, turn)
@@ -1552,6 +1563,10 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
             job = self.store.job(job["id"])
             data = json.loads(job["data"])
             current = None
+        if "hint" in args and job["state"] == "publishing":
+            raise ValueError(
+                "publishing has no model turn; reconcile or use a fresh-input task"
+            )
         if "from_input" in args and type(args["from_input"]) is not bool:
             raise ValueError("from_input must be a boolean")
         if args.get("from_input"):
@@ -1602,6 +1617,10 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
             }
             if triage.get("result", {}).get("accepted"):
                 data["triage"] = triage
+            if guidance:
+                data["operator_hint"] = guidance
+            if feedback:
+                data["coordinator_feedback"] = feedback[:4000]
             self.store.update(
                 job["id"],
                 state="queued",
@@ -1771,6 +1790,12 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
                     "failed workspace needs explicit preservation/cleanup before resume"
                 )
             data.update(paused=False, recoveries=0)
+            if guidance:
+                data["operator_hint"] = guidance
+            else:
+                data.pop("operator_hint", None)
+            if feedback:
+                data["coordinator_feedback"] = feedback[:4000]
             data.pop("reentry_attempts_base", None)
             data.pop("manual_reconciliation", None)
             data.pop("publication_next_at", None)

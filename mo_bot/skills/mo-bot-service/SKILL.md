@@ -60,6 +60,8 @@ A failed/ambiguous initial comment POST is deliberately fenced. Inspect the job 
 
 Use `updated_at`, queue counts and backend/session state to distinguish stale status, eligibility wait, model failure and actual execution. SSE is bounded and emits gaps: reload the paginated native history when events are missing. Do not describe green CI or an idle session as proof of a successful review. Report exact job/head, session/model, validation evidence and limits.
 
+New same-head feedback invalidates a frozen worker assessment. Before any remote write attempt, publication supersedes that task, retains its result and candidate ref, and releases the PR fence so fresh-input tasks can run. This is ordinary input churn, not manual reconciliation. A previously attempted effect keeps its reconciliation fence. For legacy publishing tasks stopped by the same-head evidence error, inspect their effect records first; explicit retry rechecks the live input and safely applies this rule when no write was attempted.
+
 If `mo-botctl` is missing from PATH, try `~/.local/bin/mo-botctl`. If neither exists, report installation missing; do not guess a running service or silently start a replacement daemon. The source installer is `python3 scripts/install.py`; packaged installs use `mo-bot install`.
 
 ## Delivery pool
@@ -115,6 +117,8 @@ mo-botctl retry JOB_ID
 mo-botctl cleanup JOB_ID
 mo-botctl rerun JOB_ID --run-id RUN_ID
 ```
+
+For a running turn, `mo-botctl chat SLOT 'guidance'` steers it immediately. For a stopped worker, use `mo-botctl retry JOB_ID --hint 'guidance'` or `resume JOB_ID --hint 'guidance'`. The latest hint stays with that durable task, appears in subsequent worker prompts and never carries into other jobs sharing the slot; an empty hint clears it. The coordinator also includes its previous rejection reason in the next worker prompt. Hints do not change the frozen target or bypass publication/write fences. Publishing has no model turn: reconcile uncertain effects or allow fresh-input work to replace a safely unpublished stale assessment.
 
 Pause interrupts the turn, waits for tool cleanup, archives owned worker source
 including uncommitted edits/rebase metadata, then releases the slot. Resume restores

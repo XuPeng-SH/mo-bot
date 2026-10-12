@@ -42,6 +42,10 @@ def _main():
     for name in ["pause", "resume", "retry", "cleanup", "rerun"]:
         p = commands.add_parser(name)
         p.add_argument("job_id")
+        if name in ("resume", "retry"):
+            p.add_argument(
+                "--hint", help="task guidance for the next worker turn; empty clears it"
+            )
         if name == "rerun":
             p.add_argument("--run-id", type=int, required=True)
         if name == "retry":
@@ -108,6 +112,8 @@ def _main():
         body = {"run_id": args.run_id} if args.command == "rerun" else {}
         if args.command == "retry" and args.from_input:
             body["from_input"] = True
+        if args.command in ("resume", "retry") and args.hint is not None:
+            body["hint"] = args.hint
     elif args.command == "job":
         endpoint = f"/api/jobs/{args.job_id}"
     elif args.command == "enqueue":
