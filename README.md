@@ -274,3 +274,8 @@ explicit operator request can pause a task. Direct `chat`, `pause`, `resume` and
 `data.harness_result`: admission is not execution, stale advice is discarded,
 and missing input is reported as an attention alert. No advice bypasses source
 ownership, tool cleanup or publication fences.
+
+Independent environment/flaky CI failures (including transient GitHub API and
+proven flaky TLS/network failures) do not automatically create GitHub issues.
+The default `worker.cause_issues = false` retains causal evidence and bounded
+approved reruns; uncertain previous writes still require reconciliation.

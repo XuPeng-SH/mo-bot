@@ -1511,7 +1511,35 @@ class TestWorker(unittest.TestCase):
             self.w.launch(self.slot, job)
         self.s.backend.start.assert_not_called()
 
+    def test_default_environment_policy_publishes_diagnosis_without_cause_issue(self):
+        job = self.phase(self.job())
+        diagnosis = dict(
+            classification="environment",
+            cause_signature="GitHub API socket hang up",
+            issue_title="",
+            issue_body="",
+        )
+        self.phase(self.s.store.claim(2), **diagnosis)
+        job = self.phase(self.s.store.claim(2), **diagnosis)
+        self.w.publish(job)
+        self.assertEqual(self.s.store.job(job["id"])["state"], "done")
+        self.assertFalse(self.gh.issues)
+        self.assertFalse(self.gh.writes)
+        self.assertEqual(
+            self.s.store.db.execute(
+                "SELECT COUNT(*) FROM effects WHERE kind='cause-issue'"
+            ).fetchone()[0],
+            0,
+        )
+        self.assertIsNone(
+            self.w.cause_issue(
+                job,
+                {"classification": "flaky", "cause_signature": "TLS handshake timeout"},
+            )
+        )
+
     def test_write_timeout_reconciles_once_without_repeating_post(self):
+        self.s.config = self.w.config = replace(self.s.config, worker_cause_issues=True)
         job = self.job()
         diagnosis = {
             "classification": "flaky",
@@ -1523,6 +1551,10 @@ class TestWorker(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.w.cause_issue(job, diagnosis)
         self.gh.ambiguous = False
+        # Disabling new cause issues cannot discard an attempted write fence.
+        self.s.config = self.w.config = replace(
+            self.s.config, worker_cause_issues=False
+        )
         issue = self.w.cause_issue(job, diagnosis)
         self.assertEqual(issue["number"], 1000)
         self.assertEqual(len(self.gh.writes), 1)
@@ -1532,6 +1564,7 @@ class TestWorker(unittest.TestCase):
         self.assertEqual(len(self.gh.writes), 1)
 
     def test_successful_issue_receipt_bypasses_search_index_lag(self):
+        self.s.config = self.w.config = replace(self.s.config, worker_cause_issues=True)
         job = self.job()
         diagnosis = {
             "classification": "flaky",
@@ -1556,6 +1589,7 @@ class TestWorker(unittest.TestCase):
         self.assertFalse(any("issues?state=all" in e for e in calls))
 
     def test_incomplete_cause_search_cannot_authorize_an_issue_write(self):
+        self.s.config = self.w.config = replace(self.s.config, worker_cause_issues=True)
         job = self.job()
         original = self.gh.api
         self.gh.api = lambda endpoint, **kwargs: (
@@ -1576,6 +1610,7 @@ class TestWorker(unittest.TestCase):
         self.assertFalse(self.gh.writes)
 
     def test_publication_timeout_releases_model_slot_but_retains_pr_fence(self):
+        self.s.config = self.w.config = replace(self.s.config, worker_cause_issues=True)
         job = self.phase(
             self.job(),
             classification="flaky",
@@ -2097,6 +2132,7 @@ class TestWorker(unittest.TestCase):
         )
 
     def test_mixed_failures_each_have_disposition_and_issue_precedes_source_push(self):
+        self.s.config = self.w.config = replace(self.s.config, worker_cause_issues=True)
         self.gh.checks = [
             {
                 "id": 1,

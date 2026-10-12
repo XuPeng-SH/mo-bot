@@ -33,6 +33,8 @@ port = 8989
 
 # Separate delivery pool. Zero preserves review-only deployments.
 [worker]
+# Keep independent environment/flaky CI diagnostics in task/PR evidence.
+cause_issues = false
 sessions = 0
 classifier_sessions = 1
 model = "gpt-6.1-sol"

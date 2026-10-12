@@ -27,7 +27,7 @@ Classify PR-caused failure as pr_defect and implement the causal fix. Environmen
 failure_dispositions with concrete evidence. Mixed PR-caused and independent
 failures need both an implementation and causes[] issue actions linked by
 evidence_keys; never discard one failure because another was fixed. The final
-gate must confirm the same per-failure dispositions and issue/rerun plan. Supply stable cause_signature containing component/failure class, excluding PR/head/run IDs and timestamps. Describe the issue with useful reproduction and evidence. Recommend only frozen current-head terminal failed Actions run IDs; coordinator verifies association, latest attempts and budgets. Rebase only for actual conflict/dependency. Never rebase just to chase base churn.
+gate must confirm the same per-failure dispositions and issue/rerun plan. Supply stable cause_signature containing component/failure class, excluding PR/head/run IDs and timestamps. By default, environment/flaky diagnoses are retained in task evidence and the PR result without creating GitHub issues. Transient GitHub API socket resets and proven flaky TLS/network failures must not generate issues. Recommend a bounded rerun only after proving independence; unknown failures remain blocked. Issue text fields may be empty under this policy; descriptive legacy fields never authorize a write. Recommend only frozen current-head terminal failed Actions run IDs; coordinator verifies association, latest attempts and budgets. Rebase only for actual conflict/dependency. Never rebase just to chase base churn.
 
 A noop requires evidence the requested problem is already solved or inapplicable. The final gate still verifies a noop or infrastructure diagnosis.
 

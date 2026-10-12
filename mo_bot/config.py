@@ -40,6 +40,7 @@ class Config:
     worker_tasks_per_head: int = 4
     worker_reruns_per_head: int = 2
     worker_scan_limit: int = 20
+    worker_cause_issues: bool = False
     worker_allowed_head_repos: tuple[str, ...] = ()
 
     @classmethod
@@ -88,6 +89,7 @@ class Config:
             worker_tasks_per_head=worker.get("tasks_per_head", 4),
             worker_reruns_per_head=worker.get("reruns_per_head", 2),
             worker_scan_limit=worker.get("scan_limit", 20),
+            worker_cause_issues=worker.get("cause_issues", False),
             worker_allowed_head_repos=tuple(worker.get("allowed_head_repos", [])),
         )
         if not re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", cfg.service_id):
@@ -100,6 +102,8 @@ class Config:
             raise ValueError("sessions must be 1..8 and poll_seconds >= 10")
         if not 0 <= cfg.worker_sessions <= 8:
             raise ValueError("worker.sessions must be 0..8")
+        if type(cfg.worker_cause_issues) is not bool:
+            raise ValueError("worker.cause_issues must be a boolean")
         if cfg.classifier_sessions not in (0, 1):
             raise ValueError("worker.classifier_sessions must be 0 or 1")
         if any(
