@@ -622,6 +622,27 @@ class TestWorker(unittest.TestCase):
             )
         self.assertFalse(self.gh.writes)
 
+    def test_environment_grouped_cause_advances_without_legacy_fields(self):
+        job = self.phase(self.job())
+        job = self.phase(
+            self.s.store.claim(2),
+            classification="environment",
+            causes=[
+                {
+                    "classification": "environment",
+                    "cause_signature": "checkout TLS failure",
+                    "issue_title": "CI checkout fails before tests",
+                    "issue_body": "Failed checkout log with same-head passing control",
+                    "evidence": ["checkout log and same-head build control"],
+                    "evidence_keys": [],
+                    "rerun_ids": [],
+                }
+            ],
+        )
+        self.assertEqual(job["phase"], "final_review")
+        self.assertEqual(job["state"], "queued")
+        self.assertFalse(self.gh.writes)
+
     def test_unresolved_final_validation_enters_bounded_correction(self):
         job = self.phase(self.job())
         job = self.phase(self.s.store.claim(2))

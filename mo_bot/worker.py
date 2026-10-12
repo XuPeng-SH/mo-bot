@@ -1485,15 +1485,8 @@ Return every schema field. causes holds independently proven environment/flaky a
                 "environment",
                 "flaky",
             ):
-                if (
-                    not result["evidence"]
-                    or not result["cause_signature"]
-                    or not result["issue_title"]
-                    or not result["issue_body"]
-                ):
-                    raise ValueError(
-                        "environment/flaky diagnosis lacks concrete cause evidence"
-                    )
+                # validate_dispositions already validates normalized causes,
+                # including legacy top-level data. Do not require both forms.
                 # This task creates an issue and may rerun; no source edits are required.
                 if result["rebase"]:
                     data["needs_rebase"] = True
