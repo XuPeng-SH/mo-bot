@@ -9,10 +9,35 @@ from unittest.mock import Mock
 
 from mo_bot.api import API
 from mo_bot.config import Config
-from mo_bot.rpc import Backend, Events
+from mo_bot.rpc import Backend, Events, Turn
 
 
 class TestRPC(unittest.TestCase):
+    def test_job_cache_is_shared_and_included_in_sandbox_without_source_write(self):
+        with tempfile.TemporaryDirectory(prefix="mo bot ") as tmp:
+            root = Path(tmp)
+            cfg = Config("test", root, "o/r", "me", root)
+            node_cfg = Config("test", root / "nodes/idc55", "o/r", "me", root)
+            backend = Mock(
+                config=node_cfg, host_config=cfg, lock=threading.RLock(), turns={}
+            )
+            backend.turn_params.side_effect = lambda turn, params: params
+            backend.call.return_value = {"turn": {"id": "turn"}}
+            slot = {"session_id": "thread", "model": "fake", "effort": "low"}
+            directory = root / "jobs/task/design-1"
+            turn = Turn(backend, slot, directory, root / "source", "review", None)
+            params = backend.call.call_args.args[1]
+            self.assertEqual(
+                params["sandboxPolicy"]["writableRoots"],
+                [str(directory), str(root / "jobs/task/cache")],
+            )
+            self.assertTrue((root / "jobs/task/cache").is_dir())
+            self.assertIn("save logs, reports and evidence", params["input"][0]["text"])
+            self.assertIn("export GOCACHE='", params["input"][0]["text"])
+            self.assertEqual(
+                turn.scratch_env["GOMODCACHE"], str(root / "jobs/task/cache/go-mod")
+            )
+
     def test_stdio_responses_events_reuse_and_disconnect(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

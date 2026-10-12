@@ -37,6 +37,13 @@ The service submits `REQUEST_CHANGES` for confirmed findings, `APPROVE` for a su
 
 ## Review status and history
 
+`status.scratch_cleanup` reports automatic task scratch reclamation and errors.
+Terminal task `tmp` and shared Go `cache` are detached only after live-turn and
+process/bind-mount checks, then removed in the background. Failures retry every
+minute and after restart, including while dispatch is drained. Source, task
+logs/results/evidence, SQLite and reusable session history are retained. Keep
+needed validation logs outside scratch; failed-task reentry rebuilds caches.
+
 For “在 review 什么 / 进展 / 之前 review 了哪些 / 结果”, use `mo-botctl status` and `mo-botctl jobs` first. These return compact summaries; use `mo-botctl job JOB_ID` for full immutable evidence, data and assessment. Map each session's `job_id` to job `pr/head/state`; report selected versus active model. `updated_at` is snapshot freshness, not proof that tools are advancing.
 
 To ask a RUNNING session directly, use `mo-botctl progress SLOT`. This steers the current turn to report evidence, work remaining and blockers as commentary, then continue review. It does not cancel the turn or create an idle conversation; a stale turn ID is rejected. Read the actual reply via history/events: the steer acknowledgement alone is not a progress report.

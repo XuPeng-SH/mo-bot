@@ -4,12 +4,15 @@ from collections import deque
 from concurrent.futures import Future
 import json
 import os
+from pathlib import Path
 import select
+import shlex
 import subprocess
 import threading
 import time
 
 from .codex import broken_session, process_identity, stop_owned
+from .artifacts import scratch_env
 
 
 class Events:
@@ -282,8 +285,17 @@ class Turn:
         self.directory = directory
         directory.mkdir(parents=True, exist_ok=True)
         (directory / "tmp").mkdir(exist_ok=True)
+        self.scratch_env = scratch_env(
+            getattr(backend, "host_config", backend.config).state_dir, directory
+        )
+        cache_root = Path(self.scratch_env["GOCACHE"]).parent
+        cache_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        cache_exports = "; ".join(
+            f"export {key}={shlex.quote(value)}"
+            for key, value in self.scratch_env.items()
+        )
         prompt = (
-            f"Source checkout: {workspace}. Use explicit paths; source is {'writable for assigned edits only; Git metadata/remote writes belong to the coordinator' if source_write else 'read-only'}. For checks, export TMPDIR, GOTMPDIR, GOCACHE and GOMODCACHE to subdirectories under {directory}/tmp.\n"
+            f"Source checkout: {workspace}. Use explicit paths; source is {'writable for assigned edits only; Git metadata/remote writes belong to the coordinator' if source_write else 'read-only'}. For checks use: {cache_exports}. Reuse these task caches across retries; do not create additional Go caches. tmp and cache are disposable after the task ends: save logs, reports and evidence needed by later phases outside them, in {directory}.\n"
             + prompt
         )
         (directory / "prompt.txt").write_text(prompt)
@@ -311,6 +323,11 @@ class Turn:
             "sandboxPolicy": {
                 "type": "workspaceWrite",
                 "writableRoots": [str(directory)]
+                + (
+                    [str(cache_root)]
+                    if not cache_root.is_relative_to(directory)
+                    else []
+                )
                 + ([str(workspace)] if source_write else []),
                 "networkAccess": True,
                 "excludeSlashTmp": True,

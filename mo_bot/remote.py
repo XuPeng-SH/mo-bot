@@ -13,6 +13,7 @@ import uuid
 
 from .rpc import Backend
 from .codex import stop_owned
+from .artifacts import scratch_env
 
 
 class CleanupPending(RuntimeError):
@@ -151,11 +152,7 @@ class HostTools:
                 {
                     "command": ["/bin/sh", "-c", args["command"]],
                     "cwd": str(cwd),
-                    "env": {
-                        "TMPDIR": str(directory / "tmp"),
-                        "GOTMPDIR": str(directory / "tmp"),
-                        "GOWORK": "off",
-                    },
+                    "env": scratch_env(self.remote.host_config.state_dir, directory),
                     "timeoutMs": budget * 1000,
                     "outputBytesCap": 65536,
                     "processId": process,

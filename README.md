@@ -204,6 +204,16 @@ a stopped task without deleting evidence or bypassing uncertain-write fences.
 Rerun follows the approved frozen plan, cause issues and current-head/latest-run
 budget checks. Repeated publication/Actions operations reconcile prior effects.
 
+All phases and retries of a task share its Go build/module caches. Stage `tmp`
+and task `cache` are disposable: save validation logs, reports and evidence in
+the stage directory outside them. Once a job is done, failed or superseded and
+has no live turn, process reference or bind mount, the coordinator detaches its
+scratch and deletes it in the background. Source checkpoints, native histories,
+events and results are retained; retries rebuild discarded caches. Maintenance
+runs every minute, including during dispatch drain and low-disk admission waits.
+Deletion failures remain in `scratch-trash` for retry after restart; status exposes
+`scratch_cleanup` activity and errors. Interrupted cleanup stops between files.
+
 Rebase design pins the actual target branch tip separately from the PR's historical base SHA. Implementation fetches that exact commit and verifies either a stopped rebase onto it or its ancestry in the candidate; an old `rebased=true` flag is never sufficient.
 
 Failed workers preserve owned source for `retry`/`resume`. For legacy failures without a recoverable source, `mo-botctl retry JOB_ID --from-input` retains diagnostics and restarts the same task from its frozen input, requiring new design and validation. It rejects active tools, completed tasks and attempted remote effects. Explicit reentry renews bounded attempt capacity while keeping lifetime counters; explicit repair is not blocked by the automatic admission budget.

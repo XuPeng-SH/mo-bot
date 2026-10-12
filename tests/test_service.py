@@ -82,6 +82,24 @@ class TestWorkflow(unittest.TestCase):
         self.store.enqueue(c)
         return self.store.job(self.store.key(c["repo"], pr, head))
 
+    def test_drained_service_reclaims_terminal_scratch_without_deleting_evidence(self):
+        job = self.job()
+        directory = self.service.job_dir(job) / "attempt-1"
+        (directory / "tmp").mkdir(parents=True)
+        (directory / "tmp/cache").write_text("disposable")
+        (directory / "events.jsonl").write_text("evidence")
+        self.store.update(job["id"], state="done")
+        self.service.dispatch_control["paused"] = True
+        self.service.backend = Mock(dead=False)
+        with patch("mo_bot.artifacts.referenced_jobs", return_value=set()):
+            self.service.tick()
+            self.service.artifacts.future.result(timeout=5)
+            self.service.tick()
+        self.assertFalse((directory / "tmp").exists())
+        self.assertEqual((directory / "events.jsonl").read_text(), "evidence")
+        self.service.refresh_status()
+        self.assertEqual(self.service.status["scratch_cleanup"]["removed"], 1)
+
     def test_repeated_scan_unique_and_newer_commit_supersedes(self):
         snap = {
             "heads": {"1": "a" * 40},

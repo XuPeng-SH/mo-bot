@@ -28,6 +28,7 @@ from .store import Store
 from .worker import Worker
 from .discovery import Discovery
 from .config import CLASSIFIER_EFFORT, CLASSIFIER_MODEL
+from .artifacts import Artifacts
 
 
 LOG = logging.getLogger("mo-bot")
@@ -190,6 +191,7 @@ class Service:
         self.status = {}
         self.models = []
         self.turns = {}  # Only live RPC turn handles; persistent workflow is in SQLite.
+        self.artifacts = Artifacts(config.state_dir)
         self.eligible = set()
         self.last_error = None
         self.next_scan = 0.0
@@ -914,6 +916,7 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
             self.status = {
                 "service_id": self.config.service_id,
                 "last_error": self.last_error,
+                "scratch_cleanup": dict(self.artifacts.status),
                 "updated_at": time.time(),
                 "backend_alive": bool(self.backend and not self.backend.dead),
                 "sessions": sessions,
@@ -1441,6 +1444,17 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
                 )
                 turn.stop()
             self.finish(slot_id, turn, key)
+        # Includes restart leftovers and newly terminal jobs; runs even while
+        # dispatch is drained or low disk prevents launching additional work.
+        try:
+            if self.artifacts.due():
+                self.artifacts.poll(
+                    self.store.jobs(("done", "failed", "superseded")),
+                    {key for _, key in self.turns.values() if key},
+                )
+        except (OSError, ValueError) as error:
+            self.artifacts.status["errors"] = [str(error)]
+            LOG.warning("scratch cleanup deferred: %s", error)
         if self.dispatch_control["paused"] or self.stopping:
             return
         if time.monotonic() >= self.next_scan:
@@ -1917,5 +1931,6 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
                             "owned process cleanup failed; retaining recovery record"
                         )
         finally:
+            self.artifacts.close()
             self.store.close()
             self.lock.close()
