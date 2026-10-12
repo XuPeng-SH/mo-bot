@@ -1469,8 +1469,8 @@ Return every schema field. causes holds independently proven environment/flaky a
                 raise ValueError(
                     "unresolved or indeterminate merge conflict requires a rebase plan; an independent CI diagnosis does not resolve it"
                 )
-        if result["classification"] == "blocked" or (
-            phase != "final_review" and not result["accepted"]
+        if phase != "final_review" and (
+            result["classification"] == "blocked" or not result["accepted"]
         ):
             self.checkpoint(job, data)
             self.fail(job, result["summary"])
@@ -1527,7 +1527,8 @@ Return every schema field. causes holds independently proven environment/flaky a
                 "classification"
             ] in ("environment", "flaky")
             if (
-                not result["accepted"]
+                result["classification"] == "blocked"
+                or not result["accepted"]
                 or result["findings"]
                 or not result["validation_complete"]
             ):

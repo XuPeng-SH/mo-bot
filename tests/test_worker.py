@@ -653,6 +653,7 @@ class TestWorker(unittest.TestCase):
         }
         job = self.phase(
             self.s.store.claim(2),
+            classification="blocked",
             accepted=False,
             validation_complete=False,
             findings=["SCA unavailable"],
@@ -660,6 +661,23 @@ class TestWorker(unittest.TestCase):
         self.assertEqual(job["phase"], "implement")
         self.assertEqual(job["state"], "queued")
         self.assertEqual(json.loads(job["data"])["corrections"], 1)
+        self.assertFalse(self.gh.writes)
+
+        # A blocked final review follows the same correction budget, rather
+        # than failing early or retrying indefinitely.
+        data = json.loads(job["data"])
+        data["corrections"] = self.s.config.worker_rounds
+        self.s.store.update(job["id"], data=json.dumps(data))
+        self.phase(self.s.store.claim(2))
+        job = self.phase(
+            self.s.store.claim(2),
+            classification="blocked",
+            accepted=False,
+            validation_complete=False,
+            findings=["required integration regression still missing"],
+        )
+        self.assertEqual(job["state"], "failed")
+        self.assertIn("final xhigh gate blocked", job["error"])
         self.assertFalse(self.gh.writes)
 
     def test_metadata_mutation_rejected_even_in_implementation(self):
