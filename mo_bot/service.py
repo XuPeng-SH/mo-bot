@@ -870,6 +870,16 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
         ]
         alerts += [
             {
+                "kind": "worker_discovery_blocked",
+                "job_id": None,
+                "target": target,
+                "pr": int(target) if target.isdigit() else None,
+                "reason": reason,
+            }
+            for target, reason in self.worker.discovery_errors.items()
+        ]
+        alerts += [
+            {
                 "kind": "session_inactive",
                 "slot": s["id"],
                 "job_id": s["job_id"],

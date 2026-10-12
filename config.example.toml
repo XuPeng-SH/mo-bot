@@ -40,6 +40,7 @@ reasoning_effort = "low"
 # Optional supplementary worker workflow; bundled worker skill is the default.
 # issue_skill = "~/custom/issue-to-pr/SKILL.md"
 correction_rounds = 2
+# Bounds active/completed tasks and attempts for an identical frozen input.
 tasks_per_head = 4
 reruns_per_head = 2
 scan_limit = 20

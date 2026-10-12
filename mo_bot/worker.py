@@ -376,18 +376,50 @@ class Worker:
         fresh = self.store.fresh_evidence(
             candidate["repo"], number, head, candidate["atoms"]
         )
+        if not fresh and not explicit:
+            return None
+        history = self.store.db.execute(
+            "SELECT id,state,attempts,json_extract(metadata,'$.atoms') AS atoms,json_extract(metadata,'$.input_evidence_keys') AS input_keys FROM jobs WHERE kind='work' AND repo=? AND target_type='pr' AND target_number=? AND head=?",
+            (candidate["repo"], number, head),
+        ).fetchall()
+        keys = {a["key"] for a in fresh}
+        inputs = set(
+            candidate.get("input_evidence_keys", [a["key"] for a in candidate["atoms"]])
+        )
+        attempts = 0
+        previous = set()
+        for job in history:
+            atoms = json.loads(job["atoms"] or "[]")
+            overlap = keys.intersection(a["key"] for a in atoms)
+            prior_inputs = set(
+                json.loads(job["input_keys"])
+                if job["input_keys"]
+                else [a["key"] for a in atoms]
+            )
+            if job["attempts"] and prior_inputs == inputs:
+                attempts += 1
+            if overlap and job["state"] in ("failed", "superseded"):
+                previous.add(job["id"])
+        if fresh and attempts >= self.config.worker_tasks_per_head:
+            raise ValueError(
+                "unresolved evidence retry budget exhausted; inspect failed tasks and resume a failed task or provide new inputs"
+            )
         if explicit:
             fresh.append(atom("explicit", number, head))
-        count = self.store.db.execute(
-            "SELECT COUNT(*) FROM jobs WHERE kind='work' AND repo=? AND target_type='pr' AND target_number=? AND head=?",
-            (candidate["repo"], number, head),
-        ).fetchone()[0]
-        if not fresh or count >= self.config.worker_tasks_per_head:
+        if not fresh:
             return None
+        count = sum(j["state"] not in ("failed", "superseded") for j in history)
+        if count >= self.config.worker_tasks_per_head:
+            raise ValueError(
+                "per-head work budget exhausted; failed/superseded tasks are excluded; inspect existing tasks"
+            )
+        trigger = sorted(a["key"] for a in fresh)
         return {
             **candidate,
             "atoms": fresh,
-            "trigger_key": digest(sorted(a["key"] for a in fresh)),
+            "trigger_key": digest([trigger, sorted(previous)])
+            if previous
+            else digest(trigger),
         }
 
     def pr_candidate(self, number, explicit=False):
@@ -606,6 +638,7 @@ class Worker:
                     if candidate:
                         self.store.enqueue(candidate)
                         self.s.eligible.add(self.store.work_key(candidate))
+                    self.discovery_errors.pop(str(pr["number"]), None)
                 except (ValueError, RuntimeError, KeyError) as error:
                     self.discovery_errors[str(pr["number"])] = str(error)
         if self.s.config_path:
@@ -1365,6 +1398,17 @@ Return every schema field. causes holds independently proven environment/flaky a
         }
         phase = job["phase"]
         data["recoveries"] = 0
+        skip_rebase = (phase == "design" and not result["rebase"]) or (
+            phase == "final_review"
+            and data.get("candidate", job["head"]) == job["head"]
+        )
+        frozen_pr = json.loads(job["metadata"]).get("evidence", {}).get("pr", {})
+        if result["accepted"] and skip_rebase and frozen_pr.get("mergeable") is False:
+            _, current_pr = self.own_pr(job["pr"])
+            if current_pr.get("mergeable") is not True:
+                raise ValueError(
+                    "unresolved or indeterminate merge conflict requires a rebase plan; an independent CI diagnosis does not resolve it"
+                )
         if result["classification"] == "blocked" or (
             phase != "final_review" and not result["accepted"]
         ):

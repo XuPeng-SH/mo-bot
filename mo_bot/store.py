@@ -306,7 +306,7 @@ class Store:
                 self._insert_issue_members(key, candidate["repo"], members)
             for atom in candidate.get("atoms", []):
                 self.db.execute(
-                    "UPDATE evidence SET disposition='queued',job_id=? WHERE repo=? AND number=? AND head=? AND key=? AND disposition IS NULL",
+                    "UPDATE evidence SET disposition='queued',job_id=? WHERE repo=? AND number=? AND head=? AND key=? AND (disposition IS NULL OR disposition IN ('blocked','failed','superseded'))",
                     (
                         key,
                         candidate["repo"],
@@ -607,10 +607,13 @@ class Store:
                     (repo, number, head, atom["key"], json.dumps(atom)),
                 )
                 row = self.db.execute(
-                    "SELECT disposition FROM evidence WHERE repo=? AND number=? AND head=? AND key=?",
+                    "SELECT e.disposition,j.state FROM evidence e LEFT JOIN jobs j ON j.id=e.job_id WHERE e.repo=? AND e.number=? AND e.head=? AND e.key=?",
                     (repo, number, head, atom["key"]),
                 ).fetchone()
-                if not row["disposition"]:
+                if not row["disposition"] or (
+                    row["disposition"] in ("blocked", "failed", "superseded")
+                    and row["state"] in ("failed", "superseded")
+                ):
                     fresh.append(atom)
         return fresh
 

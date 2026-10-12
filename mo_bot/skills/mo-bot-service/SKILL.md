@@ -99,7 +99,7 @@ transport configuration changes.
 
 ## Blocked tasks and controlled recovery
 
-Use `mo-botctl alerts` for publication failures, manual reconciliation and native
+Use `mo-botctl alerts` for repair-admission budget/discovery failures, publication failures, manual reconciliation and native
 inactivity over five minutes; inactivity alone does not prove a model is hung.
 Jobs expose the error and next retry time. Publication releases model slots after
 preserving reviewed commits in private coordinator Git refs; target/write fences

@@ -154,3 +154,9 @@ command timeouts/backoff. Global drain blocks launches independently of resize.
 Source and wheel installs share the CLI installer. Runtime policy and all three skills are package resources; external queue/workflow paths are optional compatibility overrides. Init generates user-local paths and refuses overwrites; doctor validates existing config without starting native turns or writing GitHub. Systemd is opt-in.
 
 Installer-owned paths are recorded in a manifest under the installation prefix. A nonblocking file lock serializes installation/uninstallation. Preflight refuses foreign or modified destinations; durable ownership intent allows interrupted writes to be retried. Units use quoted interpreter/config/source paths and do not restart existing jobs unless explicitly started. Uninstall retains config/state, and modified destinations remain recorded for reconciliation.
+
+## Unresolved repair evidence
+
+Failed, blocked or superseded evidence remains actionable while its owning task is terminal. Admission retries those atoms with a deterministic identity derived from the prior terminal tasks; enqueue atomically transfers their queued ownership. Handled/delivered evidence and evidence owned by live tasks stay deduplicated.
+
+The configured tasks-per-head limit bounds active/completed tasks and separately bounds executed attempts for an identical frozen input. Failed/superseded task records do not consume completion capacity. A changed input can be investigated again; exhausted admission reports a worker discovery alert instead of silently returning no task. Noop or independent-CI diagnoses cannot bypass a frozen, still-unresolved merge conflict at design or final review.

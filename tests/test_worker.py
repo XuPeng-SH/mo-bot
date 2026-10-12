@@ -576,6 +576,125 @@ class TestWorker(unittest.TestCase):
             {a["kind"] for a in candidate["atoms"]}, {"conflict", "check_failure"}
         )
 
+    def test_failed_and_superseded_history_does_not_hide_unresolved_conflict(self):
+        self.gh.prs[1]["mergeable"] = False
+        self.gh.checks = [
+            {"id": 1, "name": "UT", "status": "completed", "conclusion": "failure"}
+        ]
+        raw = self.w.gather_candidate(1)
+        self.s.store.fresh_evidence(raw["repo"], 1, HEAD, raw["atoms"])
+        conflict = next(a for a in raw["atoms"] if a["kind"] == "conflict")
+        check = next(a for a in raw["atoms"] if a["kind"] == "check_failure")
+        for index, (state, atoms, disposition) in enumerate(
+            [
+                ("failed", [conflict], "blocked"),
+                ("failed", [check], "failed"),
+                ("superseded", [], "superseded"),
+                ("done", [check], "done"),
+            ]
+        ):
+            candidate = {
+                **raw,
+                "atoms": atoms,
+                "input_evidence_keys": [a["key"] for a in atoms],
+                "trigger_key": str(index),
+            }
+            self.s.store.enqueue(candidate)
+            job = self.s.store.job(self.s.store.work_key(candidate))
+            self.s.store.update(job["id"], state=state, attempts=1 if atoms else 0)
+            self.s.store.dispose_evidence(job, disposition)
+        candidate = self.w.pr_candidate(1)
+        self.assertEqual([a["kind"] for a in candidate["atoms"]], ["conflict"])
+        self.assertTrue(self.s.store.enqueue(candidate))
+        self.assertIsNone(self.w.pr_candidate(1))
+
+    def failed_conflict_attempts(self):
+        self.gh.prs[1]["mergeable"] = False
+        ids = []
+        for _ in range(self.s.config.worker_tasks_per_head):
+            candidate = self.w.pr_candidate(1)
+            self.assertTrue(self.s.store.enqueue(candidate))
+            job = self.s.store.job(self.s.store.work_key(candidate))
+            self.s.store.update(job["id"], state="failed", attempts=1)
+            self.s.store.dispose_evidence(job, "blocked")
+            ids.append(job["id"])
+        self.assertEqual(len(ids), len(set(ids)))
+
+    def test_identical_unresolved_input_retries_are_bounded_and_visible(self):
+        self.failed_conflict_attempts()
+        self.w.scan([{"number": 1}])
+        self.assertIn("retry budget exhausted", self.w.discovery_errors["1"])
+        self.assertEqual(len(self.s.store.jobs()), self.s.config.worker_tasks_per_head)
+        self.s.refresh_status()
+        self.assertIn("1", self.s.status["worker_discovery_errors"])
+        self.assertTrue(
+            any(
+                a["kind"] == "worker_discovery_blocked" and a["pr"] == 1
+                for a in self.s.status["alerts"]
+            )
+        )
+
+    def test_new_input_can_reconsider_previously_blocked_conflict(self):
+        self.failed_conflict_attempts()
+        self.w.scan([{"number": 1}])
+        self.gh.comments_data = [
+            {
+                "id": 99,
+                "user": {"id": 9},
+                "body": "A passing control now establishes the CI failure is independent",
+            }
+        ]
+        candidate = self.w.pr_candidate(1)
+        self.assertEqual(
+            {a["kind"] for a in candidate["atoms"]}, {"conflict", "comment"}
+        )
+        self.assertTrue(self.s.store.enqueue(candidate))
+        self.w.scan([{"number": 1}])
+        self.assertNotIn("1", self.w.discovery_errors)
+        self.assertIsNone(self.w.pr_candidate(1))
+
+    def test_unresolved_conflict_cannot_be_approved_as_noop(self):
+        self.gh.prs[1]["mergeable"] = False
+        job = self.phase(self.job())
+        job = self.s.store.claim(2)
+        with self.assertRaisesRegex(
+            ValueError, "merge conflict requires a rebase plan"
+        ):
+            self.phase(job, classification="noop")
+        # A conflict that GitHub confirms disappeared needs no forced rebase.
+        job = self.s.store.job(job["id"])
+        self.gh.prs[1]["mergeable"] = True
+        self.w.consume(
+            job,
+            self.slot,
+            result(job, self.ws.worker_state.return_value, classification="noop"),
+            "gpt-6.1-sol",
+            "xhigh",
+        )
+        self.assertEqual(self.s.store.job(job["id"])["phase"], "final_review")
+
+    def test_unchanged_final_candidate_cannot_hide_legacy_conflict(self):
+        self.gh.prs[1]["mergeable"] = False
+        job = self.job()
+        self.s.store.update(
+            job["id"],
+            phase="final_review",
+            data=json.dumps(
+                {"candidate": HEAD, "before": self.ws.worker_state.return_value}
+            ),
+        )
+        job = self.s.store.job(job["id"])
+        with self.assertRaisesRegex(
+            ValueError, "merge conflict requires a rebase plan"
+        ):
+            self.w.consume(
+                job,
+                self.slot,
+                result(job, self.ws.worker_state.return_value),
+                "gpt-6.1-sol",
+                "xhigh",
+            )
+
     def test_failed_check_queues_repair_while_workflow_running_without_repeating(self):
         self.gh.checks = [
             {"id": 11, "name": "UT", "status": "completed", "conclusion": "failure"},
