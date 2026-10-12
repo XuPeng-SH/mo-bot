@@ -6,8 +6,12 @@ build-backend = "setuptools.build_meta"
 name = "mo-bot"
 version = "0.1.0"
 description = "Persistent PR review service with reusable Codex sessions"
+readme = "README.md"
 requires-python = ">=3.11"
 dependencies = []
+
+[project.optional-dependencies]
+dev = ["ruff"]
 
 [project.scripts]
 mo-bot = "mo_bot.cli:main"
@@ -17,4 +21,4 @@ mo-botctl = "mo_bot.client:main"
 include = ["mo_bot*"]
 
 [tool.setuptools.package-data]
-mo_bot = ["review_prompt.txt"]
+mo_bot = ["skills/*/SKILL.md", "skills/*/references/*.md"]

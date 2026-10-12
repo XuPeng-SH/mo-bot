@@ -5,20 +5,48 @@ import json
 from pathlib import Path
 import sys
 import tomllib
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.request import ProxyHandler, Request, build_opener
+from urllib.parse import urlencode
 
 
-def main():
+def _main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--config", type=Path, default=Path.home() / ".config/mo-bot/config.toml"
     )
     commands = parser.add_subparsers(dest="command", required=True)
-    for name in ["status", "sessions", "jobs", "models", "events"]:
+    for name in [
+        "status",
+        "sessions",
+        "jobs",
+        "models",
+        "nodes",
+        "alerts",
+        "events",
+        "pools",
+    ]:
         commands.add_parser(name)
+    p = commands.add_parser("resize")
+    p.add_argument("role", choices=("review", "worker", "classifier"))
+    p.add_argument("sessions", type=int)
+    p = commands.add_parser("job")
+    p.add_argument("job_id")
     p = commands.add_parser("enqueue")
     p.add_argument("pr", type=int)
+    for name in ["repair", "issue"]:
+        p = commands.add_parser(name)
+        p.add_argument("number", type=int)
+    p = commands.add_parser("reconcile")
+    p.add_argument("job_id")
+    for name in ["pause", "resume", "retry", "cleanup", "rerun"]:
+        p = commands.add_parser(name)
+        p.add_argument("job_id")
+        if name == "rerun":
+            p.add_argument("--run-id", type=int, required=True)
+    for name in ["drain", "resume-service"]:
+        p = commands.add_parser(name)
+        p.add_argument("--reason", default="operator request")
     p = commands.add_parser("chat")
     p.add_argument("slot", type=int)
     p.add_argument("text")
@@ -29,6 +57,8 @@ def main():
     for name in ["history", "interrupt", "progress"]:
         p = commands.add_parser(name)
         p.add_argument("slot", type=int)
+        if name == "history":
+            p.add_argument("--cursor")
     args = parser.parse_args()
     config = tomllib.loads(args.config.expanduser().read_text())
     api = config.get("api", {})
@@ -61,14 +91,35 @@ def main():
             return
     endpoint = "/api/" + args.command
     body = None
-    if args.command == "enqueue":
+    if args.command == "resize":
+        endpoint = f"/api/pools/{args.role}"
+        body = {"sessions": args.sessions}
+    elif args.command in ("drain", "resume-service"):
+        endpoint = "/api/service/" + ("drain" if args.command == "drain" else "resume")
+        body = {"reason": args.reason}
+    elif args.command in ("pause", "resume", "retry", "cleanup", "rerun"):
+        endpoint = f"/api/jobs/{args.job_id}/{args.command}"
+        body = {"run_id": args.run_id} if args.command == "rerun" else {}
+    elif args.command == "job":
+        endpoint = f"/api/jobs/{args.job_id}"
+    elif args.command == "enqueue":
         endpoint = "/api/jobs"
         body = {"pr": args.pr, "force": True}
+    elif args.command == "reconcile":
+        endpoint = f"/api/jobs/{args.job_id}/reconcile"
+        body = {}
+    elif args.command in ("repair", "issue"):
+        endpoint = "/api/jobs"
+        body = {
+            "kind": "work",
+            "target_type": "pr" if args.command == "repair" else "issue",
+            "number": args.number,
+        }
     elif args.command == "progress":
         endpoint = f"/api/sessions/{args.slot}/messages"
         body = {
             "expected_turn_id": session["turn_id"],
-            "text": "请仅以简短 commentary 汇报当前任务的 PR/commit、已完成的检查和证据、正在做什么、剩余验证和阻塞点。不要改变评审目标，不要终止评审，不要重复已完成的工作，汇报后继续当前评审。",
+            "text": "请仅以简短 commentary 汇报当前任务的目标、阶段和 PR/commit、已完成的检查和证据、正在做什么、剩余验证和阻塞点。不要改变任务目标，不要终止任务，不要重复已完成的工作，汇报后继续当前任务。",
         }
     elif args.command == "chat":
         endpoint = f"/api/sessions/{args.slot}/messages"
@@ -78,6 +129,8 @@ def main():
         body = {"model": args.model, "reasoning_effort": args.effort}
     elif args.command in ["history", "interrupt"]:
         endpoint = f"/api/sessions/{args.slot}/{args.command}"
+        if args.command == "history" and args.cursor:
+            endpoint += "?" + urlencode({"cursor": args.cursor})
         if args.command == "interrupt":
             body = {}
     request = Request(
@@ -103,6 +156,17 @@ def main():
         raise SystemExit(1)
     except KeyboardInterrupt:
         pass
+
+
+def main():
+    try:
+        _main()
+    except (OSError, ValueError, KeyError, URLError) as error:
+        print(
+            f"mo-botctl: {error}. Check config and start mo-bot serve before using the API.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1) from None
 
 
 if __name__ == "__main__":

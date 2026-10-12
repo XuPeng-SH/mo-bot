@@ -56,19 +56,33 @@ class API:
                     "/api/status": status,
                     "/api/jobs": status.get("jobs", []),
                     "/api/sessions": status.get("sessions", []),
+                    "/api/pools": status.get("pools", {}),
                     "/api/models": status.get("models", []),
+                    "/api/nodes": status.get("nodes", []),
+                    "/api/alerts": status.get("alerts", []),
                 }
                 if parsed.path in routes:
                     self.json(200, routes[parsed.path])
                     return
                 parts = parsed.path.strip("/").split("/")
+                if len(parts) == 3 and parts[:2] == ["api", "jobs"]:
+                    self.dispatch("job", {"job_id": parts[2]})
+                    return
                 if (
                     len(parts) == 4
                     and parts[:2] == ["api", "sessions"]
                     and parts[3] == "history"
                 ):
                     try:
-                        self.dispatch("history", {"slot": int(parts[2])})
+                        self.dispatch(
+                            "history",
+                            {
+                                "slot": int(parts[2]),
+                                "cursor": parse_qs(parsed.query).get("cursor", [None])[
+                                    0
+                                ],
+                            },
+                        )
                     except ValueError as error:
                         self.json(400, {"error": str(error)})
                     return
@@ -86,9 +100,37 @@ class API:
                     if not isinstance(body, dict):
                         raise ValueError("JSON object required")
                     if self.path == "/api/jobs":
-                        self.dispatch("enqueue", body)
+                        self.dispatch(
+                            "work" if body.get("kind") == "work" else "enqueue", body
+                        )
                         return
                     parts = self.path.strip("/").split("/")
+                    if len(parts) == 3 and parts[:2] == ["api", "pools"]:
+                        self.dispatch("resize_pool", {**body, "role": parts[2]})
+                        return
+                    if (
+                        parts[:2] == ["api", "service"]
+                        and len(parts) == 3
+                        and parts[2] in ("drain", "resume")
+                    ):
+                        self.dispatch(
+                            "drain" if parts[2] == "drain" else "resume_dispatch", body
+                        )
+                        return
+                    if (
+                        parts[:2] == ["api", "jobs"]
+                        and len(parts) == 4
+                        and parts[3] in ("pause", "resume", "retry", "cleanup", "rerun")
+                    ):
+                        self.dispatch(parts[3] + "_job", {**body, "job_id": parts[2]})
+                        return
+                    if (
+                        len(parts) == 4
+                        and parts[:2] == ["api", "jobs"]
+                        and parts[3] == "reconcile"
+                    ):
+                        self.dispatch("reconcile", {"job_id": parts[2]})
+                        return
                     if (
                         len(parts) == 4
                         and parts[:2] == ["api", "sessions"]
