@@ -8,7 +8,7 @@ from typing import Any
 QUERY = """
 query Queue($owner: String!, $repo: String!, $endCursor: String) {
   repository(owner: $owner, name: $repo) {
-    pullRequests(first: 100, states: OPEN, orderBy: {field: UPDATED_AT, direction: DESC}, after: $endCursor) {
+    pullRequests(first: 25, states: OPEN, orderBy: {field: UPDATED_AT, direction: DESC}, after: $endCursor) {
       nodes {
         number title url isDraft updatedAt headRefOid mergeable reviewDecision
         author { login }
