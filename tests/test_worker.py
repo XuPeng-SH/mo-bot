@@ -496,7 +496,7 @@ class TestWorker(unittest.TestCase):
         self.assertEqual(updated["phase"], "design")
         self.assertEqual(updated["comment_id"], job["comment_id"])
         data = json.loads(updated["data"])
-        self.assertEqual(data["reentry_attempts_base"], 99)
+        self.assertNotIn("reentry_attempts_base", data)
         self.assertTrue(Path(data["reentry_record"]).is_file())
         self.assertNotIn("before", data)
         self.w.launch(self.slot, self.s.store.claim(2))
@@ -643,7 +643,7 @@ class TestWorker(unittest.TestCase):
         self.assertEqual(job["state"], "queued")
         self.assertFalse(self.gh.writes)
 
-    def test_unresolved_final_validation_enters_bounded_correction(self):
+    def test_repeated_final_gaps_back_off_and_restore_without_round_limit(self):
         job = self.phase(self.job())
         job = self.phase(self.s.store.claim(2))
         job = self.phase(self.s.store.claim(2))
@@ -663,21 +663,49 @@ class TestWorker(unittest.TestCase):
         self.assertEqual(json.loads(job["data"])["corrections"], 1)
         self.assertFalse(self.gh.writes)
 
-        # A blocked final review follows the same correction budget, rather
-        # than failing early or retrying indefinitely.
+        # Lifetime correction/turn counts do not terminate useful work.
         data = json.loads(job["data"])
-        data["corrections"] = self.s.config.worker_rounds
-        self.s.store.update(job["id"], data=json.dumps(data))
+        data["corrections"] = 50
+        self.s.store.update(job["id"], data=json.dumps(data), attempts=100)
         self.phase(self.s.store.claim(2))
         job = self.phase(
             self.s.store.claim(2),
             classification="blocked",
             accepted=False,
             validation_complete=False,
-            findings=["required integration regression still missing"],
+            findings=["SCA unavailable"],
         )
-        self.assertEqual(job["state"], "failed")
-        self.assertIn("final xhigh gate blocked", job["error"])
+        self.assertEqual(
+            (job["state"], job["phase"], job["slot_id"]), ("queued", "implement", None)
+        )
+        self.assertGreater(job["retry_at"], time.time())
+        self.assertIsNone(self.s.store.claim(2))
+        self.ws.archive_worker.assert_called_once()
+        self.s.refresh_status()
+        self.assertTrue(
+            next(j for j in self.s.status["jobs"] if j["id"] == job["id"])[
+                "attention_required"
+            ]
+        )
+
+        # The scheduled retry resumes the same source and task after backoff.
+        self.s.store.update(job["id"], retry_at=0)
+        self.phase(self.s.store.claim(2))
+        self.ws.restore_worker.assert_called_once()
+        self.ws.worker_state.return_value = {
+            **self.ws.worker_state.return_value,
+            "head": "d" * 40,
+        }
+        job = self.phase(
+            self.s.store.claim(2),
+            classification="blocked",
+            accepted=False,
+            validation_complete=False,
+            findings=["SCA unavailable"],
+        )
+        self.assertEqual((job["state"], job["phase"]), ("queued", "implement"))
+        self.assertEqual(json.loads(job["data"])["correction_stalls"], 0)
+        self.assertIsNone(job["error"])
         self.assertFalse(self.gh.writes)
 
     def test_metadata_mutation_rejected_even_in_implementation(self):
@@ -688,6 +716,52 @@ class TestWorker(unittest.TestCase):
         self.ws.worker_state.return_value = {**state, "config": "changed"}
         with self.assertRaises(SourceChanged):
             self.w.consume(job, self.slot, result(job, state), "gpt-6.1-sol", "low")
+
+    def test_archived_retry_waits_for_capacity_then_restores_on_launch(self):
+        job = self.job()
+        archive = str(self.root / "saved-source")
+        self.s.store.update(
+            job["id"],
+            state="failed",
+            slot_id=None,
+            data=json.dumps({"workspace_archive": archive}),
+        )
+        for slot in self.s.store.slots():
+            if slot["role"] == "worker":
+                self.s.store.slot_update(slot["id"], ready=0)
+        self.s.command("retry_job", {"job_id": job["id"]})
+        waiting = self.s.store.job(job["id"])
+        self.assertEqual((waiting["state"], waiting["slot_id"]), ("queued", None))
+        self.assertEqual(json.loads(waiting["data"])["workspace_archive"], archive)
+        self.ws.restore_worker.assert_not_called()
+        self.s.store.slot_update(2, ready=1)
+        self.phase(self.s.store.claim(2))
+        self.ws.restore_worker.assert_called_once_with(2, unittest.mock.ANY, archive)
+        self.assertNotIn(
+            "workspace_archive", json.loads(self.s.store.job(job["id"])["data"])
+        )
+
+    def test_environment_final_gaps_return_to_diagnosis(self):
+        cause = {
+            "classification": "environment",
+            "cause_signature": "TLS checkout",
+            "issue_title": "Checkout infrastructure",
+            "issue_body": "failed checkout and passing control",
+            "evidence": ["logs/control"],
+            "evidence_keys": [],
+            "rerun_ids": [],
+        }
+        self.phase(self.job())
+        self.phase(self.s.store.claim(2), classification="environment", causes=[cause])
+        job = self.phase(
+            self.s.store.claim(2),
+            classification="blocked",
+            accepted=False,
+            validation_complete=False,
+            findings=["control evidence mismatch"],
+        )
+        self.assertEqual((job["state"], job["phase"]), ("queued", "design"))
+        self.assertFalse(self.gh.writes)
 
     def test_noop_still_runs_design_and_final_gate(self):
         job = self.phase(self.job(), classification="noop")

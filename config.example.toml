@@ -40,7 +40,6 @@ reasoning_effort = "low"
 # Bundled issue-to-pr + mo-bot-worker are always loaded. No home skill path needed.
 # Optional additional custom instructions:
 # issue_skill = "~/custom/issue-to-pr/SKILL.md"
-correction_rounds = 2
 # Bounds active/completed tasks and attempts for an identical frozen input.
 tasks_per_head = 4
 reruns_per_head = 2

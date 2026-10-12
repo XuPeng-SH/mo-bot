@@ -1256,6 +1256,11 @@ class Worker:
             identity = json.loads(job["metadata"])["identity"]
             if target["repo"] != job["repo"] or target["ref"] != identity["base_ref"]:
                 raise SourceChanged("rebase target repository/ref changed")
+        if data.get("workspace_archive"):
+            self.ws.restore_worker(slot["id"], job, data["workspace_archive"])
+            data.pop("workspace_archive")
+            data["worker_slot"] = slot["id"]
+            self.checkpoint(job, data)
         path = self.ws.worker_prepare(slot["id"], job)
         if job["phase"] in ("triage", "design") and data.get("rebase_target"):
             self.ws.worker_fetch_target(
@@ -1279,11 +1284,6 @@ class Worker:
         data["before"] = state
         data["phase_started_at"] = time.time()
         attempt = job["attempts"] + 1
-        if (
-            attempt - data.get("reentry_attempts_base", 0)
-            > self.config.max_recoveries + 12 + self.config.worker_rounds * 3
-        ):
-            raise ValueError("worker total turn budget exhausted")
         directory = self.s.job_dir(job) / f"{job['phase']}-{attempt}"
         directory.mkdir(parents=True, exist_ok=True)
         (directory / "evidence.json").write_text(
@@ -1532,15 +1532,37 @@ Return every schema field. causes holds independently proven environment/flaky a
                 or result["findings"]
                 or not result["validation_complete"]
             ):
-                if (
-                    is_environment
-                    or data.get("corrections", 0) >= self.config.worker_rounds
-                ):
-                    self.checkpoint(job, data)
-                    self.fail(job, "final xhigh gate blocked: " + result["summary"])
-                    return
                 data["corrections"] = data.get("corrections", 0) + 1
-                next_phase = "implement"
+                next_phase = "design" if is_environment else "implement"
+                progress = digest(
+                    [
+                        after["head"],
+                        result["validation_complete"],
+                        sorted(result["findings"]),
+                        sorted(result["limitations"]),
+                    ]
+                )
+                stalled = (
+                    data.get("correction_stalls", 0) + 1
+                    if data.get("correction_progress") == progress
+                    else 0
+                )
+                data.update(correction_progress=progress, correction_stalls=stalled)
+                if stalled:
+                    # Preserve the candidate and release capacity during backoff.
+                    # The existing queue/claim path restores it on the next turn.
+                    data["workspace_archive"] = self.ws.archive_worker(slot["id"], job)
+                    self.checkpoint(
+                        job,
+                        data,
+                        phase=next_phase,
+                        state="queued",
+                        slot_id=None,
+                        error="Repeated final-review gaps without candidate progress: "
+                        + result["summary"],
+                        retry_at=time.time() + min(3600, 60 * 2 ** min(stalled - 1, 6)),
+                    )
+                    return
             else:
                 data["candidate"] = after["head"]
                 data["worker_slot"] = slot["id"]

@@ -846,7 +846,7 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
                 job["data"].get("paused")
                 or (
                     job["error"]
-                    and job["state"] in ("publishing", "failed", "canceling")
+                    and job["state"] in ("queued", "publishing", "failed", "canceling")
                 )
             )
             job["next_retry_at"] = (
@@ -1597,7 +1597,6 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
             triage = data.get("triage", {})
             data = {
                 "reentry_record": str(record),
-                "reentry_attempts_base": job["attempts"],
                 "recoveries": 0,
                 "paused": False,
             }
@@ -1751,17 +1750,18 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
                     ),
                     None,
                 )
-                if free is None:
-                    raise ValueError(
-                        "no free worker slot for preserved source restoration"
+                if free is not None:
+                    # Reserve before mutation; a crash cannot reassign this clone.
+                    self.store.update(job["id"], state="queued", slot_id=free["id"])
+                    self.workspace.restore_worker(
+                        free["id"], job, data["workspace_archive"]
                     )
-                # Reserve before filesystem mutation; a crash cannot reassign this clone.
-                self.store.update(job["id"], state="queued", slot_id=free["id"])
-                self.workspace.restore_worker(
-                    free["id"], job, data["workspace_archive"]
-                )
-                data["worker_slot"] = free["id"]
-                data.pop("workspace_archive")
+                    data["worker_slot"] = free["id"]
+                    data.pop("workspace_archive")
+                else:
+                    # Admission does not require free capacity. Keep the archive
+                    # until the ordinary claim/launch path acquires a slot.
+                    self.store.update(job["id"], state="queued", slot_id=None)
             elif (
                 job["kind"] == "work"
                 and job["state"] == "failed"
@@ -1770,9 +1770,8 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
                 raise ValueError(
                     "failed workspace needs explicit preservation/cleanup before resume"
                 )
-            data.update(
-                paused=False, recoveries=0, reentry_attempts_base=job["attempts"]
-            )
+            data.update(paused=False, recoveries=0)
+            data.pop("reentry_attempts_base", None)
             data.pop("manual_reconciliation", None)
             data.pop("publication_next_at", None)
             data.pop("publication_failures", None)

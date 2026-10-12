@@ -37,7 +37,6 @@ class Config:
     worker_model: str = "gpt-6.1-sol"
     worker_effort: str = "low"
     issue_skill: Path | None = None
-    worker_rounds: int = 2
     worker_tasks_per_head: int = 4
     worker_reruns_per_head: int = 2
     worker_scan_limit: int = 20
@@ -86,7 +85,6 @@ class Config:
                 if worker.get("issue_skill")
                 else None
             ),
-            worker_rounds=worker.get("correction_rounds", 2),
             worker_tasks_per_head=worker.get("tasks_per_head", 4),
             worker_reruns_per_head=worker.get("reruns_per_head", 2),
             worker_scan_limit=worker.get("scan_limit", 20),
@@ -107,7 +105,6 @@ class Config:
         if any(
             type(x) is not int or x < 1
             for x in (
-                cfg.worker_rounds,
                 cfg.worker_tasks_per_head,
                 cfg.worker_reruns_per_head,
                 cfg.worker_scan_limit,
