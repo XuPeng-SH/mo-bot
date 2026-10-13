@@ -91,10 +91,10 @@ instructions; omit it for the bundled workflow. Existing external skills are not
 overwritten by installation: preserve or relocate them before migrating to the
 bundled skill. Triage → actual `gpt-6.1-sol/xhigh` design → writable
 implementation → actual `gpt-6.1-sol/xhigh` overall review run as native turns in
-one retained session. Corrections are bounded; mandatory gates cannot be lowered
+one retained session. Blocked work backs off without a lifetime failure; mandatory gates cannot be lowered
 by changing the session default. Unknown CI causes and unavailable validation
-block delivery. Proven environment/existing flaky failures create or link a
-cause issue before a bounded current-head Actions rerun. Rebase is reserved for
+block delivery. Proven environment/existing flaky failures retain causal evidence
+before a bounded approved current-head Actions rerun; cause issues are opt-in. Rebase is reserved for
 real conflicts/dependencies; a push starts fresh CI and never reruns old-head CI.
 
 Explicit assignments use the same queue:
@@ -137,8 +137,8 @@ in assigned implementation turns; Git metadata/default/ref checks are also
 verified by the coordinator. Do not deploy with unrelated credentials.
 
 Mixed CI failures receive per-failure causal dispositions. A PR regression is
-fixed while independently proven environment/flaky causes create linked issues
-before delivery/rerun. Omitting a failure disposition blocks the design gate.
+fixed while independently proven environment/flaky causes retain evidence for
+approved delivery/rerun. Omitting a failure disposition blocks the design gate.
 Detailed PR evidence is gathered by bounded read-only child processes so review
 turn completion and local commands keep running. Semantic input changes fence
 stale same-head delivery; handled feedback follows only the bot's exact candidate.
@@ -304,6 +304,16 @@ explicit operator request can pause a task. Direct `chat`, `pause`, `resume` and
 `data.harness_result`: admission is not execution, stale advice is discarded,
 and missing input is reported as an attention alert. No advice bypasses source
 ownership, tool cleanup or publication fences.
+
+Missing final validation stays in final_review with the accepted design retained.
+Supported local setup recovery and missing checks are concrete continuation work.
+For an unavailable external prerequisite, harness `wait` preserves the checkpoint
+and releases capacity using the existing queue/retry deadline (5 minutes to 1 hour).
+Status exposes `data.recovery_wait`, `wait_reason`, `next_retry_at` and an alert.
+New evidence or operator guidance wakes the task early; a deadline retries it
+without a permanent failure. Repeated gaps back off regardless of paraphrased
+descriptions; source/input changes and new successful execution receipts establish
+progress. Lost steering acknowledgements are surfaced without replaying the message.
 
 New same-head PR observations join the existing unattempted repair task rather
 than creating another task for each failed job and workflow aggregate. Turn input

@@ -74,7 +74,16 @@ triage/design/implement/final_review recovery. Design/final gates select actual
 adds the independent worker clone to native writable roots. Coordinator checks
 Git/source snapshots, invokes rebase/continuations, commits Conventionally, then
 freezes the exact clean candidate for final review. Rebase conflict rounds,
-corrections and total turns are bounded. Incomplete turns retain source and slot;
+corrections do not fail on a lifetime turn count. Validation-only final rejections
+retain final_review and its accepted design; actionable findings return to the
+responsible phase. Retry pacing derives progress from source, frozen input and
+successful check receipts, independent of paraphrased limitations or duplicate
+executions. Unchanged blocked checkpoints archive source, release slots and back
+off. Harness `wait` advice identifies an external prerequisite and reuses queued
+state/retry deadlines (5 minutes to 1 hour), with visible reasons and alerts.
+New evidence or authenticated guidance wakes that same task early; deadlines
+survive restart. Active tools checkpoint before waiting, and missing validation
+never becomes approval. Incomplete native turns retain source and slot;
 completed exact-thread/turn results can advance from durable artifacts.
 
 `effects` persists immutable intent and attempted status before non-idempotent
@@ -108,6 +117,14 @@ reconcile API; this never grants permission to repeat uncertain writes.
 The existing review predicate remains the admission owner. Discovery now includes every open PR's classification/reason; completed snapshots reconcile already-reviewed/explicitly-excluded automatic tasks into superseded, while temporary CI/mergeability gaps remain queued with a wait reason. Forced tasks and uncertain publication retain their fences. No result is discarded/recomputed because an idempotent publication update failed.
 
 Review and worker discovery share one bounded child lifecycle: disk-backed output, captured PID identity, atomic ownership file, timeout/output budgets and cleanup. A scan failure clears automatic review admission until success, without blocking commands or known worker phases. Per-job durable retry deadlines isolate I/O failures; a review publishing result frees model capacity, but a worker's source/delivery affinity remains fenced.
+
+Worker PR admission owns source restrictions. Its discovery child serializes
+known exclusions as successful read-only outcomes; the parent exposes them
+separately from indeterminate API/authentication failures. No traceback parsing
+or PR-specific exception is used. Later scans reevaluate restrictions and clear
+stale outcomes. Review publication policy waits retain their assessment, expose
+the admission reason and use the existing retry deadline. External dependency
+reentry checks current readiness once; waiting itself belongs to the scheduler.
 
 The singleton lock precedes SQLite migration/pool resizing. Command futures are failed on shutdown. Artifact recovery is shared across pools and matches session ID, turn ID and completion status; late previous-turn notifications are buffered until the new native turn ID is known, then rejected. Stalled stdio writes have deadlines and oversized/malformed RPC frames fence the backend. Initial spawn failures release open logs.
 

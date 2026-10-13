@@ -3,7 +3,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from mo_bot.evidence import local_validation
+from mo_bot.evidence import completed_checks, local_validation
 from mo_bot.store import Store
 
 
@@ -70,6 +70,58 @@ class TestEvidence(unittest.TestCase):
         self.assertIn("sha256", receipt)
         self.assertEqual(self.evidence(head="c" * 40), [])
         self.assertEqual(self.evidence(repo="other/repo"), [])
+
+    def test_retry_progress_ignores_failed_partial_and_repeated_checks(self):
+        receipt = {
+            "command": [
+                "go",
+                "test",
+                "-exec=" + str(self.stage / "test-exec"),
+                "./pkg/x",
+            ],
+            "kind": "check",
+            "finished_at": 1,
+            "exit_code": 1,
+            "cwd": str(self.root / "slots/2/worker-source"),
+            "source": {"head": "a" * 40, "delta_sha256": "same-source"},
+        }
+        path = self.stage / "checks/result.json"
+        path.write_text(json.dumps(receipt))
+        (self.stage / "checks/broken.json").write_text("{")
+        self.assertEqual(completed_checks(self.stage), set())
+        receipt["exit_code"] = 0
+        path.write_text(json.dumps(receipt))
+        first = completed_checks(self.stage)
+        self.assertEqual(len(first), 1)
+        (self.final / "checks").mkdir()
+        # New time, cache path, slot and launcher are still the same execution scope.
+        receipt.update(
+            finished_at=99,
+            environment={"GOCACHE": "new-cache"},
+            cwd=str(self.root / "slots/3/worker-source"),
+        )
+        receipt["command"][2] = "-exec=" + str(self.final / "test-exec")
+        (self.final / "checks/repeat.json").write_text(json.dumps(receipt))
+        self.assertEqual(completed_checks(self.final), first)
+        receipt["command"][-1] = "./pkg/y"
+        (self.final / "checks/new.json").write_text(json.dumps(receipt))
+        self.assertEqual(len(completed_checks(self.final)), 2)
+
+    def test_setup_failure_or_unfingerprinted_receipt_never_counts_as_progress(self):
+        path = self.stage / "checks/result.json"
+        for receipt in (
+            {"exit_code": 0, "command": ["true"]},
+            {
+                "exit_code": 0,
+                "finished_at": 1,
+                "command": ["true"],
+                "source": {"head": "a", "delta_sha256": "x"},
+                "setup_error": "unavailable",
+            },
+            [],
+        ):
+            path.write_text(json.dumps(receipt))
+            self.assertEqual(completed_checks(self.stage), set())
 
     def test_incomplete_or_mismatched_gate_is_never_reused(self):
         for field, value in (

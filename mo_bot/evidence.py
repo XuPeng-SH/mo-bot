@@ -3,6 +3,47 @@
 import hashlib
 import json
 from pathlib import Path
+import re
+
+
+def completed_checks(directory):
+    """Identify new successful executions for retry pacing, never for approval."""
+    completed = set()
+    for path in (Path(directory) / "checks").glob("*.json"):
+        try:
+            if path.is_symlink() or path.stat().st_size > 1024 * 1024:
+                continue
+            receipt = json.loads(path.read_text())
+            source = receipt.get("source", {})
+            command = receipt.get("command")
+            if (
+                type(receipt.get("exit_code")) is not int
+                or receipt["exit_code"] != 0
+                or not receipt.get("finished_at")
+                or receipt.get("setup_error")
+                or not source.get("head")
+                or not source.get("delta_sha256")
+                or not isinstance(command, list)
+                or any(not isinstance(arg, str) for arg in command)
+            ):
+                continue
+            # Slot and turn-local executors do not make rerunning a check progress.
+            command = [
+                re.sub(
+                    r"/(?:triage|design|implement|final_review)-\d+(?=/|$)",
+                    "/turn",
+                    arg.replace(receipt.get("cwd") or "\0", "$SOURCE"),
+                )
+                for arg in command
+            ]
+            value = [receipt.get("kind"), command, source]
+            completed.add(
+                hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
+            )
+        except (OSError, ValueError, AttributeError, TypeError):
+            # Missing/malformed receipts cannot reset stalled work or prove a pass.
+            continue
+    return completed
 
 
 def local_validation(store, state_dir, job):

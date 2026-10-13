@@ -1099,6 +1099,233 @@ class TestWorker(unittest.TestCase):
         self.ws.worker_finalize.assert_not_called()
         self.assertFalse(self.gh.writes)
 
+    def test_validation_gap_keeps_design_and_paraphrases_do_not_reset_backoff(self):
+        self.phase(self.job())
+        job = self.phase(
+            self.s.store.claim(2),
+            classification="environment",
+            cause_signature="checkout/tls",
+            issue_title="Checkout failed",
+            issue_body="Same-head passing control",
+        )
+        design = json.loads(job["data"])["design"]
+        job = self.phase(
+            self.s.store.claim(2),
+            accepted=False,
+            classification="blocked",
+            validation_complete=False,
+            limitations=["SQL cannot compile until the dependency is corrected"],
+        )
+        self.assertEqual(job["phase"], "final_review")
+        self.assertEqual(json.loads(job["data"])["design"], design)
+        job = self.phase(
+            self.s.store.claim(2),
+            accepted=False,
+            classification="blocked",
+            validation_complete=False,
+            limitations=[
+                "Independently corrected inputs are needed for SQL validation"
+            ],
+        )
+        self.assertEqual(
+            (job["state"], job["phase"], job["slot_id"]),
+            ("queued", "final_review", None),
+        )
+        self.assertEqual(json.loads(job["data"])["correction_stalls"], 1)
+        self.assertIsNone(self.s.store.claim(2))
+        self.ws.archive_worker.assert_called_once()
+        self.ws.worker_finalize.assert_not_called()
+        self.assertFalse(self.gh.writes)
+
+        # A new completed execution can advance validation on unchanged source.
+        self.s.store.update(job["id"], retry_at=0)
+        self.w.launch(self.slot, self.s.store.claim(2))
+        job = self.s.store.job(job["id"])
+        checks = Path(job["turn_dir"]) / "checks"
+        checks.mkdir()
+        (checks / "success.json").write_text(
+            json.dumps(
+                {
+                    "command": ["go", "test", "./pkg/consumer"],
+                    "kind": "check",
+                    "finished_at": time.time(),
+                    "exit_code": 0,
+                    "source": {"head": HEAD, "delta_sha256": "source"},
+                }
+            )
+        )
+        self.w.consume(
+            job,
+            self.slot,
+            result(
+                job,
+                self.ws.worker_state.return_value,
+                accepted=False,
+                validation_complete=False,
+                limitations=["One more check is missing"],
+            ),
+            "gpt-6.1-sol",
+            "xhigh",
+        )
+        job = self.s.store.job(job["id"])
+        self.assertEqual(json.loads(job["data"])["correction_stalls"], 0)
+        self.assertEqual(job["phase"], "final_review")
+        self.assertIsNone(job["error"])
+
+    def waiting_checkpoint(self, action="wait", **advice):
+        semantic = self.harness_slot()
+        self.phase(self.job())
+        self.phase(self.s.store.claim(2))
+        job = self.phase(
+            self.s.store.claim(2),
+            accepted=False,
+            validation_complete=False,
+            limitations=["An external fixture is unavailable"],
+        )
+        request = json.loads(job["data"])["harness_request"]
+        self.w.dispatch_classifier(semantic)
+        self.w.classifier_complete(
+            semantic["id"],
+            self.harness_advice(
+                request,
+                action,
+                guidance="Wait for the owned fixture; verify its build manifest, then run the missing test",
+                **advice,
+            ),
+        )
+        return self.s.store.job(job["id"]), semantic
+
+    def test_external_wait_releases_capacity_is_durable_and_resumes_on_deadline(self):
+        job, _ = self.waiting_checkpoint()
+        data = json.loads(job["data"])
+        self.assertEqual((job["state"], job["slot_id"]), ("queued", None))
+        self.assertFalse(data.get("paused"))
+        self.assertIn("workspace_archive", data)
+        self.assertGreater(job["retry_at"], time.time())
+        self.assertLessEqual(job["retry_at"], time.time() + 3600)
+        self.assertIsNone(self.s.store.claim(2))
+        self.s.refresh_status()
+        status = next(j for j in self.s.status["jobs"] if j["id"] == job["id"])
+        self.assertTrue(status["attention_required"])
+        self.assertIn("external prerequisite", status["wait_reason"])
+        self.assertEqual(status["next_retry_at"], job["retry_at"])
+
+        # A reopened scheduler observes the same durable wait, not a lifetime failure.
+        db_path = self.s.store.db.execute("PRAGMA database_list").fetchone()[2]
+        restarted = Store(
+            Path(db_path), "test", self.s.config.sessions, worker_sessions=2
+        )
+        try:
+            self.assertEqual(restarted.job(job["id"])["retry_at"], job["retry_at"])
+            self.assertIsNone(restarted.claim(2))
+            # An unrelated PR can use released worker capacity immediately.
+            other = self.w.pr_candidate(2, explicit=True)
+            restarted.enqueue(other)
+            self.assertEqual(restarted.claim(3)["pr"], 2)
+        finally:
+            restarted.db.close()
+        with patch("time.time", return_value=job["retry_at"] + 1):
+            resumed = self.s.store.claim(2)
+            self.assertEqual(resumed["id"], job["id"])
+            self.w.launch(self.slot, resumed)
+        self.ws.restore_worker.assert_called_once()
+        self.assertNotIn(
+            "recovery_wait", json.loads(self.s.store.job(job["id"])["data"])
+        )
+        prompt = self.s.backend.start.call_args.args[3]
+        self.assertIn(data["recovery_wait"]["guidance"], prompt)
+        self.assertIn("scheduler owns the wait timer", prompt)
+        self.assertIn("Do not sleep or repeat passing checks", prompt)
+        self.assertFalse(self.gh.writes)
+
+    def test_operator_guidance_wakes_dependency_wait_without_waiting_for_timer(self):
+        job, semantic = self.waiting_checkpoint()
+        request = self.s.harness.request(
+            job["id"], "operator", "The fixture is available; resume validation"
+        )
+        self.s.turns.pop(semantic["id"], None)
+        self.w.dispatch_classifier(semantic)
+        self.w.classifier_complete(semantic["id"], self.harness_advice(request))
+        fresh = self.s.store.job(job["id"])
+        self.assertEqual(fresh["retry_at"], 0)
+        self.assertNotIn("recovery_wait", json.loads(fresh["data"]))
+        self.assertEqual(self.s.store.claim(2)["id"], job["id"])
+        self.assertFalse(self.gh.writes)
+
+    def test_blocked_question_waits_boundedly_and_explicit_resume_clears_it(self):
+        job, _ = self.waiting_checkpoint("ask")
+        data = json.loads(job["data"])
+        self.assertEqual(data["harness_result"]["status"], "needs_input")
+        self.assertIn("recovery_wait", data)
+        self.assertIsNone(self.s.store.claim(2))
+        self.s.turns.pop(2, None)  # The completed worker turn has been reaped.
+        self.s.command(
+            "resume_job", {"job_id": job["id"], "hint": "Fixture is now available"}
+        )
+        resumed = self.s.store.job(job["id"])
+        self.assertEqual(resumed["retry_at"], 0)
+        self.assertEqual(resumed["phase"], job["phase"])
+        self.assertNotIn("recovery_wait", json.loads(resumed["data"]))
+        self.assertFalse(self.gh.writes)
+
+    def test_invalid_wait_is_recoverable_and_stale_wait_cannot_delay_new_attempt(self):
+        job, semantic = self.waiting_checkpoint(confidence=999)
+        data = json.loads(job["data"])
+        self.assertEqual(data["harness_result"]["status"], "fallback")
+        self.assertNotIn("recovery_wait", data)
+        request = self.s.harness.request(
+            job["id"], "operator", "Retain the candidate until recovery"
+        )
+        self.s.turns.pop(semantic["id"], None)
+        self.w.dispatch_classifier(semantic)
+        self.s.store.update(job["id"], attempts=job["attempts"] + 1)
+        self.w.classifier_complete(semantic["id"], self.harness_advice(request, "wait"))
+        fresh = self.s.store.job(job["id"])
+        self.assertEqual(json.loads(fresh["data"])["harness_result"]["status"], "stale")
+        self.assertEqual(fresh["retry_at"], 0)
+        self.assertNotIn("recovery_wait", json.loads(fresh["data"]))
+
+    def test_fresh_evidence_wakes_wait_and_reuses_preserved_task(self):
+        job, semantic = self.waiting_checkpoint()
+        self.gh.comments_data.append(
+            {"id": 101, "body": "The fixture manifest is now available"}
+        )
+        self.w.pr_candidate(1)
+        self.s.harness.next_poll = 0
+        self.s.harness.poll()
+        request = json.loads(self.s.store.job(job["id"])["data"])["harness_request"]
+        self.assertEqual(request["reason"], "new_evidence")
+        self.s.turns.pop(semantic["id"], None)
+        self.w.dispatch_classifier(semantic)
+        self.w.classifier_complete(semantic["id"], self.harness_advice(request))
+        fresh = self.s.store.job(job["id"])
+        self.assertEqual(fresh["retry_at"], 0)
+        data = json.loads(fresh["data"])
+        self.assertNotIn("recovery_wait", data)
+        self.assertNotIn("pending_input", data)
+        self.assertIn("workspace_archive", data)
+        self.assertEqual(self.s.store.claim(2)["id"], job["id"])
+
+    def test_live_wait_requires_checkpoint_and_uncertain_steer_is_not_replayed(self):
+        semantic = self.harness_slot()
+        job = self.job()
+        turn = Mock(completed=False, turn_id="active-turn", directory=self.root)
+        turn.steer.side_effect = TimeoutError("steering acknowledgement lost")
+        self.s.turns[2] = (turn, job["id"])
+        request = self.s.harness.request(
+            job["id"], "operator", "Retain the task until dependency recovery"
+        )
+        self.w.dispatch_classifier(semantic)
+        self.w.classifier_complete(semantic["id"], self.harness_advice(request, "wait"))
+        turn.steer.assert_called_once()
+        turn.stop.assert_not_called()
+        self.ws.archive_worker.assert_not_called()
+        fresh = self.s.store.job(job["id"])
+        self.assertEqual((fresh["state"], fresh["slot_id"]), ("reviewing", 2))
+        self.assertEqual(json.loads(fresh["data"])["harness_result"]["status"], "error")
+        self.assertNotIn("recovery_wait", json.loads(fresh["data"]))
+        self.assertFalse(self.gh.writes)
+
     def test_blocked_implementation_preserves_edits_backs_off_and_resumes(self):
         self.phase(self.job())
         self.phase(self.s.store.claim(2))
@@ -1282,6 +1509,79 @@ class TestWorker(unittest.TestCase):
         self.gh.prs[1]["head"]["repo"]["owner"] = {"id": 9}
         with self.assertRaisesRegex(ValueError, "owned fork"):
             self.w.pr_candidate(1, explicit=True)
+
+    def test_discovery_policy_exclusions_do_not_alert_or_hide_eligible_siblings(self):
+        self.gh.comments_data = [{"id": 7, "user": {"id": 9}, "body": "defect"}]
+        blocked = copy.deepcopy(pr())
+        blocked["head"]["repo"]["owner"] = {"id": 9}
+        for excluded in (
+            blocked,
+            {**pr(), "head": {**pr()["head"], "ref": "main"}},
+            {**pr(), "user": {"id": 9}},
+            {**pr(), "draft": True},
+            {**pr(), "state": "closed"},
+            {**pr(), "labels": [{"name": "do-not-merge/wip"}]},
+        ):
+            with self.subTest(excluded=excluded):
+                self.gh.prs[1] = excluded
+                self.w.discovery_errors["1"] = "old traceback"
+                self.w.scan([{"number": 1}, {"number": 2}])
+                self.assertIn("1", self.w.discovery_exclusions)
+                self.assertNotIn("1", self.w.discovery_errors)
+                self.assertEqual([j["pr"] for j in self.s.store.jobs()], [2])
+        self.s.refresh_status()
+        self.assertIn("1", self.s.status["worker_discovery_exclusions"])
+        self.assertFalse(
+            any(
+                a["kind"] == "worker_discovery_blocked" for a in self.s.status["alerts"]
+            )
+        )
+
+        # Removing a restriction reenters normal intake; no sticky exclusion cache.
+        self.gh.prs[1] = pr()
+        self.w.scan([{"number": 1}, {"number": 2}])
+        self.assertNotIn("1", self.w.discovery_exclusions)
+        self.assertEqual({j["pr"] for j in self.s.store.jobs()}, {1, 2})
+        self.w.discovery_exclusions["1"] = "closed"
+        self.w.discovery_errors["2"] = "outage"
+        self.w.scan([])
+        self.assertFalse(self.w.discovery_exclusions)
+        self.assertFalse(self.w.discovery_errors)
+
+    def test_invalid_child_exclusion_is_an_error_not_a_policy_bypass(self):
+        self.s.config_path = self.root / "config.toml"
+        self.w.discovery_child = Mock()
+        for raw in (
+            {"number": 1, "excluded": False},
+            {"number": 1, "excluded": ""},
+            {"number": 2, "excluded": "wrong target"},
+        ):
+            with self.subTest(raw=raw):
+                self.w.discovery = 1
+                self.w.discovery_child.poll.return_value = raw
+                self.w.poll()
+                self.assertIn("1", self.w.discovery_errors)
+                self.assertFalse(self.w.discovery_exclusions)
+                self.assertFalse(self.s.store.jobs())
+
+    def test_discovery_auth_api_and_missing_repository_stay_errors(self):
+        self.gh.prs[1]["head"]["repo"] = None
+        self.w.scan([{"number": 1}])
+        self.assertIn("unavailable", self.w.discovery_errors["1"])
+        self.assertFalse(self.w.discovery_exclusions)
+        self.gh.prs[1] = pr()
+        with patch.object(self.w, "actor", side_effect=RuntimeError("GitHub TLS")):
+            with self.assertRaisesRegex(RuntimeError, "TLS"):
+                self.w.discover_pr(1)
+            self.w.scan([{"number": 1}])
+        self.assertIn("TLS", self.w.discovery_errors["1"])
+        self.assertFalse(self.w.discovery_exclusions)
+        self.s.refresh_status()
+        self.assertTrue(
+            any(
+                a["kind"] == "worker_discovery_blocked" for a in self.s.status["alerts"]
+            )
+        )
 
     def test_conflict_and_ci_failures_admitted_without_green_review_predicate(self):
         self.gh.prs[1]["mergeable"] = False
@@ -2513,6 +2813,37 @@ class TestWorker(unittest.TestCase):
             stop.assert_called_once()
         self.assertFalse(self.s.store.jobs())
         self.assertIn("timed out", self.w.discovery_errors["1"])
+
+    def test_async_discovery_returns_exclusion_and_then_recovers_same_pr(self):
+        self.gh.prs[1]["head"]["repo"]["owner"] = {"id": 9}
+        excluded = self.w.discover_pr(1)
+        self.assertIn("owned fork", excluded["excluded"])
+        self.s.config_path = self.root / "config.toml"
+        process = Mock(pid=999999, returncode=0)
+        process.poll.return_value = 0
+        output = excluded
+
+        def launch(argv, stdout, stderr, **kwargs):
+            stdout.write(json.dumps(output))
+            stdout.flush()
+            return process
+
+        with patch("mo_bot.discovery.subprocess.Popen", side_effect=launch):
+            self.w.scan([{"number": 1}])
+            self.w.poll()
+            self.w.poll()
+            self.assertFalse(self.s.store.jobs())
+            self.assertIn("1", self.w.discovery_exclusions)
+            self.assertFalse(self.w.discovery_errors)
+            self.gh.prs[1] = pr()
+            self.gh.comments_data = [{"id": 7, "user": {"id": 9}, "body": "defect"}]
+            output = self.w.discover_pr(1)
+            self.w.scan([{"number": 1}])
+            self.w.poll()
+            self.w.poll()
+        self.assertEqual(len(self.s.store.jobs()), 1)
+        self.assertFalse(self.w.discovery_exclusions)
+        self.assertFalse(self.w.discovery_errors)
 
     def test_spent_rerun_identity_is_not_reissued_when_failure_attempt_changes(self):
         self.gh.runs = [

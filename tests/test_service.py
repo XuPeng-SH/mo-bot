@@ -467,6 +467,35 @@ class TestWorkflow(unittest.TestCase):
         self.assertEqual(saved["state"], "done")
         self.assertEqual(saved["review_event"], "COMMENT")
 
+    def test_publication_admission_wait_is_visible_paced_and_reuses_assessment(self):
+        job = self.job()
+        self.service.save_result(job, self.store.slots()[0], assessment(job))
+        saved_result = self.store.job(job["id"])["result"]
+        self.service.admission["1"] = {
+            "head": job["head"],
+            "state": "excluded",
+            "reason": "not-green",
+        }
+        self.service.publish(self.store.job(job["id"]))
+        waiting = self.store.job(job["id"])
+        self.assertEqual(waiting["state"], "publishing")
+        self.assertGreater(waiting["retry_at"], time.time())
+        self.assertFalse(waiting["review_attempted"])
+        self.gh.submit_review.assert_not_called()
+        self.service.refresh_status()
+        status = next(j for j in self.service.status["jobs"] if j["id"] == job["id"])
+        self.assertEqual(
+            status["wait_reason"], "review publication awaiting admission: not-green"
+        )
+        self.assertFalse(status["attention_required"])
+        self.assertEqual(status["next_retry_at"], waiting["retry_at"])
+
+        self.service.eligible.add(job["id"])
+        self.service.publish(waiting)
+        self.gh.submit_review.assert_called_once()
+        self.assertEqual(self.store.job(job["id"])["state"], "done")
+        self.assertEqual(self.store.job(job["id"])["result"], saved_result)
+
     def test_uncertain_review_post_is_not_repeated_when_marker_absent(self):
         job = self.job()
         self.service.save_result(job, self.store.slots()[0], assessment(job))

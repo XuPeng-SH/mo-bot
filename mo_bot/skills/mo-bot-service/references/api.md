@@ -31,6 +31,12 @@ SSE keeps 1024 events, with individual payloads capped at 64 KiB. Missing buffer
 
 Status is a snapshot: inspect `updated_at`. Network/git preparation can delay scheduler command admission; status and native output streaming remain served on HTTP threads. The command queue is bounded at 64, HTTP connections at 32. `504` reports whether a command was canceled before execution. If already running, reconcile status before retrying; admission remains idempotent. API failures are 400 (invalid input), 401 (authentication), 404 (unknown endpoint), 503 (unavailable/full queue), 504 (timeout).
 
+`worker_discovery_exclusions` reports known PR policy restrictions separately
+from `worker_discovery_errors` and outage alerts. Both are refreshed by discovery;
+an exclusion is not a permanent task failure or permission to bypass the policy.
+A saved review awaiting admission retains `publishing` and exposes `wait_reason`
+and `next_retry_at`; it does not consume another model turn.
+
 Automatic admission uses the bundled review-queue policy (or an explicitly configured replacement): open, non-draft, mergeable PR, green latest CI attempts, fresh CI evidence, and missing decisive review or newer commits after requested changes. Self-authored PRs are eligible without waiting for CI when the current head has no published formal review (APPROVED, CHANGES_REQUESTED or COMMENTED); older-head reviews, pending/dismissed reviews and ordinary issue comments do not close this gate. They retain draft/exclusion/mergeability gates and receive COMMENT-only reviews. Incomplete review evidence waits for reliable discovery. Generated config has no default exclusions; legacy config without an exclude list retains its prior default. Forced admission bypasses those filters but requires an open PR and cannot reset any existing commit task. Head changes cancel older work. Publication rechecks head; review comments include full SHA, stable service ID and ownership marker. Only comments by the authenticated GitHub user count.
 
 One durable job/comment does not guarantee exactly-once physical model execution after an opaque crash: bounded recovery may continue/recompute interrupted work. Completed checkpoints are published without another model turn. Never run this stable identity against different state databases simultaneously; local lock and SQLite fences do not provide a distributed GitHub lock.
@@ -95,6 +101,8 @@ Review and worker discovery use bounded read-only child processes. A complete, v
 One job's I/O/publication failure sets its persistent `retry_at` and cannot force a global dispatch cooldown. Saved review publication releases its model slot; delivery workers retain affine slots through model phases, then freeze reviewed commits and release slots before publication. Retry deadlines survive restart. Single-instance locking precedes SQLite migration. Recovery accepts only the exact session/turn recorded in the artifact provenance, not any completed event in a reused log. Shutdown fails queued operator commands instead of leaving their futures unresolved.
 
 Status/job lists are summaries; use `mo-botctl job JOB_ID` or the detail endpoint for full validation/findings/limitations. `dispatchable` means admission and retry deadline allow scheduling, subject to capacity and PR ownership fences. Check `discovery.running`, `last_success_at` and `error`; historic `last_error` alone does not prove a current blocker.
+
+Harness `wait` uses the existing queued state and `retry_at` after source is preserved and leases released. `data.recovery_wait` records its prerequisite/readiness guidance; `wait_reason`, `next_retry_at` and alerts expose the wait. The deadline is 5 minutes to 1 hour, survives restart, and new feedback or operator guidance/resume/retry can wake it early. It never sets operator `paused` or waives validation. Active turns must checkpoint before waiting; uncertain steering responses are reported without replay.
 
 Sessions include `node` (`local` by default). Model validation uses the target
 node's catalog; `/api/models` stays the local catalog. Global slot APIs route to
