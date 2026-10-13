@@ -630,17 +630,19 @@ class Store:
                 return None
             job = jobs[0]
             metadata = json.loads(job["metadata"])
+            identity_keys = (
+                "actor_id",
+                "repo_id",
+                "author_id",
+                "head_repo_id",
+                "head_repo",
+                "head_ref",
+                "base_ref",
+            )
             if (
                 any(
                     metadata["identity"].get(k) != candidate["identity"].get(k)
-                    for k in (
-                        "actor_id",
-                        "repo_id",
-                        "author_id",
-                        "head_repo_id",
-                        "head_ref",
-                        "base_ref",
-                    )
+                    for k in identity_keys
                 )
                 or self.db.execute(
                     "SELECT 1 FROM effects WHERE job_id=? AND attempted=1", (job["id"],)
@@ -671,7 +673,10 @@ class Store:
                 ):
                     continue
                 saved = json.loads(sibling["metadata"])
-                if saved.get("identity") != metadata.get("identity"):
+                if any(
+                    saved.get("identity", {}).get(k) != metadata["identity"].get(k)
+                    for k in identity_keys
+                ):
                     continue
                 observations.update(
                     {

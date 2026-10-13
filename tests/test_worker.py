@@ -2004,6 +2004,31 @@ class TestWorker(unittest.TestCase):
         self.assertIsNone(self.w.pr_candidate(1))
         self.assertEqual(len(self.s.store.jobs(("queued",))), 1)
 
+    def test_legacy_known_snapshots_fold_without_waiting_for_another_github_event(self):
+        self.gh.checks = [
+            {"id": 81, "name": "checks", "status": "completed", "conclusion": "failure"}
+        ]
+        first = self.w.pr_candidate(1)
+        self.s.store.enqueue(first)
+        legacy = {
+            **first,
+            "trigger_key": "old-snapshot",
+            "identity": {**first["identity"], "base_sha": "d" * 40},
+        }
+        self.s.store.enqueue(legacy)
+        selected = self.w.pr_candidate(1)
+        self.assertIsNone(selected)
+        self.assertEqual(
+            self.s.store.job(self.s.store.work_key(legacy))["state"], "superseded"
+        )
+        self.assertEqual(len(self.s.store.jobs(("queued",))), 1)
+        self.assertEqual(
+            json.loads(self.s.store.job(self.s.store.work_key(first))["metadata"])[
+                "identity"
+            ]["base_sha"],
+            BASE,
+        )
+
     def test_comment_only_notification_uses_harness_without_worker_or_remote_write(
         self,
     ):

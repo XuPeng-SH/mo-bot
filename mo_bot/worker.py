@@ -394,10 +394,9 @@ class Worker:
         fresh = self.store.fresh_evidence(
             candidate["repo"], number, head, candidate["atoms"]
         )
-        if fresh or explicit:
-            existing = self.store.coalesce_pr_feedback(candidate)
-            if existing is not None:
-                return existing
+        existing = self.store.coalesce_pr_feedback(candidate)
+        if existing is not None:
+            return existing if fresh or explicit else None
         if not fresh and not explicit:
             return None
         history = self.store.db.execute(
