@@ -198,6 +198,8 @@ budget was shorter than the default 45-second in-flight command deadline. Hard
 termination still invokes control-group cleanup and the remote heartbeat watchdog;
 the durable queue and native IDs are recovered on the next startup.
 
+Review launch carries accepted worker validation for the same repository and exact candidate commit in `evidence.json.local_validation`. It includes retained gate records and artifact inventories; reviewers reconcile receipts, logs, fingerprints and coverage rather than inherit the old verdict. Missing or foreign artifacts remain explicit gaps. Go module verification uses task-owned GOPATH alongside the existing task caches, avoiding shared host sumdb state.
+
 ## Recovery and deployment
 
 `mo-botctl alerts` exposes blocked jobs with error, retry time and manual-action

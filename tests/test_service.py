@@ -358,12 +358,45 @@ class TestWorkflow(unittest.TestCase):
         self.service.backend = Mock(dead=False)
         self.gh.evidence.return_value = {"comments": []}
         job = self.job()
+        work = {**candidate(pr=2), "kind": "work", "trigger_key": "repair"}
+        self.store.enqueue(work)
+        key = self.store.work_key(work)
+        stage = self.root / "jobs" / key / "final_review-1"
+        stage.mkdir(parents=True)
+        (stage / "ledger.json").write_text('{"checks":[]}')
+        self.store.update(
+            key,
+            state="done",
+            phase="final_review",
+            data=json.dumps(
+                {
+                    "candidate": job["head"],
+                    "final_review": {
+                        "artifact": str(stage),
+                        "effort": "xhigh",
+                        "result": {
+                            "candidate_head": job["head"],
+                            "accepted": True,
+                            "validation_complete": True,
+                        },
+                    },
+                }
+            ),
+        )
         self.store.update(job["id"], comment_id=99)
         self.service.launch(self.store.slots()[0], self.store.job(job["id"]))
         prompt = self.service.backend.start.call_args.args[3]
         self.assertIn(review_instructions(), prompt)
         self.assertIn(job["head"], prompt)
         self.assertIn(job["id"], prompt)
+
+        manifest = json.loads(
+            (self.root / "jobs" / job["id"] / "attempt-1/evidence.json").read_text()
+        )
+        self.assertIn("local_validation", manifest)
+        self.assertEqual(manifest["local_validation"][0]["job_id"], key)
+        self.assertEqual(manifest["local_validation"][0]["candidate_head"], job["head"])
+        self.assertIn("local_validation", prompt)
 
     def test_new_review_loads_edited_skill_without_restart(self):
         skill = self.root / "SKILL.md"

@@ -9,6 +9,15 @@ from mo_bot.artifacts import Artifacts, referenced_jobs, remove_scratch, scratch
 
 
 class TestArtifacts(unittest.TestCase):
+    def test_go_verification_cache_is_task_owned_and_shared_across_phases(self):
+        root = Path("/state")
+        first = scratch_env(root, root / "jobs/a/design-1")
+        later = scratch_env(root, root / "jobs/a/implement-2")
+        other = scratch_env(root, root / "jobs/b/implement-1")
+        self.assertEqual(first["GOPATH"], later["GOPATH"])
+        self.assertNotEqual(first["GOPATH"], other["GOPATH"])
+        self.assertEqual(first["GOPATH"], "/state/jobs/a/cache/go")
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

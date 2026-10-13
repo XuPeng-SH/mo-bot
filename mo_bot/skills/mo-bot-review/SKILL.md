@@ -52,6 +52,8 @@ Report verifiable findings, complete evidence and remaining limits. Missing vali
 
 Reuse relevant exact-input CI, author and earlier-attempt evidence. Re-execute only checks that resolve a concrete gap. Lack of local native artifacts, a GPU, or a repeated test run is not by itself grounds to block approval when traceable existing evidence and the accepted scope suffice. Ordinary disclaimers and explicitly accepted nonblocking limitations belong in the report; they do not automatically require `needs_validation`. Conversely, a materially unvalidated changed path cannot be called verified merely because unrelated CI is green. Distinguish standalone/host probes from production-entrypoint tests and real-device runs.
 
+Read the coordinator's `evidence.json.local_validation` before local tests. It supplies exact-candidate worker gates and retained artifact paths across tasks. Verify source fingerprints, commands, exit receipts, log contents and behavioral scope independently; the old verdict is not your verdict. Diagnose missing artifacts explicitly. Recover compatible native builds through the repository build owner, using the assigned diagnostic directory and task caches (including GOPATH for sumdb). A failed fresh setup does not invalidate matching earlier execution evidence.
+
 For interrupted work, recover valid frozen-head artifacts before repeating checks. Distinguish a completed final assessment from commentary, hypotheses and unfinished validation. Do not describe an interrupted partial review as approval.
 
 ## Publication contract

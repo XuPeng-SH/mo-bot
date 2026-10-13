@@ -29,6 +29,7 @@ from .worker import Worker
 from .discovery import Discovery
 from .config import CLASSIFIER_EFFORT, CLASSIFIER_MODEL
 from .artifacts import Artifacts
+from .evidence import local_validation
 from .review_queue import OwnerWip, owner_wip
 
 
@@ -488,6 +489,9 @@ class Service:
             directory = self.job_dir(job) / f"attempt-{attempt}"
             directory.mkdir(parents=True, exist_ok=True)
             evidence = self.github.evidence(job, pr)
+            evidence["local_validation"] = local_validation(
+                self.store, self.config.state_dir, job
+            )
             (directory / "evidence.json").write_text(json.dumps(evidence, indent=2))
             workspace, merge_base = self.workspace.prepare(slot_id, job, pr, directory)
             prompt = (
@@ -500,6 +504,17 @@ Read {directory}/change.patch and surrounding owners/callers. Follow applicable
 mo-self-review instructions. Review the COMPLETE delta, design/ownership, correctness,
 performance, unhappy paths, compatibility, comments and test quality. Reuse valid exact-input
 CI/author evidence; run only checks that resolve concrete gaps. Missing evidence is not a pass.
+Read evidence.json's local_validation before executing tests. It carries same-repository,
+exact-candidate worker final gates and retained artifact inventories. Independently reconcile
+their command/source/exit receipts, logs and scope; an accepted gate is evidence, not your
+verdict. Failed-before controls and obsolete receipts may coexist with successful checks.
+Use retained native-input ledgers and validation environment files to identify compatible
+builds before rebuilding. Export the assigned task cache environment before invoking Go,
+including toolchain bootstrap; do not fall back to shared host caches. Read-only source
+does not prevent building prerequisites in the assigned writable diagnostic directory
+through the repository build owner. If setup fails, first recover matching evidence and
+prerequisites, continue source review and isolate the remaining behavioral gap. A local
+setup failure alone must not erase traceable validation of the current candidate.
 Source must remain unchanged. Put diagnostic artifacts only under {directory}; use its
 disk-backed tmp directory. Before native tests verify the current revision's native provenance
 through the repository build/test owner; retained artifacts may belong to an earlier PR.

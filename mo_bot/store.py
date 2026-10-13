@@ -390,6 +390,14 @@ class Store:
     def job(self, key: str):
         return self.db.execute("SELECT * FROM jobs WHERE id=?", (key,)).fetchone()
 
+    def candidate_jobs(self, repo, head):
+        return self.db.execute(
+            "SELECT * FROM jobs WHERE repo=? AND kind='work' "
+            "AND state IN ('done','publishing') AND phase='final_review' "
+            "AND json_extract(data,'$.candidate')=? ORDER BY updated DESC",
+            (repo, head),
+        ).fetchall()
+
     def jobs(self, states=None, limit=None):
         if states:
             query = (

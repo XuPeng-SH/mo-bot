@@ -299,7 +299,7 @@ class Turn:
             f"Source checkout: {workspace}. Use explicit paths; source is {'writable for assigned edits only; Git metadata/remote writes belong to the coordinator' if source_write else 'read-only'}. For checks use: {cache_exports}. Reuse these task caches across retries; do not create additional Go caches. tmp and cache are disposable after the task ends: save logs, reports and evidence needed by later phases outside them, in {directory}.\n"
             + prompt
         )
-        prompt = prepare_validation(directory) + prompt
+        prompt = prepare_validation(directory, self.scratch_env) + prompt
         (directory / "prompt.txt").write_text(prompt)
         self.events_path = directory / "events.jsonl"
         self.events_path.touch()

@@ -14,17 +14,24 @@ import tempfile
 import time
 
 
-def prepare(directory):
+def prepare(directory, environment=None):
     directory = Path(directory).resolve()
     runtime = directory / "tmp" / "runtime"
     runtime.mkdir(parents=True, exist_ok=True, mode=0o700)
     base = [sys.executable, str(Path(__file__).resolve()), "--runtime", str(runtime)]
+    exports = "".join(
+        f"export {key}={shlex.quote(value)}\n"
+        for key, value in (environment or {}).items()
+        if key in ("TMPDIR", "GOTMPDIR", "GOCACHE", "GOMODCACHE", "GOPATH", "GOWORK")
+    )
     for name, args in (
         ("check-run", []),
         ("test-exec", ["--isolated", "--"]),
     ):
         launcher = directory / name
-        launcher.write_text("#!/bin/sh\nexec " + shlex.join(base + args) + ' "$@"\n')
+        launcher.write_text(
+            "#!/bin/sh\n" + exports + "exec " + shlex.join(base + args) + ' "$@"\n'
+        )
         launcher.chmod(0o700)
     return (
         f"Shared validation executors: {directory}/check-run and {directory}/test-exec. "
@@ -191,6 +198,11 @@ def main():
         "kind": "preflight" if args.preflight else "check",
         "started_at": time.time(),
         "timeout": args.timeout,
+        "environment": {
+            key: os.environ[key]
+            for key in ("GOCACHE", "GOMODCACHE", "GOPATH", "GOWORK")
+            if key in os.environ
+        },
     }
     try:
         if not (args.inner or args.isolated):

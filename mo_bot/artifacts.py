@@ -28,6 +28,7 @@ def scratch_env(state_dir, directory):
         "GOTMPDIR": str(temp),
         "GOCACHE": str(cache / "go-build"),
         "GOMODCACHE": str(cache / "go-mod"),
+        "GOPATH": str(cache / "go"),
         "GOWORK": "off",
     }
 

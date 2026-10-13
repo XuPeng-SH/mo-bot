@@ -46,6 +46,21 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(receipts[0]["command"][-1], "spaces;$(not-a-shell)")
         self.assertEqual(receipts[0]["kind"], "check")
 
+    def test_launcher_enforces_task_cache_even_with_host_environment(self):
+        owned = str(self.root / "owned go cache")
+        prepare(self.phase, {"GOPATH": owned, "GOMODCACHE": owned + "/modules"})
+        result = self.invoke(
+            "check-run",
+            "--",
+            sys.executable,
+            "-c",
+            "import os; print(os.environ['GOPATH'])",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), owned)
+        receipt = json.loads(next((self.phase / "checks").glob("*.json")).read_text())
+        self.assertEqual(receipt["environment"]["GOPATH"], owned)
+
     def test_real_namespace_preflight_and_test_binary_isolation(self):
         preflight = self.invoke("check-run", "--preflight")
         if preflight.returncode and any(
