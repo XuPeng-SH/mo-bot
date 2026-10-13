@@ -436,6 +436,8 @@ class Store:
                 'publication_started_at',json_extract(data,'$.publication_started_at'),
                 'phase_started_at',json_extract(data,'$.phase_started_at'),
                 'paused',json_extract(data,'$.paused'),
+                'recovery_wait',json_extract(data,'$.recovery_wait'),
+                'correction_stalls',json_extract(data,'$.correction_stalls'),
                 'pending_evidence_count',json_array_length(json_extract(data,'$.pending_input.atoms')),
                 'harness_request',json_extract(data,'$.harness_request'),
                 'harness_result',json_extract(data,'$.harness_result')) AS data,

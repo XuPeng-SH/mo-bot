@@ -74,7 +74,16 @@ triage/design/implement/final_review recovery. Design/final gates select actual
 adds the independent worker clone to native writable roots. Coordinator checks
 Git/source snapshots, invokes rebase/continuations, commits Conventionally, then
 freezes the exact clean candidate for final review. Rebase conflict rounds,
-corrections and total turns are bounded. Incomplete turns retain source and slot;
+corrections do not fail on a lifetime turn count. Validation-only final rejections
+retain final_review and its accepted design; actionable findings return to the
+responsible phase. Retry pacing derives progress from source, frozen input and
+successful check receipts, independent of paraphrased limitations or duplicate
+executions. Unchanged blocked checkpoints archive source, release slots and back
+off. Harness `wait` advice identifies an external prerequisite and reuses queued
+state/retry deadlines (5 minutes to 1 hour), with visible reasons and alerts.
+New evidence or authenticated guidance wakes that same task early; deadlines
+survive restart. Active tools checkpoint before waiting, and missing validation
+never becomes approval. Incomplete native turns retain source and slot;
 completed exact-thread/turn results can advance from durable artifacts.
 
 `effects` persists immutable intent and attempted status before non-idempotent

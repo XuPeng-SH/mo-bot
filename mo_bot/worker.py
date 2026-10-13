@@ -11,6 +11,7 @@ from pathlib import Path
 from .codex import SourceChanged, completed_result
 from .config import CLASSIFIER_EFFORT, CLASSIFIER_MODEL
 from .discovery import Discovery
+from .evidence import completed_checks
 from .review_queue import OwnerWip, owner_wip
 
 LOG = logging.getLogger("mo-bot")
@@ -1224,6 +1225,7 @@ class Worker:
         )
         job = self.store.job(job["id"])
         data = json.loads(job["data"])
+        data.pop("recovery_wait", None)
         if data.get("pending_input"):
             raise WorkerFeedbackPending(
                 "pending observations require a phase checkpoint"
@@ -1606,7 +1608,13 @@ Return every schema field. causes holds independently proven environment/flaky a
                 or not result["validation_complete"]
             ):
                 data["corrections"] = data.get("corrections", 0) + 1
-                next_phase = "design" if is_environment else "implement"
+                # Validation belongs to this gate. Only actionable findings need
+                # source/design correction; a missing check does not undo design.
+                next_phase = (
+                    ("design" if is_environment else "implement")
+                    if result["findings"]
+                    else "final_review"
+                )
                 self.continue_gap(job, slot, data, result, after, next_phase)
                 return
             else:
@@ -1621,14 +1629,23 @@ Return every schema field. causes holds independently proven environment/flaky a
 
     def continue_gap(self, job, slot, data, result, after, next_phase):
         """Keep incomplete model work recoverable without spinning on a gap."""
+        checks = set()
+        for stage in self.s.job_dir(job).iterdir():
+            if (
+                stage.name.rsplit("-", 1)[0] in PHASES
+                and not stage.is_symlink()
+                and stage.is_dir()
+            ):
+                checks.update(completed_checks(stage))
+        metadata = json.loads(job["metadata"])
         progress = digest(
             [
-                job["phase"],
                 after["head"],
                 after["source"],
                 result["validation_complete"],
-                sorted(result["findings"]),
-                sorted(result["limitations"]),
+                sorted(metadata.get("input_evidence_keys", [])),
+                data.get("operator_hint"),
+                sorted(checks),
             ]
         )
         stalled = (
@@ -1820,9 +1837,12 @@ Return every schema field. causes holds independently proven environment/flaky a
             data["resume_publication"] = True
             data.setdefault("publication_candidate", data["candidate"])
         data.pop("pending_input")
+        # Fresh input is a wakeup, not a reason to retain an old dependency wait.
+        for key in ("recovery_wait", "correction_progress", "correction_stalls"):
+            data.pop(key, None)
         with self.store.db:
             self.store.db.execute(
-                "UPDATE jobs SET metadata=?,data=?,state=?,phase=?,result=?,error=NULL,updated=? WHERE id=?",
+                "UPDATE jobs SET metadata=?,data=?,state=?,phase=?,result=?,error=NULL,retry_at=0,updated=? WHERE id=?",
                 (
                     json.dumps(metadata),
                     json.dumps(data),

@@ -900,6 +900,10 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
                     if self.dispatch_control["paused"]
                     else "semantic harness coordination"
                     if harness_waiting
+                    else "external prerequisite: "
+                    + job["data"]["recovery_wait"]["guidance"]
+                    if job["retry_at"] > time.time()
+                    and job["data"].get("recovery_wait")
                     else "retry backoff"
                     if job["retry_at"] > time.time()
                     else status.get("reason", "awaiting successful discovery")
@@ -1892,6 +1896,8 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
             data.pop("manual_reconciliation", None)
             data.pop("publication_next_at", None)
             data.pop("publication_failures", None)
+            for key in ("recovery_wait", "correction_progress", "correction_stalls"):
+                data.pop(key, None)
             self.store.update(
                 job["id"],
                 state="publishing" if job["state"] == "publishing" else "queued",

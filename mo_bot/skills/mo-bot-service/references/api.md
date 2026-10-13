@@ -96,6 +96,8 @@ One job's I/O/publication failure sets its persistent `retry_at` and cannot forc
 
 Status/job lists are summaries; use `mo-botctl job JOB_ID` or the detail endpoint for full validation/findings/limitations. `dispatchable` means admission and retry deadline allow scheduling, subject to capacity and PR ownership fences. Check `discovery.running`, `last_success_at` and `error`; historic `last_error` alone does not prove a current blocker.
 
+Harness `wait` uses the existing queued state and `retry_at` after source is preserved and leases released. `data.recovery_wait` records its prerequisite/readiness guidance; `wait_reason`, `next_retry_at` and alerts expose the wait. The deadline is 5 minutes to 1 hour, survives restart, and new feedback or operator guidance/resume/retry can wake it early. It never sets operator `paused` or waives validation. Active turns must checkpoint before waiting; uncertain steering responses are reported without replay.
+
 Sessions include `node` (`local` by default). Model validation uses the target
 node's catalog; `/api/models` stays the local catalog. Global slot APIs route to
 the original host's native thread. A disconnected node pauses its dispatch while
