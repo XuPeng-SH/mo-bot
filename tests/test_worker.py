@@ -440,6 +440,34 @@ class TestWorker(unittest.TestCase):
         self.assertFalse(data["rebased"])
         self.assertEqual(data["rebase_status"], "conflicts")
 
+    def test_issue_rebase_requires_design_and_uses_the_owned_pinned_target(self):
+        target = "d" * 40
+        self.gh.branch_sha = target
+        job = self.phase(self.job(issue=True))
+        identity = json.loads(job["metadata"])["identity"]
+        self.ws.worker_rebase.assert_not_called()
+        job = self.phase(self.s.store.claim(2), rebase=True)
+        data = json.loads(job["data"])
+        self.assertTrue(data["needs_rebase"])
+        self.assertEqual(data["rebase_target"]["sha"], target)
+        self.gh.branch_sha = "e" * 40
+        self.ws.worker_rebase_status.side_effect = ["pending", "complete"]
+        self.w.launch(self.slot, self.s.store.claim(2))
+        self.ws.worker_rebase.assert_called_once_with(2, target)
+        fresh = self.s.store.job(job["id"])
+        self.assertEqual(json.loads(fresh["metadata"])["identity"], identity)
+        self.assertFalse(self.gh.writes)
+
+    def test_issue_noop_after_dependency_still_rebases_before_final_verification(self):
+        self.phase(self.job(issue=True))
+        job = self.phase(self.s.store.claim(2), classification="noop", rebase=True)
+        self.assertEqual(job["phase"], "implement")
+        self.assertTrue(json.loads(job["data"])["needs_rebase"])
+        self.ws.worker_rebase_status.return_value = "complete"
+        job = self.phase(self.s.store.claim(2), classification="noop")
+        self.assertEqual(job["phase"], "final_review")
+        self.assertFalse(self.gh.writes)
+
     def test_reentry_verifies_stale_success_flag_and_reuses_conflict_stop(self):
         job = self.job()
         data = {

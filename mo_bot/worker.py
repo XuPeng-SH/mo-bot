@@ -1358,6 +1358,10 @@ class Worker:
             ):
                 data.pop("recovery_wait")
                 data.pop("correction_stalls", None)
+                if job["phase"] in ("triage", "design") and not data.get(
+                    "needs_rebase"
+                ):
+                    data.pop("rebase_target", None)
                 data["coordinator_feedback"] = (
                     f"Prerequisite PR #{number} changed: "
                     + json.dumps(observed)
@@ -1420,11 +1424,7 @@ class Worker:
             self.checkpoint(job, data, phase="design")
             job = self.store.job(job["id"])
             self.check_input(job, refresh_evidence=True)
-        if (
-            job["phase"] in ("triage", "design")
-            and job["target_type"] == "pr"
-            and not data.get("rebase_target")
-        ):
+        if job["phase"] in ("triage", "design") and not data.get("rebase_target"):
             identity = json.loads(job["metadata"])["identity"]
             branch = self.gh.api(
                 f"repos/{job['repo']}/branches/{quote(identity['base_ref'], safe='')}"
@@ -1732,25 +1732,20 @@ Return every schema field. causes holds independently proven environment/flaky a
             next_phase = "design"
         elif phase == "design":
             self.validate_dispositions(job, result)
-            if result["classification"] == "noop":
-                next_phase = "final_review"
-            elif job["target_type"] == "pr" and result["classification"] in (
-                "environment",
-                "flaky",
+            if result["rebase"]:
+                if not data.get("rebase_target"):
+                    raise ValueError(
+                        "rebase design requires a coordinator-pinned target"
+                    )
+                data["needs_rebase"] = True
+                next_phase = "implement"
+            elif result["classification"] == "noop" or (
+                job["target_type"] == "pr"
+                and result["classification"] in ("environment", "flaky")
             ):
-                # validate_dispositions already validates normalized causes,
-                # including legacy top-level data. Do not require both forms.
-                # Retain the cause diagnosis and approved rerun; no source edits are required.
-                if result["rebase"]:
-                    data["needs_rebase"] = True
-                    next_phase = "implement"
-                else:
-                    next_phase = "final_review"
+                # No source edits are required; retain the accepted diagnosis.
+                next_phase = "final_review"
             else:
-                if result["rebase"]:
-                    if job["target_type"] != "pr":
-                        raise ValueError("issue task cannot rebase a PR input")
-                    data["needs_rebase"] = True
                 next_phase = "implement"
         elif phase == "implement":
             candidate = self.ws.worker_finalize(slot["id"], result["commit_message"])
