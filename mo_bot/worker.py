@@ -43,6 +43,10 @@ class WorkerFeedbackPending(RuntimeError):
     """Same-head feedback needs a checkpoint, not a replacement task."""
 
 
+class WorkerExcluded(ValueError):
+    """A known PR admission restriction, distinct from unavailable evidence."""
+
+
 SCHEMA = {
     "type": "object",
     "additionalProperties": False,
@@ -176,6 +180,7 @@ class Worker:
         self.classifications = {}
         self.classifier_disabled = False
         self.discovery_errors = {}
+        self.discovery_exclusions = {}
 
     def actor(self):
         actual = self.gh.api("user")
@@ -236,7 +241,7 @@ class Worker:
             or pr.get("draft")
             or number in self.config.exclude
         ):
-            raise ValueError(
+            raise WorkerExcluded(
                 "worker admits only configured owner open non-draft non-excluded PRs"
             )
         head_repo = pr["head"]["repo"]
@@ -250,12 +255,19 @@ class Worker:
             not personal
             and head_repo["full_name"] not in self.config.worker_allowed_head_repos
         ):
-            raise ValueError(
+            raise WorkerExcluded(
                 "PR head is not an owned fork or explicitly allowed repository"
             )
         if pr["head"]["ref"] == head_repo["default_branch"]:
-            raise ValueError("worker refuses a default branch destination")
+            raise WorkerExcluded("worker refuses a default branch destination")
         return actor, pr
+
+    def discover_pr(self, number):
+        try:
+            return self.gather_candidate(number)
+        except (WorkerExcluded, OwnerWip) as error:
+            # The child returns an explicit exclusion, never a traceback to parse.
+            return {"number": number, "excluded": str(error)}
 
     def gather_candidate(self, number):
         actor, pr = self.own_pr(number)
@@ -654,6 +666,11 @@ class Worker:
         if not self.store.capacity("worker"):
             return
         prs = sorted(own_prs, key=lambda p: p["number"])
+        current = {str(pr["number"]) for pr in prs}
+        for outcomes in (self.discovery_exclusions, self.discovery_errors):
+            for target in list(outcomes):
+                if target.isdigit() and target not in current:
+                    outcomes.pop(target)
         count = min(len(prs), self.config.worker_scan_limit)
         selected = (
             [prs[(self.cursor + i) % len(prs)] for i in range(count)] if prs else []
@@ -671,7 +688,12 @@ class Worker:
                         self.store.enqueue(candidate)
                         self.s.eligible.add(self.store.work_key(candidate))
                     self.discovery_errors.pop(str(pr["number"]), None)
+                    self.discovery_exclusions.pop(str(pr["number"]), None)
+                except (WorkerExcluded, OwnerWip) as error:
+                    self.discovery_exclusions[str(pr["number"])] = str(error)
+                    self.discovery_errors.pop(str(pr["number"]), None)
                 except (ValueError, RuntimeError, KeyError) as error:
+                    self.discovery_exclusions.pop(str(pr["number"]), None)
                     self.discovery_errors[str(pr["number"])] = str(error)
         if self.s.config_path:
             queued = set(self.issue_discovery_queue)
@@ -1031,9 +1053,17 @@ class Worker:
                 raw = self.discovery_child.poll()
                 if raw is not None:
                     self.discovery = None
+                    if type(raw.get("number")) is not int or raw["number"] != number:
+                        raise ValueError("worker discovery target changed")
+                    if "excluded" in raw:
+                        if not isinstance(raw["excluded"], str) or not raw["excluded"]:
+                            raise ValueError("invalid worker discovery exclusion")
+                        self.discovery_exclusions[str(number)] = raw["excluded"]
+                    else:
+                        self.discovery_exclusions.pop(str(number), None)
                     candidate = (
                         self.admit_candidate(raw)
-                        if self.store.capacity("worker")
+                        if "excluded" not in raw and self.store.capacity("worker")
                         else None
                     )
                     if candidate:
@@ -1042,6 +1072,7 @@ class Worker:
                     self.discovery_errors.pop(str(number), None)
             except (OSError, ValueError, RuntimeError, KeyError) as error:
                 self.discovery = None
+                self.discovery_exclusions.pop(str(number), None)
                 self.discovery_errors[str(number)] = str(error)
                 LOG.warning("worker discovery PR=%s indeterminate=%s", number, error)
         if self.issue_discovery is not None:
@@ -1225,13 +1256,19 @@ class Worker:
         )
         job = self.store.job(job["id"])
         data = json.loads(job["data"])
-        data.pop("recovery_wait", None)
+        recovery_wait = data.pop("recovery_wait", None)
         if data.get("pending_input"):
             raise WorkerFeedbackPending(
                 "pending observations require a phase checkpoint"
             )
         if job["error"] and not data.get("paused"):
             data["coordinator_feedback"] = job["error"][:4000]
+        if recovery_wait:
+            data["coordinator_feedback"] = (
+                "Check the external prerequisite once against current evidence: "
+                + recovery_wait["guidance"]
+                + "\nThe scheduler owns the wait timer. Do not sleep or repeat passing checks. If still unavailable, return the preserved blocked checkpoint with the actual producer and readiness evidence; the coordinator is not a substitute for that producer."
+            )
         if job["phase"] not in PHASES:
             raise ValueError("invalid worker phase")
         # Legacy checkpoints did not distinguish the historical base from the
@@ -2458,7 +2495,7 @@ if __name__ == "__main__":
     if len(sys.argv) == 4 and sys.argv[2] == "issue":
         candidate = worker.issue_candidate(int(sys.argv[3]), require_ready=True)
     elif len(sys.argv) == 3:
-        candidate = worker.gather_candidate(int(sys.argv[2]))
+        candidate = worker.discover_pr(int(sys.argv[2]))
     else:
         raise SystemExit("usage: python -m mo_bot.worker CONFIG [issue] NUMBER")
     print(json.dumps(candidate))

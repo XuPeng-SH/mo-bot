@@ -31,6 +31,12 @@ SSE keeps 1024 events, with individual payloads capped at 64 KiB. Missing buffer
 
 Status is a snapshot: inspect `updated_at`. Network/git preparation can delay scheduler command admission; status and native output streaming remain served on HTTP threads. The command queue is bounded at 64, HTTP connections at 32. `504` reports whether a command was canceled before execution. If already running, reconcile status before retrying; admission remains idempotent. API failures are 400 (invalid input), 401 (authentication), 404 (unknown endpoint), 503 (unavailable/full queue), 504 (timeout).
 
+`worker_discovery_exclusions` reports known PR policy restrictions separately
+from `worker_discovery_errors` and outage alerts. Both are refreshed by discovery;
+an exclusion is not a permanent task failure or permission to bypass the policy.
+A saved review awaiting admission retains `publishing` and exposes `wait_reason`
+and `next_retry_at`; it does not consume another model turn.
+
 Automatic admission uses the bundled review-queue policy (or an explicitly configured replacement): open, non-draft, mergeable PR, green latest CI attempts, fresh CI evidence, and missing decisive review or newer commits after requested changes. Self-authored PRs are eligible without waiting for CI when the current head has no published formal review (APPROVED, CHANGES_REQUESTED or COMMENTED); older-head reviews, pending/dismissed reviews and ordinary issue comments do not close this gate. They retain draft/exclusion/mergeability gates and receive COMMENT-only reviews. Incomplete review evidence waits for reliable discovery. Generated config has no default exclusions; legacy config without an exclude list retains its prior default. Forced admission bypasses those filters but requires an open PR and cannot reset any existing commit task. Head changes cancel older work. Publication rechecks head; review comments include full SHA, stable service ID and ownership marker. Only comments by the authenticated GitHub user count.
 
 One durable job/comment does not guarantee exactly-once physical model execution after an opaque crash: bounded recovery may continue/recompute interrupted work. Completed checkpoints are published without another model turn. Never run this stable identity against different state databases simultaneously; local lock and SQLite fences do not provide a distributed GitHub lock.

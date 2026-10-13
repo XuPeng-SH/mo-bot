@@ -138,11 +138,22 @@ transport configuration changes.
 
 Use `mo-botctl alerts` for repair-admission budget/discovery failures, publication failures, manual reconciliation and native
 inactivity over five minutes; inactivity alone does not prove a model is hung.
+`status.worker_discovery_exclusions` lists known PR policy restrictions, including
+unapproved source repositories and default branch destinations. These are normal
+exclusions, not discovery outages or alerts. They are refreshed on subsequent
+scans; removing a restriction permits normal admission without a manual retry.
+Authentication, unavailable repository evidence and transport failures remain
+in `worker_discovery_errors`. Explicit repair retains the same restrictions.
 Jobs expose the error and next retry time. Publication releases model slots after
 preserving reviewed commits in private coordinator Git refs; target/write fences
 remain. A GitHub outage must not consume another model review.
 
 Missing final validation continues in final_review with the accepted design retained. Only source/design findings or an explicit replan reopen earlier phases. Retry pacing uses source, frozen input and successful execution receipts rather than the wording of limitations; repeating the same check does not reset a stalled task.
+Review publication awaiting CI/admission exposes its policy in `wait_reason` and
+uses a retry deadline; it retains the saved assessment without another review.
+External-wait reentry checks actual readiness once, then returns a checkpoint if
+still blocked. The scheduler owns the waiting interval; model turns should not
+sleep or repeat previously passing checks to simulate progress.
 
 Task controls use exact durable job IDs:
 

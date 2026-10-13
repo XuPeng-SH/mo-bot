@@ -739,7 +739,10 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
                 and admission.get("reason") == "self-authored"
             )
             if not own_pr_still_unreviewed:
-                return  # Preserve ineligible results without starting another model turn.
+                # Retain the assessment; a policy wait needs no model replay or
+                # repeated GitHub read on every scheduler tick.
+                self.store.update(job["id"], retry_at=time.time() + 60)
+                return
         envelope = json.loads(job["result"])
         text = report_text(envelope)
         event = (
@@ -910,6 +913,17 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
                     if status.get("head") == job["head"]
                     else "awaiting successful discovery"
                 )
+            elif (
+                job["state"] == "publishing"
+                and job["kind"] == "review"
+                and not job["review_attempted"]
+                and job["id"] not in self.eligible
+            ):
+                job["wait_reason"] = "review publication awaiting admission: " + (
+                    status.get("reason", "awaiting successful discovery")
+                    if status.get("head") == job["head"]
+                    else "awaiting successful discovery"
+                )
             job["attention_required"] = bool(
                 job["data"].get("paused")
                 or (
@@ -1001,6 +1015,7 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
                     }
                 ],
                 "worker_discovery_errors": self.worker.discovery_errors.copy(),
+                "worker_discovery_exclusions": self.worker.discovery_exclusions.copy(),
                 "discovery": {
                     "running": self.discovery.process is not None,
                     "last_success_at": self.last_scan_at,

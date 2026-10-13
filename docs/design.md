@@ -118,6 +118,14 @@ The existing review predicate remains the admission owner. Discovery now include
 
 Review and worker discovery share one bounded child lifecycle: disk-backed output, captured PID identity, atomic ownership file, timeout/output budgets and cleanup. A scan failure clears automatic review admission until success, without blocking commands or known worker phases. Per-job durable retry deadlines isolate I/O failures; a review publishing result frees model capacity, but a worker's source/delivery affinity remains fenced.
 
+Worker PR admission owns source restrictions. Its discovery child serializes
+known exclusions as successful read-only outcomes; the parent exposes them
+separately from indeterminate API/authentication failures. No traceback parsing
+or PR-specific exception is used. Later scans reevaluate restrictions and clear
+stale outcomes. Review publication policy waits retain their assessment, expose
+the admission reason and use the existing retry deadline. External dependency
+reentry checks current readiness once; waiting itself belongs to the scheduler.
+
 The singleton lock precedes SQLite migration/pool resizing. Command futures are failed on shutdown. Artifact recovery is shared across pools and matches session ID, turn ID and completion status; late previous-turn notifications are buffered until the new native turn ID is known, then rejected. Stalled stdio writes have deadlines and oversized/malformed RPC frames fence the backend. Initial spawn failures release open logs.
 
 Status is a compact SQL projection over recent plus active jobs; complete evidence stays in SQLite and is read on demand. Admission state, retry deadline and scan freshness are visible separately from queue state. This avoids parsing/emitting historical CI/comment/diagnostic blobs on every scheduler tick.
