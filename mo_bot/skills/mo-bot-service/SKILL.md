@@ -50,6 +50,9 @@ runtime leaf; task caches remain shared across phases. Timeout/cancellation
 reaps the invocation's process group, and scratch follows existing task GC.
 Setup failures retain source/evidence and are distinct from product-test
 failures. Use the normal task continuation controls after environment recovery.
+`check-run` stores command, source fingerprint, timing and exit receipts in the
+turn's `checks/` directory. Correlate those and retained logs with claimed UT,
+race and static checks; do not judge execution from artifact filenames alone.
 
 `status.scratch_cleanup` reports automatic task scratch reclamation and errors.
 Terminal task `tmp` and shared Go `cache` are detached only after live-turn and
@@ -81,7 +84,7 @@ A failed/ambiguous initial comment POST is deliberately fenced. Inspect the job 
 
 Use `updated_at`, queue counts and backend/session state to distinguish stale status, eligibility wait, model failure and actual execution. SSE is bounded and emits gaps: reload the paginated native history when events are missing. Do not describe green CI or an idle session as proof of a successful review. Report exact job/head, session/model, validation evidence and limits.
 
-New same-head feedback invalidates a frozen worker assessment. Before any remote write attempt, publication supersedes that task, retains its result and candidate ref, and releases the PR fence so fresh-input tasks can run. This is ordinary input churn, not manual reconciliation. A previously attempted effect keeps its reconciliation fence. For legacy publishing tasks stopped by the same-head evidence error, inspect their effect records first; explicit retry rechecks the live input and safely applies this rule when no write was attempted.
+New same-head feedback joins the existing unattempted worker task as pending evidence, without changing a live turn's input. At a checkpoint, the existing harness may dismiss informational comments with a retained rationale; failed CI and formal reviews cannot be dismissed. Relevant feedback reopens the necessary design/review gate on the preserved source/candidate. Model failure, stale advice or timeout never discards feedback or creates a replacement task; conservative worker continuation remains available. Inspect `data.pending_evidence_count` and the full job's `pending_input`. A changed head still supersedes the old task, and a previously attempted effect keeps its reconciliation fence.
 
 If `mo-botctl` is missing from PATH, try `~/.local/bin/mo-botctl`. If neither exists, report installation missing; do not guess a running service or silently start a replacement daemon. The source installer is `python3 scripts/install.py`; packaged installs use `mo-bot install`.
 

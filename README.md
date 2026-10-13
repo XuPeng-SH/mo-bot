@@ -9,6 +9,9 @@ checks Linux user/mount/network isolation before compiling tests;
 checks and reaps their owned process group on cancellation/timeout. Build caches
 stay with the task; logs and validation evidence stay outside disposable scratch.
 Unavailable isolation is reported as setup failure and never as a test pass.
+`check-run` records argv, checkout fingerprint, timing and exit status under the
+turn's `checks/` directory, outside scratch. Reviewers match validation claims to
+these receipts and logs; preflight is recorded separately from actual checks.
 
 ## Install and start
 
@@ -299,6 +302,15 @@ explicit operator request can pause a task. Direct `chat`, `pause`, `resume` and
 `data.harness_result`: admission is not execution, stale advice is discarded,
 and missing input is reported as an attention alert. No advice bypasses source
 ownership, tool cleanup or publication fences.
+
+New same-head PR observations join the existing unattempted repair task rather
+than creating another task for each failed job and workflow aggregate. Turn input
+stays fixed until a checkpoint. Harness can dismiss informational comments with
+an audited reason; new CI failures and formal review evidence require worker
+validation. Relevant feedback resumes the preserved candidate through the
+necessary gate. Stale decisions, model outages and timeouts conservatively route
+feedback back to that task. A changed head or attempted remote write retains its
+existing supersession/reconciliation protections.
 
 Independent environment/flaky CI failures (including transient GitHub API and
 proven flaky TLS/network failures) do not automatically create GitHub issues.

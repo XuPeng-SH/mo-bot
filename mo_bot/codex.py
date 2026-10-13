@@ -243,13 +243,14 @@ class Workspace:
     def publication_ref(self, job):
         return f"refs/mo-bot/{self.config.service_id}/delivery/{job['id']}"
 
-    def freeze_publication(self, slot, job, candidate):
+    def freeze_publication(self, slot, job, candidate, previous=None):
         ref = self.publication_ref(job)
         existing = self.publication_git("rev-parse", "--verify", ref, check=False)
         if existing.returncode == 0:
-            if existing.stdout.strip() != candidate:
+            if existing.stdout.strip() == candidate:
+                return ref
+            if existing.stdout.strip() != previous:
                 raise SourceChanged("frozen publication ref changed")
-            return ref
         state = self.worker_state(slot)
         if (
             state["head"] != candidate
@@ -259,8 +260,9 @@ class Workspace:
             raise SourceChanged("reviewed candidate changed before publication freeze")
         self.worker_ensure(slot)
         self.publication_git(
-            "fetch", "--no-tags", str(self.worker_path(slot)), candidate + ":" + ref
+            "fetch", "--no-tags", str(self.worker_path(slot)), candidate
         )
+        self.publication_git("update-ref", ref, candidate, previous or "0" * 40)
         if self.publication_git("rev-parse", ref) != candidate:
             raise SourceChanged("publication freeze identity mismatch")
         return ref
@@ -271,6 +273,18 @@ class Workspace:
             or self.publication_git("rev-parse", ref) != candidate
         ):
             raise SourceChanged("frozen publication candidate changed")
+
+    def restore_publication(self, slot, job, ref, candidate):
+        self.verify_publication(job, ref, candidate)
+        state = self.worker_state(slot)
+        if state["status"] or state["branch"] != "mo-bot/work/" + job["id"]:
+            raise SourceChanged(
+                "cannot restore publication over unrelated or dirty source"
+            )
+        self.worker_git(slot, "fetch", "--no-tags", str(self.config.source_dir), ref)
+        if self.worker_git(slot, "rev-parse", "FETCH_HEAD") != candidate:
+            raise SourceChanged("restored publication identity mismatch")
+        self.worker_git(slot, "checkout", "-B", state["branch"], candidate)
 
     def archive_worker(self, slot, job):
         destination = self.config.state_dir / "jobs" / job["id"] / "saved-source"

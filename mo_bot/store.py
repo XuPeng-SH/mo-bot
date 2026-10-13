@@ -304,6 +304,17 @@ class Store:
             )
             if target_type == "issue":
                 self._insert_issue_members(key, candidate["repo"], members)
+            elif (
+                kind == "work"
+                and candidate.get("atoms")
+                and all(a["kind"] == "comment" for a in candidate["atoms"])
+            ):
+                # Comment-only admission needs semantic relevance, not a full
+                # worker design/review cycle for every account notification.
+                self.db.execute(
+                    "UPDATE jobs SET data=? WHERE id=?",
+                    (json.dumps({"pending_input": candidate}), key),
+                )
             for atom in candidate.get("atoms", []):
                 self.db.execute(
                     "UPDATE evidence SET disposition='queued',job_id=? WHERE repo=? AND number=? AND head=? AND key=? AND (disposition IS NULL OR disposition IN ('blocked','failed','superseded'))",
@@ -417,6 +428,7 @@ class Store:
                 'publication_started_at',json_extract(data,'$.publication_started_at'),
                 'phase_started_at',json_extract(data,'$.phase_started_at'),
                 'paused',json_extract(data,'$.paused'),
+                'pending_evidence_count',json_array_length(json_extract(data,'$.pending_input.atoms')),
                 'harness_request',json_extract(data,'$.harness_request'),
                 'harness_result',json_extract(data,'$.harness_result')) AS data,
             CASE WHEN result IS NULL THEN NULL ELSE json_object(
@@ -605,6 +617,99 @@ class Store:
         return hashlib.sha256(
             json.dumps(scope, separators=(",", ":")).encode()
         ).hexdigest()
+
+    def coalesce_pr_feedback(self, candidate):
+        """Attach new observations to one live task, without changing its turn input."""
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            jobs = self.db.execute(
+                "SELECT * FROM jobs WHERE kind='work' AND target_type='pr' AND repo=? AND target_number=? AND head=? AND state IN ('queued','reviewing','publishing') ORDER BY CASE WHEN state IN ('reviewing','publishing') THEN 0 ELSE 1 END,created",
+                (candidate["repo"], candidate["number"], candidate["headRefOid"]),
+            ).fetchall()
+            if not jobs:
+                return None
+            job = jobs[0]
+            metadata = json.loads(job["metadata"])
+            if (
+                any(
+                    metadata["identity"].get(k) != candidate["identity"].get(k)
+                    for k in (
+                        "actor_id",
+                        "repo_id",
+                        "author_id",
+                        "head_repo_id",
+                        "head_ref",
+                        "base_ref",
+                    )
+                )
+                or self.db.execute(
+                    "SELECT 1 FROM effects WHERE job_id=? AND attempted=1", (job["id"],)
+                ).fetchone()
+            ):
+                return None
+            data = json.loads(job["data"])
+            previous = data.get("pending_input", {})
+            known = set(metadata.get("input_evidence_keys", []))
+            known.update(a["key"] for a in metadata.get("atoms", []))
+            observations = {
+                a["key"]: a
+                for a in [*previous.get("atoms", []), *candidate.get("atoms", [])]
+                if a["key"] not in known
+            }
+            for sibling in jobs[1:]:
+                # Old deployments may have queued several snapshots. Only fold
+                # tasks with no execution, source lease or uncertain claim/write.
+                if (
+                    sibling["state"] != "queued"
+                    or sibling["attempts"]
+                    or sibling["slot_id"] is not None
+                    or sibling["claim_attempted"]
+                    or self.db.execute(
+                        "SELECT 1 FROM effects WHERE job_id=? AND attempted=1",
+                        (sibling["id"],),
+                    ).fetchone()
+                ):
+                    continue
+                saved = json.loads(sibling["metadata"])
+                if saved.get("identity") != metadata.get("identity"):
+                    continue
+                observations.update(
+                    {
+                        a["key"]: a
+                        for a in saved.get("atoms", [])
+                        if a["key"] not in known
+                    }
+                )
+                self.db.execute(
+                    "UPDATE jobs SET state='superseded',error=?,updated=? WHERE id=?",
+                    (
+                        "feedback coalesced into " + job["id"],
+                        time.time(),
+                        sibling["id"],
+                    ),
+                )
+            if observations:
+                data.pop("publication_next_at", None)
+                data["pending_input"] = {
+                    **candidate,
+                    "atoms": list(observations.values()),
+                }
+                self.db.execute(
+                    "UPDATE jobs SET data=?,updated=? WHERE id=?",
+                    (json.dumps(data), time.time(), job["id"]),
+                )
+                for key in observations:
+                    self.db.execute(
+                        "UPDATE evidence SET disposition='queued',job_id=? WHERE repo=? AND number=? AND head=? AND key=?",
+                        (
+                            job["id"],
+                            candidate["repo"],
+                            candidate["number"],
+                            candidate["headRefOid"],
+                            key,
+                        ),
+                    )
+            return metadata
 
     def fresh_evidence(self, repo, number, head, atoms):
         fresh = []

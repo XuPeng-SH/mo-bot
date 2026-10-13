@@ -15,6 +15,7 @@ from mo_bot.codex import SourceChanged, Workspace
 from mo_bot.config import Config
 from mo_bot.service import Service
 from mo_bot.store import Store
+from mo_bot.worker import WorkerFeedbackPending
 
 
 HEAD = "a" * 40
@@ -1941,11 +1942,13 @@ class TestWorker(unittest.TestCase):
         self.gh.comments_data.append(
             {"id": 7, "user": {"id": 9}, "body": "another material causal bug"}
         )
-        with self.assertRaisesRegex(SourceChanged, "same-head"):
+        with self.assertRaisesRegex(WorkerFeedbackPending, "same-head"):
             self.w.check_input(job, refresh_evidence=True)
         self.assertFalse(self.gh.writes)
 
-    def publication_with_new_feedback(self, head=HEAD):
+    def publication_with_new_feedback(
+        self, head=HEAD, body="another material causal bug"
+    ):
         self.phase(self.job())
         self.phase(self.s.store.claim(2))
         self.phase(self.s.store.claim(2))
@@ -1956,26 +1959,239 @@ class TestWorker(unittest.TestCase):
         job = self.phase(self.s.store.claim(2))
         self.s.turns.clear()
         self.gh.prs[1]["head"]["sha"] = head
-        self.gh.comments_data.append(
-            {"id": 7, "user": {"id": 9}, "body": "another material causal bug"}
-        )
+        self.gh.comments_data.append({"id": 7, "user": {"id": 9}, "body": body})
         candidate = self.w.pr_candidate(1, explicit=True)
         self.s.store.enqueue(candidate)
         return job, self.s.store.work_key(candidate)
 
-    def test_unpublished_stale_assessment_releases_pr_fence(self):
+    def test_unpublished_feedback_retains_candidate_and_same_task(self):
         job, next_id = self.publication_with_new_feedback()
         self.assertIsNone(self.s.store.claim(3))
         self.w.publish(job)
         old = self.s.store.job(job["id"])
-        self.assertEqual((old["state"], old["slot_id"]), ("superseded", None))
+        self.assertEqual((old["state"], old["slot_id"]), ("queued", None))
         data = json.loads(old["data"])
         self.assertNotIn("manual_reconciliation", data)
         self.assertEqual(data["candidate"], NEW)
         self.assertIn("publication_ref", data)
-        self.assertIsNotNone(old["result"])
+        self.assertIsNone(old["result"])
+        self.assertEqual(next_id, job["id"])
         self.assertFalse(self.gh.writes)
         self.assertEqual(self.s.store.claim(3)["id"], next_id)
+
+    def test_failed_job_and_terminal_run_join_one_task_without_changing_live_input(
+        self,
+    ):
+        self.gh.checks = [
+            {"id": 81, "name": "checks", "status": "completed", "conclusion": "failure"}
+        ]
+        first = self.w.pr_candidate(1)
+        self.s.store.enqueue(first)
+        key = self.s.store.work_key(first)
+        frozen = self.s.store.job(key)["metadata"]
+        self.gh.runs = [
+            {"id": 91, "status": "completed", "conclusion": "failure", "run_attempt": 1}
+        ]
+        second = self.w.pr_candidate(1)
+        self.assertEqual(self.s.store.work_key(second), key)
+        self.assertFalse(self.s.store.enqueue(second))
+        job = self.s.store.job(key)
+        self.assertEqual(job["metadata"], frozen)
+        self.assertEqual(
+            [a["kind"] for a in json.loads(job["data"])["pending_input"]["atoms"]],
+            ["run_failure"],
+        )
+        self.assertIsNone(self.w.pr_candidate(1))
+        self.assertEqual(len(self.s.store.jobs(("queued",))), 1)
+
+    def test_comment_only_notification_uses_harness_without_worker_or_remote_write(
+        self,
+    ):
+        semantic = self.harness_slot()
+        self.gh.comments_data = [
+            {"id": 90, "body": "Automatic account notification: account link required"}
+        ]
+        candidate = self.w.pr_candidate(1)
+        self.s.store.enqueue(candidate)
+        key = self.s.store.work_key(candidate)
+        self.s.harness.poll()
+        request = json.loads(self.s.store.job(key)["data"])["harness_request"]
+        self.w.dispatch_classifier(semantic)
+        self.w.classifier_complete(
+            semantic["id"],
+            self.harness_advice(
+                request,
+                "ignore",
+                rationale="Account notification has no actionable repository feedback",
+            ),
+        )
+        self.assertEqual(self.s.store.job(key)["state"], "superseded")
+        self.assertEqual(self.s.store.job(key)["attempts"], 0)
+        self.assertIsNone(self.w.pr_candidate(1))
+        self.ws.worker_prepare.assert_not_called()
+        self.assertFalse(self.gh.writes)
+
+    def test_legacy_unstarted_siblings_coalesce_but_source_checkpoints_are_retained(
+        self,
+    ):
+        job = self.job()
+        self.gh.comments_data = [{"id": 5, "body": "feedback"}]
+        raw = self.w.gather_candidate(1)
+        self.s.store.fresh_evidence(raw["repo"], 1, HEAD, raw["atoms"])
+        sibling = {**raw, "trigger_key": "legacy"}
+        self.s.store.enqueue(sibling)
+        sibling_id = self.s.store.work_key(sibling)
+        self.w.pr_candidate(1, explicit=True)
+        self.assertEqual(self.s.store.job(sibling_id)["state"], "superseded")
+        self.assertIn("pending_input", json.loads(self.s.store.job(job["id"])["data"]))
+        self.assertEqual(self.s.store.job(job["id"])["state"], "reviewing")
+        self.ws.archive_worker.assert_not_called()
+
+    def test_informational_comment_can_resume_saved_publication_without_another_gate(
+        self,
+    ):
+        semantic = self.harness_slot()
+        job, _ = self.publication_with_new_feedback(
+            body="Automatic account notification: subscription is paused"
+        )
+        self.w.publish(job)
+        retained = self.s.store.job(job["id"])
+        original_result = retained["result"]
+        request = json.loads(retained["data"])["harness_request"]
+        self.w.dispatch_classifier(semantic)
+        self.w.classifier_complete(
+            semantic["id"],
+            self.harness_advice(
+                request,
+                "ignore",
+                rationale="Informational notification, no code feedback",
+            ),
+        )
+        retained = self.s.store.job(job["id"])
+        self.assertEqual(retained["state"], "publishing")
+        self.assertEqual(retained["result"], original_result)
+        self.w.check_input(retained, refresh_evidence=True)
+        self.assertNotIn("pending_input", json.loads(retained["data"]))
+        self.assertFalse(self.gh.writes)
+
+    def test_new_failed_ci_cannot_be_ignored_and_keeps_candidate_for_design(self):
+        semantic = self.harness_slot()
+        job, _ = self.publication_with_new_feedback()
+        self.gh.checks = [
+            {
+                "id": 88,
+                "name": "new failure",
+                "status": "completed",
+                "conclusion": "failure",
+            }
+        ]
+        self.w.publish(job)
+        retained = self.s.store.job(job["id"])
+        request = json.loads(retained["data"])["harness_request"]
+        self.w.dispatch_classifier(semantic)
+        self.w.classifier_complete(
+            semantic["id"], self.harness_advice(request, "ignore")
+        )
+        retained = self.s.store.job(job["id"])
+        data = json.loads(retained["data"])
+        self.assertEqual((retained["state"], retained["phase"]), ("queued", "design"))
+        self.assertEqual(data["candidate"], NEW)
+        self.assertEqual(data["harness_result"]["status"], "fallback")
+        self.assertNotIn("final_review", data)
+        self.assertNotIn("design", data)
+        self.w.launch(self.slot, self.s.store.claim(2))
+        self.ws.restore_publication.assert_called_once()
+        self.assertFalse(self.gh.writes)
+
+    def test_feedback_version_change_discards_stale_semantic_ignore(self):
+        semantic = self.harness_slot()
+        job, _ = self.publication_with_new_feedback()
+        self.w.publish(job)
+        request = json.loads(self.s.store.job(job["id"])["data"])["harness_request"]
+        self.w.dispatch_classifier(semantic)
+        self.gh.comments_data.append({"id": 8, "body": "new material feedback"})
+        self.w.pr_candidate(1)
+        self.w.classifier_complete(
+            semantic["id"], self.harness_advice(request, "ignore")
+        )
+        retained = self.s.store.job(job["id"])
+        data = json.loads(retained["data"])
+        self.assertEqual(data["harness_result"]["status"], "stale")
+        self.assertEqual(len(data["pending_input"]["atoms"]), 2)
+        self.assertEqual(retained["state"], "queued")
+        self.s.harness.next_poll = 0
+        self.s.harness.poll()
+        self.assertNotEqual(
+            json.loads(self.s.store.job(job["id"])["data"])["harness_request"]["id"],
+            request["id"],
+        )
+
+    def test_feedback_timeout_after_restart_conservatively_resumes_same_candidate(self):
+        semantic = self.harness_slot()
+        job, _ = self.publication_with_new_feedback()
+        self.w.publish(job)
+        self.w.dispatch_classifier(semantic)
+        self.s.harness.pending.clear()
+        retained = self.s.store.job(job["id"])
+        data = json.loads(retained["data"])
+        data["harness_request"]["expires_at"] = time.time() - 1
+        self.s.store.update(job["id"], data=json.dumps(data))
+        self.s.harness.next_poll = 0
+        self.s.harness.poll()
+        retained = self.s.store.job(job["id"])
+        data = json.loads(retained["data"])
+        self.assertEqual(
+            (retained["state"], retained["phase"]), ("queued", "final_review")
+        )
+        self.assertEqual(data["candidate"], NEW)
+        self.assertNotIn("pending_input", data)
+        self.assertEqual(data["harness_result"]["status"], "fallback")
+        self.assertFalse(self.gh.writes)
+
+    def test_feedback_archive_error_retains_source_lease_without_crashing_scheduler(
+        self,
+    ):
+        job = self.phase(self.job())
+        self.s.turns.clear()
+        self.gh.comments_data = [{"id": 19, "body": "new feedback"}]
+        self.s.eligible.add(job["id"])
+        self.s.next_scan = float("inf")
+        self.ws.archive_worker.side_effect = OSError("archive unavailable")
+        self.s.tick()
+        retained = self.s.store.job(job["id"])
+        self.assertEqual((retained["state"], retained["slot_id"]), ("queued", 2))
+        self.assertIn("source preservation", retained["error"])
+        self.assertGreater(retained["retry_at"], time.time())
+        self.assertIsNone(self.s.store.claim(3))
+        self.assertIn("pending_input", json.loads(retained["data"]))
+
+    def test_ignoring_notice_cannot_restore_a_gate_invalidated_by_operator_replanning(
+        self,
+    ):
+        semantic = self.harness_slot()
+        job, _ = self.publication_with_new_feedback(
+            body="Informational service notification"
+        )
+        self.w.publish(job)
+        retained = self.s.store.job(job["id"])
+        data = json.loads(retained["data"])
+        data.pop("design")
+        data.pop("final_review")
+        # An operator's independent replan invalidates the saved final gate.
+        self.s.store.update(job["id"], phase="design", data=json.dumps(data))
+        self.s.harness.next_poll = 0
+        self.s.harness.poll()
+        self.s.harness.next_poll = 0
+        self.s.harness.poll()
+        request = json.loads(self.s.store.job(job["id"])["data"])["harness_request"]
+        self.w.dispatch_classifier(semantic)
+        self.w.classifier_complete(
+            semantic["id"], self.harness_advice(request, "ignore")
+        )
+        retained = self.s.store.job(job["id"])
+        self.assertEqual((retained["state"], retained["phase"]), ("queued", "design"))
+        self.assertTrue(json.loads(retained["data"])["resume_publication"])
+        self.assertFalse(self.gh.writes)
 
     def test_stale_assessment_with_attempted_write_keeps_pr_fence(self):
         job, _ = self.publication_with_new_feedback()
@@ -2742,11 +2958,25 @@ class TestIndependentGit(unittest.TestCase):
             self.assertEqual((source / "file").read_text(), "original\n")
             self.assertFalse(workspace.worker_state(2)["status"])
             frozen = workspace.freeze_publication(2, {"id": "job"}, candidate)
+            workspace.worker_git(2, "checkout", "-B", "mo-bot/work/job", initial)
+            workspace.restore_publication(2, {"id": "job"}, frozen, candidate)
+            self.assertEqual(workspace.worker_state(2)["head"], candidate)
+            (path / "file").write_text("fixed with feedback\n")
+            revised = workspace.worker_finalize(2, "fix: incorporate feedback")
+            with self.assertRaises(SourceChanged):
+                workspace.freeze_publication(
+                    2, {"id": "job"}, revised, previous=initial
+                )
+            workspace.freeze_publication(2, {"id": "job"}, revised, previous=candidate)
+            workspace.verify_publication({"id": "job"}, frozen, revised)
+            candidate = revised
             workspace.worker_git(2, "checkout", "--detach", initial)
             (path / "file").write_text("another task working copy\n")
+            with self.assertRaises(SourceChanged):
+                workspace.restore_publication(2, {"id": "job"}, frozen, candidate)
             workspace.verify_publication({"id": "job"}, frozen, candidate)
             self.assertEqual(git("rev-parse", "HEAD"), initial)
-            self.assertEqual(git("show", frozen + ":file"), "fixed")
+            self.assertEqual(git("show", frozen + ":file"), "fixed with feedback")
             workspace.publication_git("update-ref", frozen, initial)
             with self.assertRaises(SourceChanged):
                 workspace.verify_publication({"id": "job"}, frozen, candidate)

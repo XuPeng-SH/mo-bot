@@ -38,6 +38,10 @@ class WorkerInputChanged(SourceChanged):
     """A new PR head or evidence invalidates the frozen assessment."""
 
 
+class WorkerFeedbackPending(RuntimeError):
+    """Same-head feedback needs a checkpoint, not a replacement task."""
+
+
 SCHEMA = {
     "type": "object",
     "additionalProperties": False,
@@ -377,16 +381,6 @@ class Worker:
 
     def admit_candidate(self, candidate, explicit=False):
         number, head = candidate["number"], candidate["headRefOid"]
-        if explicit:
-            for existing in self.store.db.execute(
-                "SELECT metadata FROM jobs WHERE kind='work' AND repo=? AND target_type='pr' AND target_number=? AND head=? AND state IN ('queued','reviewing','canceling','publishing')",
-                (candidate["repo"], number, head),
-            ):
-                saved = json.loads(existing["metadata"])
-                if saved.get("input_evidence_keys") == candidate.get(
-                    "input_evidence_keys"
-                ):
-                    return saved
         # Pending own pushes may already be visible remotely before their response
         # is checkpointed. Carry only the exact accepted candidate's semantic atoms.
         for effect in self.store.db.execute(
@@ -400,6 +394,10 @@ class Worker:
         fresh = self.store.fresh_evidence(
             candidate["repo"], number, head, candidate["atoms"]
         )
+        if fresh or explicit:
+            existing = self.store.coalesce_pr_feedback(candidate)
+            if existing is not None:
+                return existing
         if not fresh and not explicit:
             return None
         history = self.store.db.execute(
@@ -1130,9 +1128,22 @@ class Worker:
                         "input_evidence_keys", [a["key"] for a in meta.get("atoms", [])]
                     )
                 )
-                if any(a["key"] not in known for a in latest["atoms"]):
+                if any(a["key"] not in known for a in latest["atoms"]) or json.loads(
+                    self.store.job(job["id"])["data"]
+                ).get("pending_input"):
+                    if not self.store.db.execute(
+                        "SELECT 1 FROM effects WHERE job_id=? AND attempted=1",
+                        (job["id"],),
+                    ).fetchone():
+                        self.store.fresh_evidence(
+                            job["repo"], job["pr"], job["head"], latest["atoms"]
+                        )
+                        self.store.coalesce_pr_feedback(latest)
+                        raise WorkerFeedbackPending(
+                            "new same-head evidence awaiting coordination"
+                        )
                     raise WorkerInputChanged(
-                        "new same-head PR feedback/CI evidence requires a fresh task"
+                        "new same-head evidence requires reconciliation after an attempted write"
                     )
         else:
             members = self.issue_members(meta, job["target_number"], job["trigger_key"])
@@ -1214,6 +1225,10 @@ class Worker:
         )
         job = self.store.job(job["id"])
         data = json.loads(job["data"])
+        if data.get("pending_input"):
+            raise WorkerFeedbackPending(
+                "pending observations require a phase checkpoint"
+            )
         if job["error"] and not data.get("paused"):
             data["coordinator_feedback"] = job["error"][:4000]
         if job["phase"] not in PHASES:
@@ -1288,6 +1303,14 @@ class Worker:
             data["worker_slot"] = slot["id"]
             self.checkpoint(job, data)
         path = self.ws.worker_prepare(slot["id"], job)
+        if data.pop("resume_publication", False):
+            self.ws.restore_publication(
+                slot["id"],
+                job,
+                data["publication_ref"],
+                data.get("publication_candidate", data["candidate"]),
+            )
+            self.checkpoint(job, data)
         if job["phase"] in ("triage", "design") and data.get("rebase_target"):
             self.ws.worker_fetch_target(
                 slot["id"], job["repo"], data["rebase_target"]["sha"]
@@ -1648,6 +1671,9 @@ Return every schema field. causes holds independently proven environment/flaky a
 
     def retry(self, job, error):
         job = self.store.job(job["id"])
+        if isinstance(error, WorkerFeedbackPending):
+            self.defer_feedback(job)
+            return
         data = json.loads(job["data"])
         if isinstance(error, OwnerWip) or str(error) == "owner-wip":
             if (
@@ -1705,6 +1731,116 @@ Return every schema field. causes holds independently proven environment/flaky a
             self.s.harness.request(job["id"], "execution_error", str(error)[:4000])
         else:
             self.checkpoint(job, data, state="queued", error=str(error))
+
+    def defer_feedback(self, job):
+        """Preserve the existing candidate before exceptional input coordination."""
+        data = json.loads(job["data"])
+        if not data.get("pending_input"):
+            raise ValueError("feedback checkpoint lacks new evidence")
+        data.setdefault(
+            "feedback_resume_state",
+            "publishing" if job["state"] == "publishing" else "queued",
+        )
+        if (
+            job["slot_id"] is not None
+            and data.get("before")
+            and not data.get("workspace_archive")
+        ):
+            try:
+                data["workspace_archive"] = self.ws.archive_worker(job["slot_id"], job)
+            except (OSError, ValueError, RuntimeError) as error:
+                # Retain the source lease until preservation succeeds; a failed
+                # move must never expose this checkout to another task.
+                self.checkpoint(
+                    job,
+                    data,
+                    state="queued",
+                    error="feedback source preservation: " + str(error),
+                    retry_at=time.time() + 60,
+                )
+                return
+        self.checkpoint(job, data, state="queued", slot_id=None, error=None, retry_at=0)
+        self.s.harness.request(job["id"], "new_evidence")
+
+    def apply_feedback(self, job, action, guidance):
+        """Commit an evidence revision at a safe boundary; keep source and task ID."""
+        data = json.loads(job["data"])
+        pending = data.get("pending_input")
+        if not pending:
+            raise ValueError("feedback already consumed")
+        additions = pending["atoms"]
+        if action == "ignore" and any(a["kind"] != "comment" for a in additions):
+            raise ValueError(
+                "semantic advice cannot dismiss failed CI or review evidence"
+            )
+        metadata = json.loads(job["metadata"])
+        metadata["input_evidence_keys"] = sorted(
+            set(metadata.get("input_evidence_keys", [])) | {a["key"] for a in additions}
+        )
+        metadata["evidence"] = pending["evidence"]
+        if action != "ignore":
+            metadata["atoms"] = list(
+                {a["key"]: a for a in [*metadata["atoms"], *additions]}.values()
+            )
+        state = data.pop("feedback_resume_state", "queued")
+        phase = job["phase"]
+        if (
+            action == "ignore"
+            and not job["attempts"]
+            and not data.get("before")
+            and not data.get("operator_hint")
+            and {a["key"] for a in metadata["atoms"]} <= {a["key"] for a in additions}
+        ):
+            state = "superseded"  # No actionable admission, never an approval.
+        if state == "publishing" and (
+            phase != "final_review"
+            or not data.get("design")
+            or not data.get("final_review")
+            or not job["result"]
+        ):
+            state = "queued"  # Another coordination decision invalidated the old gate.
+        if action != "ignore":
+            state = "queued"
+            if action == "replan" or any(
+                a["kind"]
+                in ("check_failure", "status_failure", "run_failure", "conflict")
+                for a in additions
+            ):
+                phase = "design" if phase != "triage" else "triage"
+                data.pop("design", None)
+            data.pop("final_review", None)
+            data["coordinator_feedback"] = (
+                "New same-head evidence incorporated; reuse the preserved candidate and valid validation.\n"
+                + guidance
+            )[:4000]
+        if (
+            state == "queued"
+            and data.get("publication_ref")
+            and not data.get("workspace_archive")
+        ):
+            data["resume_publication"] = True
+            data.setdefault("publication_candidate", data["candidate"])
+        data.pop("pending_input")
+        with self.store.db:
+            self.store.db.execute(
+                "UPDATE jobs SET metadata=?,data=?,state=?,phase=?,result=?,error=NULL,updated=? WHERE id=?",
+                (
+                    json.dumps(metadata),
+                    json.dumps(data),
+                    state,
+                    phase,
+                    job["result"] if action == "ignore" else None,
+                    time.time(),
+                    job["id"],
+                ),
+            )
+            if action == "ignore":
+                for a in additions:
+                    self.store.db.execute(
+                        "UPDATE evidence SET disposition='done',job_id=? WHERE repo=? AND number=? AND head=? AND key=?",
+                        (job["id"], job["repo"], job["pr"], job["head"], a["key"]),
+                    )
+        self.s.eligible.add(job["id"])
 
     def fail(self, job, error):
         data = json.loads(self.store.job(job["id"])["data"])
@@ -2168,8 +2304,12 @@ Return every schema field. causes holds independently proven environment/flaky a
             if job["slot_id"] is not None:
                 if data["candidate"] != job["head"]:
                     data["publication_ref"] = self.ws.freeze_publication(
-                        data["worker_slot"], job, data["candidate"]
+                        data["worker_slot"],
+                        job,
+                        data["candidate"],
+                        previous=data.get("publication_candidate"),
                     )
+                    data["publication_candidate"] = data["candidate"]
                 self.checkpoint(job, data, slot_id=None)
                 job = self.store.job(job["id"])
         except Exception as error:
@@ -2243,6 +2383,9 @@ Return every schema field. causes holds independently proven environment/flaky a
             data["publication_next_at"] = time.time() + 60
             self.checkpoint(job, data, error="owner-wip")
         except Exception as error:
+            if isinstance(error, WorkerFeedbackPending):
+                self.defer_feedback(self.store.job(job["id"]))
+                return
             if (
                 isinstance(error, WorkerInputChanged)
                 and not self.store.db.execute(

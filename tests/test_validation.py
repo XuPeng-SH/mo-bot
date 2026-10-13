@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+import json
 import subprocess
 import sys
 import tempfile
@@ -37,6 +38,13 @@ class ValidationTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 7, result.stderr)
         self.assertEqual(result.stdout.strip(), "spaces;$(not-a-shell)")
+        receipts = [
+            json.loads(p.read_text()) for p in (self.phase / "checks").glob("*.json")
+        ]
+        self.assertEqual(len(receipts), 1)
+        self.assertEqual(receipts[0]["exit_code"], 7)
+        self.assertEqual(receipts[0]["command"][-1], "spaces;$(not-a-shell)")
+        self.assertEqual(receipts[0]["kind"], "check")
 
     def test_real_namespace_preflight_and_test_binary_isolation(self):
         preflight = self.invoke("check-run", "--preflight")
@@ -75,6 +83,8 @@ class ValidationTests(unittest.TestCase):
             "check-run", "--timeout", "1", "--", sys.executable, "-c", code
         )
         self.assertEqual(result.returncode, 124, result.stderr)
+        receipt = json.loads(next((self.phase / "checks").glob("*.json")).read_text())
+        self.assertEqual(receipt["exit_code"], 124)
         pid = pidfile.read_text()
         for _ in range(50):
             status = Path("/proc", pid, "stat")
@@ -94,6 +104,79 @@ class ValidationTests(unittest.TestCase):
                 with self.assertRaises(KeyboardInterrupt):
                     run(["command"], 1)
             self.assertEqual(kill.call_count, 2)
+
+    def test_receipt_fingerprints_new_test_contents_and_separates_setup_failure(self):
+        repo = self.root / "checkout"
+        repo.mkdir()
+
+        def git(*args):
+            return subprocess.run(
+                ["git", "-C", str(repo), *args], capture_output=True, check=True
+            )
+
+        git("init")
+        git(
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "initial",
+        )
+        probe = repo / "regression.py"
+        fingerprints = []
+        for contents in ("first", "changed"):
+            probe.write_text(contents)
+            result = subprocess.run(
+                [str(self.phase / "check-run"), "--", "true"],
+                cwd=repo,
+                capture_output=True,
+                timeout=25,
+            )
+            self.assertEqual(result.returncode, 0)
+            latest = sorted((self.phase / "checks").glob("*.json"))[-1]
+            fingerprints.append(
+                json.loads(latest.read_text())["source"]["delta_sha256"]
+            )
+        self.assertNotEqual(*fingerprints)
+        result = self.invoke("check-run", "--", str(self.root / "missing-command"))
+        self.assertEqual(result.returncode, 125)
+        receipt = json.loads(
+            sorted((self.phase / "checks").glob("*.json"))[-1].read_text()
+        )
+        self.assertEqual(receipt["exit_code"], 125)
+        self.assertIn("setup_error", receipt)
+
+    def test_actual_launcher_cancellation_retains_a_nonpassing_receipt(self):
+        marker = self.root / "started"
+        script = f"import pathlib,time; pathlib.Path({str(marker)!r}).touch(); time.sleep(60)"
+        process = subprocess.Popen(
+            [str(self.phase / "check-run"), "--", sys.executable, "-c", script],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            deadline = time.monotonic() + 10
+            while (
+                not marker.exists()
+                and process.poll() is None
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.02)
+            self.assertTrue(marker.exists())
+            process.terminate()
+            self.assertEqual(process.wait(timeout=10), 130)
+            receipt = json.loads(
+                next((self.phase / "checks").glob("*.json")).read_text()
+            )
+            self.assertEqual(receipt["exit_code"], 130)
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.communicate(timeout=10)
 
 
 if __name__ == "__main__":

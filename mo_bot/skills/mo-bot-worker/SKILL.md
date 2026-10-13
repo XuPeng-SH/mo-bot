@@ -52,6 +52,11 @@ a private runtime child and loopback, while compilation keeps the assigned Go
 caches. A preflight failure produces no test verdict: diagnose it, continue
 independent source review and retain matching source/build evidence. Resume
 missing checks after recovery rather than restarting design or repeating passes.
+Wrap actual UT, race and static checks with `check-run`; its `checks/*.json`
+receipts retain command, checkout fingerprint and exit outcome. In final review,
+match claimed checks to their actual scope, receipt and retained logs. A file or
+prose labelled "SCA" is not proof, and a different filename does not disprove
+properly executed component checks. Earlier exact-input logs remain reusable.
 
 Harness suggestions are coordination advice within the frozen task, not validation or publication authority. Reuse preserved source and execute concrete missing checks. If implementation disproves the accepted plan, preserve edits and explain the invalid assumption in a blocked checkpoint so the coordinator can route to a new native design gate. When asked for progress, give completed evidence, active tools and remaining work, then continue. A missing operator input must not be guessed; continue independent work and retain the dependency explicitly. Never interpret silence alone as a reason to kill processes or alter unrelated environments.
 

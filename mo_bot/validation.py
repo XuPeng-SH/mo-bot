@@ -1,6 +1,8 @@
 """Foreground checks and private test runtime for coordinator-owned tasks."""
 
 import argparse
+import hashlib
+import json
 import os
 from pathlib import Path
 import shlex
@@ -9,6 +11,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 
 
 def prepare(directory):
@@ -30,6 +33,8 @@ def prepare(directory):
         f"Then run Go tests with -exec={shlex.quote(str(directory / 'test-exec'))}; "
         "each test binary gets a dedicated runtime child, private /tmp and loopback. "
         "Use check-run --timeout SECONDS -- COMMAND for bounded foreground checks. "
+        f"Each check-run saves a command/source/exit receipt under {directory}/checks; "
+        "final review must match claimed checks to these receipts and retained logs. "
         "Never bind the whole task tmp directory over /tmp or invent another execution "
         "wrapper. Preserve stdout/stderr and terminal receipts outside tmp. "
         "Preflight failure is an environment diagnostic: keep the candidate and "
@@ -83,6 +88,82 @@ def inner(runtime, command):
     return 0
 
 
+def source_state():
+    """Fingerprint the actual checkout, including newly added regression tests."""
+    try:
+
+        def git(*args):
+            return subprocess.check_output(
+                ["git", *args], stderr=subprocess.DEVNULL, timeout=15
+            )
+
+        delta = git("diff", "HEAD", "--binary")
+        remaining = 8 * 1024 * 1024 - len(delta)
+        if remaining < 0:
+            raise OSError(
+                "source fingerprint exceeds 8 MiB; retain a scoped evidence ledger"
+            )
+        fingerprint = hashlib.sha256(delta)
+        root = Path(os.fsdecode(git("rev-parse", "--show-toplevel")).strip())
+        for name in git("ls-files", "--others", "--exclude-standard", "-z").split(
+            b"\0"
+        ):
+            if not name:
+                continue
+            path = root / os.fsdecode(name)
+            fingerprint.update(name + b"\0")
+            if path.is_symlink():
+                fingerprint.update(os.fsencode(os.readlink(path)))
+            else:
+                if path.stat().st_size > remaining:
+                    raise OSError(
+                        "untracked source exceeds fingerprint budget; retain a scoped evidence ledger"
+                    )
+                with path.open("rb") as stream:
+                    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                        remaining -= len(chunk)
+                        if remaining < 0:
+                            raise OSError(
+                                "untracked source grew beyond fingerprint budget"
+                            )
+                        fingerprint.update(chunk)
+        return {
+            "head": git("rev-parse", "HEAD").decode().strip(),
+            "delta_sha256": fingerprint.hexdigest(),
+        }
+    except (OSError, subprocess.SubprocessError) as error:
+        return {"unavailable": str(error)}
+
+
+def execute(args, command):
+    if args.inner:
+        return inner(args.runtime, command)
+    if not (args.isolated or args.preflight):
+        return run(command, args.timeout)
+    missing = [name for name in ("unshare", "mount", "ip") if not shutil.which(name)]
+    if missing:
+        raise RuntimeError("isolation tools unavailable: " + ", ".join(missing))
+    args.runtime.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # Each binary owns a separate leaf; compilation caches remain outside it.
+    with tempfile.TemporaryDirectory(prefix="run-", dir=args.runtime) as runtime:
+        invocation = [
+            "unshare",
+            "--user",
+            "--map-root-user",
+            "--mount",
+            "--net",
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "--runtime",
+            runtime,
+            "--inner",
+        ]
+        invocation += ["--preflight"] if args.preflight else ["--", *command]
+        return run(
+            invocation, min(args.timeout, 15) if args.preflight else args.timeout
+        )
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--runtime", required=True, type=Path)
@@ -104,41 +185,35 @@ def main():
         raise KeyboardInterrupt
 
     signal.signal(signal.SIGTERM, interrupted)
+    receipt = {
+        "command": command,
+        "cwd": str(Path.cwd()),
+        "kind": "preflight" if args.preflight else "check",
+        "started_at": time.time(),
+        "timeout": args.timeout,
+    }
     try:
-        if args.inner:
-            return inner(args.runtime, command)
-        if not (args.isolated or args.preflight):
-            return run(command, args.timeout)
-        missing = [
-            name for name in ("unshare", "mount", "ip") if not shutil.which(name)
-        ]
-        if missing:
-            raise RuntimeError("isolation tools unavailable: " + ", ".join(missing))
-        args.runtime.mkdir(parents=True, exist_ok=True, mode=0o700)
-        # Each binary owns a separate leaf. Compilation caches and sandbox
-        # mounts in the parent tmp are never rebound into the private namespace.
-        with tempfile.TemporaryDirectory(prefix="run-", dir=args.runtime) as runtime:
-            invocation = [
-                "unshare",
-                "--user",
-                "--map-root-user",
-                "--mount",
-                "--net",
-                sys.executable,
-                str(Path(__file__).resolve()),
-                "--runtime",
-                runtime,
-                "--inner",
-            ]
-            invocation += ["--preflight"] if args.preflight else ["--", *command]
-            return run(
-                invocation, min(args.timeout, 15) if args.preflight else args.timeout
-            )
+        if not (args.inner or args.isolated):
+            receipt["source"] = source_state()
+        code = execute(args, command)
     except KeyboardInterrupt:
-        return 130
+        code = 130
     except (OSError, RuntimeError, subprocess.SubprocessError) as error:
         print(f"check environment/setup error: {error}", file=sys.stderr)
-        return 125
+        code = 125
+        receipt["setup_error"] = str(error)
+    if not (args.inner or args.isolated):
+        receipt.update(exit_code=code, finished_at=time.time())
+        directory = args.runtime.parent.parent / "checks"
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            path = directory / (str(time.time_ns()) + "-" + str(os.getpid()))
+            path.with_suffix(".tmp").write_text(json.dumps(receipt, indent=2))
+            path.with_suffix(".tmp").rename(path.with_suffix(".json"))
+        except OSError as error:
+            print(f"validation receipt unavailable: {error}", file=sys.stderr)
+            return 125
+    return code
 
 
 if __name__ == "__main__":
