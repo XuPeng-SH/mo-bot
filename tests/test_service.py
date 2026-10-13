@@ -448,6 +448,25 @@ class TestWorkflow(unittest.TestCase):
                 self.assertEqual(saved["state"], "done")
                 self.assertEqual(saved["review_event"], event)
 
+    def test_saved_own_pr_review_publishes_when_mergeability_drops(self):
+        job = self.job()
+        self.gh.pr.return_value["user"] = {"login": "me"}
+        self.service.save_result(job, self.store.slots()[0], assessment(job))
+        self.service.eligible.discard(job["id"])
+        self.service.admission["1"] = {
+            "head": job["head"],
+            "state": "excluded",
+            "reason": "self-authored",
+        }
+
+        self.service.publish(self.store.job(job["id"]))
+
+        self.gh.submit_review.assert_called_once()
+        self.assertEqual(self.gh.submit_review.call_args.args[1], "COMMENT")
+        saved = self.store.job(job["id"])
+        self.assertEqual(saved["state"], "done")
+        self.assertEqual(saved["review_event"], "COMMENT")
+
     def test_uncertain_review_post_is_not_repeated_when_marker_absent(self):
         job = self.job()
         self.service.save_result(job, self.store.slots()[0], assessment(job))

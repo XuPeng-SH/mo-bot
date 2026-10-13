@@ -727,7 +727,19 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
             )
             return
         if job["id"] not in self.eligible and not job["review_attempted"]:
-            return  # Keep the completed result; CI refresh must not start another model turn.
+            admission = self.admission.get(str(job["pr"]), {})
+            author = (pr.get("user") or {}).get("login", "").casefold()
+            own_authors = {
+                self.config.reviewer.casefold(),
+                self.github.author.casefold(),
+            }
+            own_pr_still_unreviewed = (
+                author in own_authors
+                and admission.get("head") == job["head"]
+                and admission.get("reason") == "self-authored"
+            )
+            if not own_pr_still_unreviewed:
+                return  # Preserve ineligible results without starting another model turn.
         envelope = json.loads(job["result"])
         text = report_text(envelope)
         event = (
