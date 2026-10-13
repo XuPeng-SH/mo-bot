@@ -1229,6 +1229,15 @@ class TestWorker(unittest.TestCase):
         finally:
             restarted.db.close()
         with patch("time.time", return_value=job["retry_at"] + 1):
+            self.s.eligible.add(job["id"])
+            self.s.refresh_status()
+            status = next(j for j in self.s.status["jobs"] if j["id"] == job["id"])
+            self.assertTrue(status["dispatchable"])
+            self.assertIn("readiness recheck queued", status["wait_reason"])
+            alert = next(
+                a for a in self.s.status["alerts"] if a.get("job_id") == job["id"]
+            )
+            self.assertEqual(alert["kind"], "job_waiting")
             resumed = self.s.store.claim(2)
             self.assertEqual(resumed["id"], job["id"])
             self.w.launch(self.slot, resumed)
@@ -1240,6 +1249,25 @@ class TestWorker(unittest.TestCase):
         self.assertIn(data["recovery_wait"]["guidance"], prompt)
         self.assertIn("scheduler owns the wait timer", prompt)
         self.assertIn("Do not sleep or repeat passing checks", prompt)
+        self.assertFalse(self.gh.writes)
+
+    def test_dependency_wait_uses_existing_progress_backoff_and_caps_at_one_hour(self):
+        job, _ = self.waiting_checkpoint()
+        data = json.loads(job["data"])
+        request = data["harness_request"]
+        for stalls, seconds in ((1, 600), (2, 1200), (20, 3600)):
+            with self.subTest(stalls=stalls):
+                data["correction_stalls"] = stalls
+                self.s.store.update(job["id"], data=json.dumps(data), retry_at=0)
+                with patch("time.time", return_value=10000):
+                    self.s.harness.wait(
+                        self.s.store.job(job["id"]),
+                        request,
+                        "Fixture still unavailable",
+                    )
+                self.assertEqual(
+                    self.s.store.job(job["id"])["retry_at"], 10000 + seconds
+                )
         self.assertFalse(self.gh.writes)
 
     def test_operator_guidance_wakes_dependency_wait_without_waiting_for_timer(self):
@@ -1649,6 +1677,15 @@ class TestWorker(unittest.TestCase):
         self.assertIsNotNone(job)
         self.s.eligible.add(review["id"])
         self.s.publish(self.s.store.job(review["id"]))
+        waiting = self.s.store.job(review["id"])
+        self.assertIsNone(waiting["error"])
+        self.assertEqual(waiting["retry_at"], 0)
+        self.s.refresh_status()
+        status = next(j for j in self.s.status["jobs"] if j["id"] == review["id"])
+        self.assertEqual(
+            status["wait_reason"], "review publication waiting for active task"
+        )
+        self.assertFalse(status["attention_required"])
         self.assertFalse(self.s.store.job(review["id"])["review_attempted"])
         self.assertFalse(self.gh.writes)
         self.s.store.update(job["id"], state="queued", slot_id=None)

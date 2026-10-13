@@ -157,6 +157,14 @@ remain. A GitHub outage must not consume another model review.
 Missing final validation continues in final_review with the accepted design retained. Only source/design findings or an explicit replan reopen earlier phases. Retry pacing uses source, frozen input and successful execution receipts rather than the wording of limitations; repeating the same check does not reset a stalled task.
 Review publication awaiting CI/admission exposes its policy in `wait_reason` and
 uses a retry deadline; it retains the saved assessment without another review.
+Waiting for an active task on the same PR uses the existing PR fence: it clears
+obsolete pre-write transport errors once, does not rewrite a minute retry timer,
+and proceeds when the fence clears. Uncertain attempted writes retain their
+reconciliation fence and errors. External dependency waits appear as
+`job_waiting` alerts; after the deadline, `wait_reason` identifies a queued
+readiness recheck even while model capacity is occupied. Unchanged progress
+uses the existing exponential wait (five minutes up to one hour), without a
+second retry state machine. New evidence and operator guidance can wake it early.
 External-wait reentry checks actual readiness once, then returns a checkpoint if
 still blocked. The scheduler owns the waiting interval; model turns should not
 sleep or repeat previously passing checks to simulate progress.

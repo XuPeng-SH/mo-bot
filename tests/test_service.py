@@ -515,6 +515,29 @@ class TestWorkflow(unittest.TestCase):
         self.assertEqual(self.store.job(job["id"])["state"], "done")
         self.assertEqual(self.store.job(job["id"])["result"], saved_result)
 
+    def test_active_task_wait_clears_old_error_once_and_publishes_on_release(self):
+        job = self.job()
+        self.service.save_result(job, self.store.slots()[0], assessment(job))
+        self.service.eligible.add(job["id"])
+        saved_result = self.store.job(job["id"])["result"]
+        self.store.update(job["id"], error="old transport error", retry_at=time.time())
+        with patch.object(self.store, "pr_busy", return_value={"id": "repair"}):
+            self.service.publish(self.store.job(job["id"]))
+            waiting = self.store.job(job["id"])
+            self.assertIsNone(waiting["error"])
+            self.assertEqual(waiting["retry_at"], 0)
+            with patch.object(self.store, "update", wraps=self.store.update) as update:
+                for _ in range(3):
+                    self.service.publish(waiting)
+                update.assert_not_called()
+        self.gh.pr.assert_not_called()
+        self.gh.submit_review.assert_not_called()
+        self.service.publish(self.store.job(job["id"]))
+        self.gh.submit_review.assert_called_once()
+        completed = self.store.job(job["id"])
+        self.assertEqual(completed["state"], "done")
+        self.assertEqual(completed["result"], saved_result)
+
     def test_uncertain_review_post_is_not_repeated_when_marker_absent(self):
         job = self.job()
         self.service.save_result(job, self.store.slots()[0], assessment(job))

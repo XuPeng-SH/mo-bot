@@ -710,7 +710,10 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
         if job["kind"] == "work":
             return self.worker.publish(job)
         if not job["review_attempted"] and self.store.pr_busy(job):
-            self.store.update(job["id"], retry_at=time.time() + 60)
+            # The existing PR fence is the wakeup condition. Keep this wait
+            # idempotent and publish promptly when the fence is released.
+            if job["error"] or job["retry_at"]:
+                self.store.update(job["id"], error=None, retry_at=0)
             return
         pr = self.github.pr(job)
         if owner_wip(pr, self.config.reviewer):
@@ -946,6 +949,15 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
                         else "awaiting successful discovery"
                     )
                 )
+            if (
+                job["state"] == "queued"
+                and job["dispatchable"]
+                and job["data"].get("recovery_wait")
+            ):
+                job["wait_reason"] = (
+                    "external prerequisite readiness recheck queued: "
+                    + job["data"]["recovery_wait"]["guidance"]
+                )
             job["attention_required"] = bool(
                 job["data"].get("paused")
                 or (
@@ -965,7 +977,11 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
             job["manual_required"] = bool(job["data"].get("manual_reconciliation"))
         alerts = [
             {
-                "kind": "job_blocked",
+                "kind": "job_waiting"
+                if j["state"] == "queued"
+                and j["data"].get("recovery_wait")
+                and not j["data"].get("paused")
+                else "job_blocked",
                 "job_id": j["id"],
                 "pr": j["pr"],
                 "state": j["state"],
