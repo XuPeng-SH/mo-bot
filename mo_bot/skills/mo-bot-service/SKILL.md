@@ -43,6 +43,14 @@ The service submits `REQUEST_CHANGES` for confirmed findings, `APPROVE` for a su
 
 ## Review status and history
 
+Each new turn receives shared `check-run` and `test-exec` launchers in its
+diagnostic directory. Isolation preflight checks private `/tmp` identity and
+writes plus loopback before test compilation. Tests bind only a dedicated
+runtime leaf; task caches remain shared across phases. Timeout/cancellation
+reaps the invocation's process group, and scratch follows existing task GC.
+Setup failures retain source/evidence and are distinct from product-test
+failures. Use the normal task continuation controls after environment recovery.
+
 `status.scratch_cleanup` reports automatic task scratch reclamation and errors.
 Terminal task `tmp` and shared Go `cache` are detached only after live-turn and
 process/bind-mount checks, then removed in the background. Failures retry every

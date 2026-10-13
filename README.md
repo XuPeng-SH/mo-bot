@@ -2,6 +2,14 @@
 
 A PR review and repair server with a SQLite queue, reusable Codex sessions and a REST API. `mo-bot` installs/configures/runs the server; `mo-botctl` operates it.
 
+Each task turn includes shared validation launchers. `check-run --preflight`
+checks Linux user/mount/network isolation before compiling tests;
+`go test -exec=/absolute/turn/test-exec` runs each binary with a dedicated private
+`/tmp` and loopback. `check-run --timeout SECONDS -- COMMAND` bounds foreground
+checks and reaps their owned process group on cancellation/timeout. Build caches
+stay with the task; logs and validation evidence stay outside disposable scratch.
+Unavailable isolation is reported as setup failure and never as a test pass.
+
 ## Install and start
 
 Requires Linux, Python 3.11+, Git, authenticated GitHub CLI (`gh`) and Codex CLI with app-server support. No runtime Python dependencies or external skills are required. Authenticate with `gh auth login` and `codex login`, and clone the repository whose PRs the bot will handle.

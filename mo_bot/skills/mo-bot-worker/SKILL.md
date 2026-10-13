@@ -43,6 +43,16 @@ Review requests to reduce line count require a concrete scope and maintenance-co
 
 Apply the shared implementation and QA workflow with repository build provenance and disk-backed diagnostics. Do not trust stale native artifacts. Retain evidence in the assigned diagnostic directory; reuse matching evidence and rerun only invalidated checks.
 
+The coordinator provides `check-run` and `test-exec` in each turn's diagnostic
+directory. For tests requiring isolated `/tmp` or network, first run
+`check-run --preflight`, then use `go test -exec=/absolute/diagnostic/test-exec`.
+Use `check-run --timeout SECONDS -- COMMAND` for bounded foreground checks.
+Reuse these executors; do not generate mount/timeout wrappers. Each binary gets
+a private runtime child and loopback, while compilation keeps the assigned Go
+caches. A preflight failure produces no test verdict: diagnose it, continue
+independent source review and retain matching source/build evidence. Resume
+missing checks after recovery rather than restarting design or repeating passes.
+
 Harness suggestions are coordination advice within the frozen task, not validation or publication authority. Reuse preserved source and execute concrete missing checks. If implementation disproves the accepted plan, preserve edits and explain the invalid assumption in a blocked checkpoint so the coordinator can route to a new native design gate. When asked for progress, give completed evidence, active tools and remaining work, then continue. A missing operator input must not be guessed; continue independent work and retain the dependency explicitly. Never interpret silence alone as a reason to kill processes or alter unrelated environments.
 
 ## Final gate and delivery data
