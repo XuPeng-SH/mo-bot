@@ -600,6 +600,7 @@ class TestWorker(unittest.TestCase):
             "confidence": 95,
             "rationale": "Missing validation needs execution",
             "guidance": "Run the missing SQL controls",
+            "prerequisite_pr": 0,
             **changes,
         }
 
@@ -749,6 +750,9 @@ class TestWorker(unittest.TestCase):
             {"confidence": True},
             {"guidance": "x" * 4001},
             {"action": "pause"},
+            {"prerequisite_pr": True},
+            {"action": "wait", "prerequisite_pr": -1},
+            {"prerequisite_pr": 2},
         ):
             request = self.s.harness.request(job["id"], "blocked", "Missing checks")
             self.w.dispatch_classifier(semantic)
@@ -1251,6 +1255,128 @@ class TestWorker(unittest.TestCase):
         self.assertIn("Do not sleep or repeat passing checks", prompt)
         self.assertFalse(self.gh.writes)
 
+    def test_issue_harness_receives_authorized_owned_delivery_scope(self):
+        semantic = self.harness_slot()
+        self.phase(self.job(issue=True))
+        job = self.phase(
+            self.s.store.claim(2),
+            classification="blocked",
+            accepted=False,
+            validation_complete=False,
+            limitations=["Existing open fix PR needs evaluation"],
+        )
+        self.w.dispatch_classifier(semantic)
+        directory = self.s.backend.start.call_args.args[1]
+        payload = json.loads((directory / "request.json").read_text())
+        self.assertEqual(payload["assignment"]["target_type"], "issue")
+        self.assertEqual(
+            payload["assignment"]["delivery_identity"],
+            json.loads(job["metadata"])["identity"],
+        )
+        prompt = self.s.backend.start.call_args.args[3]
+        self.assertIn("not automatically a merge prerequisite", prompt)
+        self.assertIn("issue task already authorizes fixing", prompt)
+        self.assertFalse(self.gh.writes)
+
+    def test_pr_dependency_read_does_not_start_model_or_restore_source(self):
+        job, _ = self.waiting_checkpoint(prerequisite_pr=2)
+        self.gh.prs[2]["merged"] = False
+        self.s.backend.start.reset_mock()
+        self.ws.restore_worker.reset_mock()
+        with patch("time.time", return_value=job["retry_at"] + 1):
+            self.w.launch(self.slot, self.s.store.claim(2))
+        fresh = self.s.store.job(job["id"])
+        self.assertEqual(
+            (fresh["state"], fresh["slot_id"], fresh["attempts"]),
+            ("queued", None, job["attempts"]),
+        )
+        data = json.loads(fresh["data"])
+        self.assertEqual(data["recovery_wait"]["observed_pr"]["head"], HEAD)
+        self.assertIn("workspace_archive", data)
+        self.assertGreater(fresh["retry_at"], job["retry_at"])
+        db_path = self.s.store.db.execute("PRAGMA database_list").fetchone()[2]
+        restarted = Store(
+            Path(db_path), "test", self.s.config.sessions, worker_sessions=2
+        )
+        try:
+            self.assertEqual(
+                json.loads(restarted.job(job["id"])["data"])["recovery_wait"],
+                data["recovery_wait"],
+            )
+            self.assertIsNone(restarted.claim(2))
+        finally:
+            restarted.db.close()
+        self.s.backend.start.assert_not_called()
+        self.ws.restore_worker.assert_not_called()
+        self.assertFalse(self.gh.writes)
+
+    def test_pr_dependency_change_wakes_same_task_without_repinning_source(self):
+        job, _ = self.waiting_checkpoint(prerequisite_pr=2)
+        self.gh.prs[2]["merged"] = False
+        with patch("time.time", return_value=job["retry_at"] + 1):
+            self.w.launch(self.slot, self.s.store.claim(2))
+        waiting = self.s.store.job(job["id"])
+        self.gh.prs[2]["head"]["sha"] = NEW
+        self.s.backend.start.reset_mock()
+        with patch("time.time", return_value=waiting["retry_at"] + 1):
+            self.w.launch(self.slot, self.s.store.claim(2))
+        fresh = self.s.store.job(job["id"])
+        self.assertEqual(
+            (fresh["head"], fresh["attempts"]), (HEAD, job["attempts"] + 1)
+        )
+        self.assertNotIn("recovery_wait", json.loads(fresh["data"]))
+        self.assertIn(
+            "Prerequisite PR #2 changed", self.s.backend.start.call_args.args[3]
+        )
+        self.assertNotIn("correction_stalls", json.loads(fresh["data"]))
+        self.ws.restore_worker.assert_called_once()
+        self.assertFalse(self.gh.writes)
+
+    def assert_ready_dependency(self, merged):
+        job, _ = self.waiting_checkpoint(prerequisite_pr=2)
+        self.gh.prs[2].update(state="closed", merged=merged)
+        self.s.backend.start.reset_mock()
+        with patch("time.time", return_value=job["retry_at"] + 1):
+            self.w.launch(self.slot, self.s.store.claim(2))
+        fresh = self.s.store.job(job["id"])
+        self.assertEqual(fresh["phase"], job["phase"])
+        self.assertEqual(fresh["state"], "reviewing")
+        self.assertNotIn("recovery_wait", json.loads(fresh["data"]))
+        self.s.backend.start.assert_called_once()
+        self.assertFalse(self.gh.writes)
+
+    def test_merged_dependency_wakes_for_reassessment_not_acceptance(self):
+        self.assert_ready_dependency(True)
+
+    def test_closed_dependency_wakes_for_reassessment_not_acceptance(self):
+        self.assert_ready_dependency(False)
+
+    def test_failed_dependency_read_preserves_wait_and_does_not_claim_readiness(self):
+        job, _ = self.waiting_checkpoint(prerequisite_pr=2)
+        original_api = self.gh.api
+        self.s.backend.start.reset_mock()
+        for response in (
+            RuntimeError("TLS read timeout"),
+            {"number": 2, "state": "closed"},
+        ):
+
+            def api(endpoint, *args, **kwargs):
+                if endpoint.endswith("/pulls/2"):
+                    if isinstance(response, Exception):
+                        raise response
+                    return response
+                return original_api(endpoint, *args, **kwargs)
+
+            with patch.object(self.gh, "api", side_effect=api):
+                with patch("time.time", return_value=job["retry_at"] + 1):
+                    self.w.launch(self.slot, self.s.store.claim(2))
+            job = self.s.store.job(job["id"])
+            self.assertEqual((job["state"], job["slot_id"]), ("queued", None))
+            self.assertIn("readiness check unavailable", job["error"])
+            self.assertIn("recovery_wait", json.loads(job["data"]))
+        self.s.backend.start.assert_not_called()
+        self.assertFalse(self.gh.writes)
+
     def test_dependency_wait_uses_existing_progress_backoff_and_caps_at_one_hour(self):
         job, _ = self.waiting_checkpoint()
         data = json.loads(job["data"])
@@ -1271,7 +1397,7 @@ class TestWorker(unittest.TestCase):
         self.assertFalse(self.gh.writes)
 
     def test_operator_guidance_wakes_dependency_wait_without_waiting_for_timer(self):
-        job, semantic = self.waiting_checkpoint()
+        job, semantic = self.waiting_checkpoint(prerequisite_pr=2)
         request = self.s.harness.request(
             job["id"], "operator", "The fixture is available; resume validation"
         )

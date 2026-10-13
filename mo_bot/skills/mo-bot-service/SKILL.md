@@ -68,7 +68,9 @@ minute and after restart, including while dispatch is drained. Source, task
 logs/results/evidence, SQLite and reusable session history are retained. Keep
 needed validation logs outside scratch; failed-task reentry rebuilds caches.
 
-For “在 review 什么 / 进展 / 之前 review 了哪些 / 结果”, use `mo-botctl status` and `mo-botctl jobs` first. These return compact summaries; use `mo-botctl job JOB_ID` for full immutable evidence, data and assessment. Map each session's `job_id` to job `pr/head/state`; report selected versus active model. `updated_at` is snapshot freshness, not proof that tools are advancing.
+For “在 review 什么 / 进展 / 之前 review 了哪些 / 结果”, use `mo-botctl status` and `mo-botctl jobs` first. These return compact summaries; use `mo-botctl job JOB_ID` for full immutable evidence, data and assessment. Map each session's `job_id` to job `target_type/target_number/kind/phase/head/state`;
+`state=reviewing` means an executing task, including issue work; only
+`kind=review` is a PR review. report selected versus active model. `updated_at` is snapshot freshness, not proof that tools are advancing.
 
 To ask a RUNNING session directly, use `mo-botctl progress SLOT`. This steers the current turn to report evidence, work remaining and blockers as commentary, then continue review. It does not cancel the turn or create an idle conversation; a stale turn ID is rejected. Read the actual reply via history/events: the steer acknowledgement alone is not a progress report.
 
@@ -165,6 +167,13 @@ reconciliation fence and errors. External dependency waits appear as
 readiness recheck even while model capacity is occupied. Unchanged progress
 uses the existing exponential wait (five minutes up to one hour), without a
 second retry state machine. New evidence and operator guidance can wake it early.
+A structured merge dependency names a PR in the assigned repository. The
+scheduler reads its state/head at the existing wait deadline. Unchanged or failed
+reads preserve the checkpoint, release capacity and back off without a worker
+model turn. A changed head, merge or closure wakes the same task for reassessment;
+none is approval or permission to rewrite source identity. Other prerequisites
+still require the worker's bounded readiness check. Existing open fixes must be
+evaluated as alternative solutions, not assumed to revoke issue authorization.
 External-wait reentry checks actual readiness once, then returns a checkpoint if
 still blocked. The scheduler owns the waiting interval; model turns should not
 sleep or repeat previously passing checks to simulate progress.

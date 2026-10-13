@@ -1325,10 +1325,73 @@ class Worker:
             )
         return selected
 
+    def recheck_prerequisite(self, job):
+        """Keep unchanged PR dependencies off the model pool; reuse the wait deadline."""
+        data = json.loads(job["data"])
+        wait = data.get("recovery_wait") or {}
+        number = wait.get("prerequisite_pr", 0)
+        if not number or data.get("pending_input"):
+            return False
+        try:
+            if type(number) is not int or number < 1:
+                raise ValueError("invalid prerequisite PR number")
+            pr = self.gh.api(f"repos/{job['repo']}/pulls/{number}")
+            observed = {
+                "state": pr["state"],
+                "merged": pr["merged"],
+                "head": pr["head"]["sha"],
+            }
+            if (
+                pr.get("number") != number
+                or observed["state"] not in ("open", "closed")
+                or type(observed["merged"]) is not bool
+                or not isinstance(observed["head"], str)
+                or len(observed["head"]) != 40
+                or any(c not in "0123456789abcdef" for c in observed["head"])
+            ):
+                raise ValueError("invalid prerequisite PR response")
+            previous = wait.get("observed_pr")
+            if (
+                observed["merged"]
+                or observed["state"] == "closed"
+                or (previous is not None and previous != observed)
+            ):
+                data.pop("recovery_wait")
+                data.pop("correction_stalls", None)
+                data["coordinator_feedback"] = (
+                    f"Prerequisite PR #{number} changed: "
+                    + json.dumps(observed)
+                    + ". Reevaluate the preserved plan and exact coverage; this is "
+                    "not validation or authority to repin source or modify its branch."
+                )
+                self.store.update(job["id"], data=json.dumps(data), error=None)
+                return False
+            wait["observed_pr"] = observed
+            error = "Waiting for external prerequisite: " + wait["guidance"]
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
+            # A failed read is neither readiness nor PR closure; retain the checkpoint.
+            error = f"Prerequisite PR #{number} readiness check unavailable: {exc}"[
+                :4000
+            ]
+        data["correction_stalls"] = data.get("correction_stalls", 0) + 1
+        self.store.update(
+            job["id"],
+            state="queued",
+            slot_id=None,
+            data=json.dumps(data),
+            error=error,
+            retry_at=time.time()
+            + min(3600, 300 * 2 ** min(data["correction_stalls"], 4)),
+        )
+        return True
+
     def launch(self, slot, job):
         self.check_input(
             job, refresh_evidence=job["phase"] in ("design", "final_review")
         )
+        job = self.store.job(job["id"])
+        if self.recheck_prerequisite(job):
+            return
         job = self.store.job(job["id"])
         data = json.loads(job["data"])
         recovery_wait = data.pop("recovery_wait", None)
