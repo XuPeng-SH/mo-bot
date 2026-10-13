@@ -107,13 +107,12 @@ Independent environment/flaky failures do not create GitHub issues by default (`
 
 ## Delivery pool
 
-Operate the shared worker queue using `mo-botctl repair PR` (configured owner's
-PR only) and `mo-botctl issue NUMBER` (explicit issue assignment). The service
+Operate the shared worker queue using `mo-botctl repair PR [--hint TEXT]` (explicit open, non-draft PR assignment) and `mo-botctl issue NUMBER` (explicit issue assignment). The service
 also admits configured-owner issues assigned to them with `bot-ready`; one
 optional local classifier uses pinned `gpt-6-luna/xhigh` and groups only clear
 same-root-cause matches into a compatible, early task (maximum three issues).
 Uncertain matches and classifier/model failures remain separate issue jobs.
-Inspect role, phase, error and native session in jobs/sessions.
+Automatic PR discovery stays limited to the configured owner. Explicit assignments freeze operator authority and initial guidance in SQLite; workers execute that scope without requiring PR authorship. For another author's PR, the scheduler retains the original source identity and uses the operator's owned upstream fork for delivery, opening a marked repair PR against the original author's source branch. The original upstream PR number remains the task target. Saved reviews awaiting admission do not block repair execution; active review turns and uncertain review writes retain their fences. Inspect role, phase, error and native session in jobs/sessions.
 `[worker] sessions` controls delivery capacity; its default model is
 gpt-6.1-sol/low. Worker assignments live in repo-owned mo-bot-worker; the bundled
 issue-to-pr workflow owns shared requirements and mandatory xhigh design/final

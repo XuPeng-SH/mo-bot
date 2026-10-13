@@ -54,6 +54,7 @@ class FakeGitHub:
     def __init__(self):
         self.author = "me"
         self.actor = ACTOR
+        self.repositories = {UPSTREAM["full_name"]: UPSTREAM, FORK["full_name"]: FORK}
         self.prs = {1: pr(), 2: pr(2)}
         self.issue = {
             "id": 100,
@@ -109,7 +110,12 @@ class FakeGitHub:
                             "ref": body["head"].split(":", 1)[1],
                             "sha": NEW,
                         },
-                        "base": {"repo": UPSTREAM, "ref": "main"},
+                        "base": {
+                            "repo": self.repositories[
+                                endpoint[len("repos/") : -len("/pulls")]
+                            ],
+                            "ref": body["base"],
+                        },
                     }
                 )
                 if self.ambiguous:
@@ -142,10 +148,8 @@ class FakeGitHub:
                 for i in self.issues
                 if i["number"] == int(endpoint.rsplit("/", 1)[-1])
             )
-        if endpoint == "repos/matrixorigin/repo":
-            return UPSTREAM
-        if endpoint == "repos/me/repo":
-            return FORK
+        if endpoint.removeprefix("repos/") in self.repositories:
+            return self.repositories[endpoint.removeprefix("repos/")]
         if "/branches/" in endpoint:
             return {"commit": {"sha": getattr(self, "branch_sha", BASE)}}
         if "/pulls/" in endpoint:
@@ -1497,7 +1501,10 @@ class TestWorker(unittest.TestCase):
         )
 
     def test_authorship_draft_default_and_head_repository_scope(self):
-        for change in ({"user": {"id": 9}}, {"draft": True}, {"state": "closed"}):
+        self.gh.prs[1] = {**pr(), "user": {"id": 9}}
+        with self.assertRaises(ValueError):
+            self.w.pr_candidate(1)
+        for change in ({"draft": True}, {"state": "closed"}):
             self.gh.prs[1] = {**pr(), **change}
             with self.assertRaises(ValueError):
                 self.w.pr_candidate(1, explicit=True)
@@ -1509,6 +1516,162 @@ class TestWorker(unittest.TestCase):
         self.gh.prs[1]["head"]["repo"]["owner"] = {"id": 9}
         with self.assertRaisesRegex(ValueError, "owned fork"):
             self.w.pr_candidate(1, explicit=True)
+
+    def external_pr(self):
+        source = pr()
+        source["user"] = {"id": 9, "login": "contributor"}
+        source["head"]["repo"].update(
+            id=3,
+            full_name="contributor/repo",
+            owner=source["user"],
+            permissions={"pull": True, "push": False},
+        )
+        self.gh.repositories["contributor/repo"] = source["head"]["repo"]
+        self.gh.prs[1] = source
+        return source
+
+    def test_explicit_external_repair_uses_existing_phases_and_owned_fork_delivery(
+        self,
+    ):
+        source = self.external_pr()
+        hint = (
+            "Understand all comments and CI failures; rebase and repair systemically."
+        )
+        command = {"target_type": "pr", "number": 1, "hint": hint}
+        queued = self.s.command("work", command)
+        duplicate = self.s.command("work", command)
+        self.assertTrue(queued["enqueued"])
+        self.assertFalse(duplicate["enqueued"])
+        self.assertEqual(queued["job"]["id"], duplicate["job"]["id"])
+        metadata = json.loads(queued["job"]["metadata"])
+        self.assertEqual(metadata["identity"]["head_repo"], "contributor/repo")
+        self.assertEqual(metadata["delivery"]["head_repo"], "me/repo")
+        self.assertEqual(json.loads(queued["job"]["data"])["operator_hint"], hint)
+        job = self.s.store.claim(2)
+        for _ in range(4):
+            job = self.phase(job)
+            prompt = self.s.backend.start.call_args.args[3]
+            self.assertIn(hint, prompt)
+            self.assertIn("Source-read admission is already resolved", prompt)
+            if job["phase"] == "final_review":
+                self.ws.worker_state.return_value = {
+                    **self.ws.worker_state.return_value,
+                    "head": NEW,
+                }
+            if job["state"] != "publishing":
+                job = self.s.store.claim(2)
+        # Publication updates our private feature branch, never the source fork.
+        remote = self.remote(job)
+        remote["head"] = ""
+        self.w.publish(job)
+        completed = self.s.store.job(job["id"])
+        self.assertEqual((completed["state"], completed["pr"]), ("done", 1))
+        self.assertEqual(source["head"]["sha"], HEAD)
+        self.assertEqual(len(remote["pushes"]), 1)
+        self.assertIn("https://github.com/me/repo.git", remote["pushes"][0])
+        self.assertIn(
+            "--force-with-lease=refs/heads/" + metadata["delivery"]["head_ref"] + ":",
+            remote["pushes"][0],
+        )
+        self.assertEqual(len(self.gh.created_prs), 1)
+        created = self.gh.created_prs[0]
+        self.assertEqual(created["base"]["repo"]["id"], 3)
+        self.assertEqual(created["base"]["ref"], "fix/foo")
+        self.assertIn("matrixorigin/repo/pull/1", created["body"])
+        self.assertNotIn("Closes #1", created["body"])
+        self.w.publish(completed)
+        self.assertEqual(len(self.gh.created_prs), 1)
+
+    def test_external_task_survives_restart_and_source_drift_stops_publication(self):
+        self.external_pr()
+        queued = self.s.command("work", {"number": 1, "hint": "repair this PR"})
+        config = self.s.config
+        self.s.close()
+        self.s = Service(config, github=self.gh, workspace=self.ws)
+        self.w = self.s.worker
+        job = self.s.store.job(queued["job"]["id"])
+        self.w.check_input(job)
+        self.assertEqual(json.loads(job["data"])["operator_hint"], "repair this PR")
+        self.gh.prs[1]["head"]["sha"] = NEW
+        remote = self.remote(job)
+        remote["head"] = ""
+        with self.assertRaisesRegex(SourceChanged, "input head changed"):
+            self.w.push(job, self.push_data(job))
+        self.assertFalse(remote["pushes"])
+
+    def test_external_source_default_is_readable_but_owned_destination_default_is_never_pushed(
+        self,
+    ):
+        source = self.external_pr()
+        source["head"]["ref"] = "main"
+        job = self.job()
+        delivery = json.loads(job["metadata"])["delivery"]
+        self.gh.repositories["me/repo"] = {
+            **FORK,
+            "default_branch": delivery["head_ref"],
+        }
+        remote = self.remote(job)
+        remote["head"] = ""
+        with self.assertRaisesRegex(ValueError, "default branch"):
+            self.w.push(job, self.push_data(job))
+        self.assertFalse(remote["pushes"])
+
+    def test_external_created_pr_timeout_reconciles_original_target_without_duplicate(
+        self,
+    ):
+        self.external_pr()
+        job = self.job()
+        data = self.push_data(job)
+        self.gh.ambiguous = True
+        with self.assertRaises(RuntimeError):
+            self.w.create_pr(job, data)
+        self.gh.ambiguous = False
+        saved = self.w.create_pr(job, data)
+        self.assertEqual(saved["number"], 20)
+        self.assertEqual(self.s.store.job(job["id"])["pr"], 1)
+        self.assertEqual(len(self.gh.writes), 1)
+        self.gh.created_prs[0]["base"]["repo"] = UPSTREAM
+        with self.assertRaisesRegex(SourceChanged, "created PR identity changed"):
+            self.w.create_pr(job, data)
+        self.assertEqual(len(self.gh.writes), 1)
+
+    def test_saved_unattempted_review_does_not_block_repair_but_active_or_uncertain_review_does(
+        self,
+    ):
+        self.external_pr()
+        self.s.store.enqueue(
+            {"repo": "matrixorigin/repo", "number": 1, "headRefOid": HEAD}
+        )
+        review = next(j for j in self.s.store.jobs() if j["kind"] == "review")
+        self.s.store.update(review["id"], state="publishing")
+        self.w.enqueue("pr", 1)
+        job = self.s.store.claim(2)
+        self.assertIsNotNone(job)
+        self.s.eligible.add(review["id"])
+        self.s.publish(self.s.store.job(review["id"]))
+        self.assertFalse(self.s.store.job(review["id"])["review_attempted"])
+        self.assertFalse(self.gh.writes)
+        self.s.store.update(job["id"], state="queued", slot_id=None)
+        for state, attempted in (("reviewing", 0), ("publishing", 1)):
+            self.s.store.update(review["id"], state=state, review_attempted=attempted)
+            self.assertIsNone(self.s.store.claim(2))
+        self.s.store.update(review["id"], state="done")
+        self.assertIsNotNone(self.s.store.claim(2))
+
+    def test_initial_hint_validation_and_repeat_request_do_not_reset_active_task(self):
+        with self.assertRaisesRegex(ValueError, "hint"):
+            self.s.command("work", {"number": 1, "hint": {"text": "bad type"}})
+        self.assertFalse(self.s.store.jobs())
+        queued = self.s.command("work", {"number": 1, "hint": "fix safely"})
+        job = self.s.store.claim(2)
+        self.s.store.update(job["id"], attempts=1)
+        repeated = self.s.command("work", {"number": 1, "hint": "fix safely"})
+        self.assertFalse(repeated["enqueued"])
+        with self.assertRaisesRegex(ValueError, "use guide"):
+            self.s.command("work", {"number": 1, "hint": "different request"})
+        self.assertEqual(self.s.store.job(job["id"])["state"], "reviewing")
+        self.assertEqual(self.s.store.job(job["id"])["attempts"], 1)
+        self.assertEqual(queued["job"]["id"], repeated["job"]["id"])
 
     def test_discovery_policy_exclusions_do_not_alert_or_hide_eligible_siblings(self):
         self.gh.comments_data = [{"id": 7, "user": {"id": 9}, "body": "defect"}]

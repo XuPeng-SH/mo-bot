@@ -72,14 +72,14 @@ archived disabled sessions to reconnect them after restart.
 ## Delivery assignments
 
 `POST /api/jobs` with `{"kind":"work","target_type":"pr","number":29422}`
-queues an own-PR repair. Automatic repairs admit a completed failed check/status even while sibling checks or the workflow remain running; the latest terminal-failed-run requirement still applies to actual reruns. Review and repair may both queue but never execute concurrently for the same PR. `target_type="issue"` explicitly queues an open issue in
+queues an explicitly assigned open non-draft PR repair, regardless of author. Optional `hint` (up to 8,000 characters) freezes initial task guidance; repeat requests retain the same task. Use `guide` for changed guidance after work starts. Automatic discovery stays configured-owner only. External PR repairs retain the upstream source PR identity and use an owned fork branch plus a marked integration PR targeting the original author's source branch; no write access to that source fork is required to execute the task. Automatic repairs admit a completed failed check/status even while sibling checks or the workflow remain running; the latest terminal-failed-run requirement still applies to actual reruns. Review and repair may both queue but never execute concurrently for the same PR. `target_type="issue"` explicitly queues an open issue in
 the configured repository; automatic issue admission is separately limited to
 open issues assigned to the configured owner with the `bot-ready` label. With
 one classifier slot enabled, `gpt-6-luna/xhigh` may group an issue into a
 compatible queued or very early triage/design task (maximum three issues).
 Uncertain matches or classifier/model failures stay separate. CLI equivalents
 are `mo-botctl repair NUMBER` and `mo-botctl issue NUMBER`. Worker pool must be
-enabled. PR force admission never bypasses author/draft/default-ref guards.
+enabled. Explicit repair authorizes source admission, never a default destination ref or an unowned push. Draft/exclusion and publication identity guards remain.
 
 Sessions include `role`, `pool_index`, `enabled`; jobs include `kind`,
 `target_type`, `target_number`, `phase` and persisted `data`. Global slot IDs stay
@@ -96,7 +96,7 @@ are not polled again; transient read errors have bounded persisted backoff.
 
 ## Discovery and recovery
 
-Review and worker discovery use bounded read-only child processes. A complete, validated snapshot is required before reconciliation: timeout, malformed/partial output and provider errors never imply that PRs closed. Same-head automatic tasks already decisively reviewed are superseded; transient CI/mergeability waits retain the job and expose a wait reason. Explicit force admission and already-attempted publication keep their original safety contract. During discovery, automatic review dispatch pauses until fresh success, while operator commands and retained worker tasks remain serviced.
+Saved review assessments awaiting CI/admission release the PR execution fence; active turns and attempted review writes still fence repairs. Review publication waits while repair execution owns the PR. Review and worker discovery use bounded read-only child processes. A complete, validated snapshot is required before reconciliation: timeout, malformed/partial output and provider errors never imply that PRs closed. Same-head automatic tasks already decisively reviewed are superseded; transient CI/mergeability waits retain the job and expose a wait reason. Explicit force admission and already-attempted publication keep their original safety contract. During discovery, automatic review dispatch pauses until fresh success, while operator commands and retained worker tasks remain serviced.
 
 One job's I/O/publication failure sets its persistent `retry_at` and cannot force a global dispatch cooldown. Saved review publication releases its model slot; delivery workers retain affine slots through model phases, then freeze reviewed commits and release slots before publication. Retry deadlines survive restart. Single-instance locking precedes SQLite migration. Recovery accepts only the exact session/turn recorded in the artifact provenance, not any completed event in a reused log. Shutdown fails queued operator commands instead of leaving their futures unresolved.
 

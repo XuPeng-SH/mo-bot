@@ -1,6 +1,6 @@
 ---
 name: mo-bot-worker
-description: Resolve an assigned own-PR repair or configured-owner bot-ready issue using the coordinator's frozen task, reusable session and issue-to-pr design and final review gates. Not for unassigned GitHub writes or service administration.
+description: Resolve an assigned PR repair or configured-owner bot-ready issue using the coordinator's frozen task, reusable session and issue-to-pr design and final review gates. Not for unassigned GitHub writes or service administration.
 ---
 
 # Assigned delivery worker
@@ -21,13 +21,13 @@ Write final-review findings, summaries, validation notes, limitations and GitHub
 
 ## Diagnose and plan
 
-Automatic work applies to the configured owner's open non-draft PRs and open issues assigned to that owner with the `bot-ready` label. Explicit issue jobs remain supported. Similar issues may be grouped only by the pinned `gpt-6-luna/xhigh` semantic classifier when one implementation can close the same root cause; groups are capped at three, and uncertain/unavailable classification keeps issues separate. The coordinator attaches the exact member evidence and requires every member to be accounted for. Understand substantive review comments/requested changes, actual merge conflicts and current-head CI failures. Verify findings against causal code and existing fixes.
+Automatic work applies to the configured owner's open non-draft PRs and open issues assigned to that owner with the `bot-ready` label. Explicit issue jobs and operator-selected open non-draft PR repairs remain supported regardless of PR author. The scheduler freezes admission, source identity, guidance and delivery destination; worker execution must not reimpose automatic owner-discovery rules. An external PR repair is delivered through the operator's fork and a linked PR targeting the original author's branch. Similar issues may be grouped only by the pinned `gpt-6-luna/xhigh` semantic classifier when one implementation can close the same root cause; groups are capped at three, and uncertain/unavailable classification keeps issues separate. The coordinator attaches the exact member evidence and requires every member to be accounted for. Understand substantive review comments/requested changes, actual merge conflicts and current-head CI failures. Verify findings against causal code and existing fixes.
 
 Classify PR-caused failure as pr_defect and implement the causal fix. Environment or existing flaky classification requires concrete logs plus a passing control, baseline occurrence or infrastructure diagnosis establishing independence from the PR. Unknown causes are blocked. Classify every failed-CI semantic atom in
 failure_dispositions with concrete evidence. Mixed PR-caused and independent
 failures need both an implementation and causes[] issue actions linked by
 evidence_keys; never discard one failure because another was fixed. The final
-gate must confirm the same per-failure dispositions and issue/rerun plan. Supply stable cause_signature containing component/failure class, excluding PR/head/run IDs and timestamps. By default, environment/flaky diagnoses are retained in task evidence and the PR result without creating GitHub issues. Transient GitHub API socket resets and proven flaky TLS/network failures must not generate issues. Recommend a bounded rerun only after proving independence; unknown failures remain blocked. Issue text fields may be empty under this policy; descriptive legacy fields never authorize a write. Recommend only frozen current-head terminal failed Actions run IDs; coordinator verifies association, latest attempts and budgets. Rebase only for actual conflict/dependency. Never rebase just to chase base churn.
+gate must confirm the same per-failure dispositions and issue/rerun plan. Supply stable cause_signature containing component/failure class, excluding PR/head/run IDs and timestamps. By default, environment/flaky diagnoses are retained in task evidence and the PR result without creating GitHub issues. Transient GitHub API socket resets and proven flaky TLS/network failures must not generate issues. Recommend a bounded rerun only after proving independence; unknown failures remain blocked. Issue text fields may be empty under this policy; descriptive legacy fields never authorize a write. Recommend only frozen current-head terminal failed Actions run IDs; coordinator verifies association, latest attempts and budgets. Rebase only for actual conflict/dependency or an explicit operator request. Never rebase just to chase base churn.
 
 A noop requires evidence the requested problem is already solved or inapplicable. The final gate still verifies a noop or infrastructure diagnosis.
 

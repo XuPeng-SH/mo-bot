@@ -37,6 +37,9 @@ def _main():
     for name in ["repair", "issue"]:
         p = commands.add_parser(name)
         p.add_argument("number", type=int)
+        p.add_argument(
+            "--hint", help="initial task guidance; use guide for a started task"
+        )
     p = commands.add_parser("reconcile")
     p.add_argument("job_id")
     for name in ["pause", "resume", "retry", "cleanup", "rerun"]:
@@ -135,6 +138,8 @@ def _main():
             "target_type": "pr" if args.command == "repair" else "issue",
             "number": args.number,
         }
+        if args.hint is not None:
+            body["hint"] = args.hint
     elif args.command == "progress":
         endpoint = f"/api/sessions/{args.slot}/messages"
         body = {

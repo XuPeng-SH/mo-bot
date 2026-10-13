@@ -95,16 +95,18 @@ one retained session. Blocked work backs off without a lifetime failure; mandato
 by changing the session default. Unknown CI causes and unavailable validation
 block delivery. Proven environment/existing flaky failures retain causal evidence
 before a bounded approved current-head Actions rerun; cause issues are opt-in. Rebase is reserved for
-real conflicts/dependencies; a push starts fresh CI and never reruns old-head CI.
+real conflicts/dependencies or an explicit operator request; a push starts fresh CI and never reruns old-head CI.
 
 Explicit assignments use the same queue:
 
 ```bash
-mo-botctl repair 29422
+mo-botctl repair 29422 --hint "Understand comments and CI failures; rebase, repair and validate"
 mo-botctl issue 12345
 mo-botctl sessions
 mo-botctl jobs
 ```
+
+Explicit repair can assign another author's open non-draft PR; automatic discovery still selects only the configured owner. The scheduler freezes source identity and initial guidance independently of publication permissions. External repairs use an owned fork branch and a marked integration PR targeting the original author's source branch, preserving the original upstream PR as the task target. Workers run the same triage/design/implementation/final-review phases and never write directly to the author's fork. Saved reviews awaiting admission do not block repair execution; active turns and uncertain writes retain their PR fences.
 
 Issue jobs require an existing personal fork and create an owned feature branch
 and marked PR. Automatic issue intake is limited to open issues assigned to the

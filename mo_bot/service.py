@@ -709,6 +709,9 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
             return
         if job["kind"] == "work":
             return self.worker.publish(job)
+        if not job["review_attempted"] and self.store.pr_busy(job):
+            self.store.update(job["id"], retry_at=time.time() + 60)
+            return
         pr = self.github.pr(job)
         if owner_wip(pr, self.config.reviewer):
             self.store.update(job["id"], error="owner-wip", retry_at=time.time() + 60)
@@ -891,6 +894,11 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
                 harness_request.get("status") in ("pending", "running")
                 and harness_request.get("expires_at", 0) > time.time()
             )
+            busy = (
+                self.store.pr_busy(job)
+                if job["state"] in ("queued", "publishing")
+                else None
+            )
             job["dispatchable"] = (
                 job["state"] == "queued"
                 and not self.dispatch_control["paused"]
@@ -898,6 +906,7 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
                 and not harness_waiting
                 and job["id"] in self.eligible
                 and job["retry_at"] <= time.time()
+                and not busy
             )
             status = self.admission.get(str(job["pr"]), {})
             job["wait_reason"] = None
@@ -909,6 +918,8 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
                     if self.dispatch_control["paused"]
                     else "semantic harness coordination"
                     if harness_waiting
+                    else "active task for same PR"
+                    if busy
                     else "external prerequisite: "
                     + job["data"]["recovery_wait"]["guidance"]
                     if job["retry_at"] > time.time()
@@ -923,12 +934,17 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
                 job["state"] == "publishing"
                 and job["kind"] == "review"
                 and not job["review_attempted"]
-                and job["id"] not in self.eligible
+                and (busy or job["id"] not in self.eligible)
             ):
-                job["wait_reason"] = "review publication awaiting admission: " + (
-                    status.get("reason", "awaiting successful discovery")
-                    if status.get("head") == job["head"]
-                    else "awaiting successful discovery"
+                job["wait_reason"] = (
+                    "review publication waiting for active task"
+                    if busy
+                    else "review publication awaiting admission: "
+                    + (
+                        status.get("reason", "awaiting successful discovery")
+                        if status.get("head") == job["head"]
+                        else "awaiting successful discovery"
+                    )
                 )
             job["attention_required"] = bool(
                 job["data"].get("paused")
@@ -1189,7 +1205,9 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
             return self.worker.reconcile(job)
         if action == "work":
             return self.worker.enqueue(
-                args.get("target_type", "pr"), args.get("number", args.get("pr"))
+                args.get("target_type", "pr"),
+                args.get("number", args.get("pr")),
+                args.get("hint"),
             )
         if action == "model":
             if self.dispatch_control["paused"]:

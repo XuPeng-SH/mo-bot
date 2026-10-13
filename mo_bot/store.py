@@ -8,6 +8,15 @@ from pathlib import Path
 ACTIVE = ("reviewing", "publishing", "canceling")
 
 
+def pr_fence(alias=""):
+    p = alias + "." if alias else ""
+    return (
+        f"{p}state IN ('reviewing','canceling') OR "
+        f"({p}state='publishing' AND ({p}kind='work' OR {p}review_attempted=1)) OR "
+        f"({p}kind='work' AND {p}state='queued' AND {p}slot_id IS NOT NULL)"
+    )
+
+
 JOBS_SQL = """CREATE TABLE jobs(
     id TEXT PRIMARY KEY, repo TEXT NOT NULL, pr INTEGER, target_number INTEGER, head TEXT NOT NULL,
     state TEXT NOT NULL CHECK(state IN ('queued','reviewing','publishing','canceling','done','failed','superseded')),
@@ -171,7 +180,7 @@ class Store:
                 "CREATE UNIQUE INDEX active_slot ON jobs(slot_id) WHERE state IN ('reviewing','canceling') OR (kind='work' AND state IN ('queued','publishing') AND slot_id IS NOT NULL)"
             )
             self.db.execute(
-                "CREATE UNIQUE INDEX active_pr ON jobs(repo,pr) WHERE state IN ('reviewing','publishing','canceling') OR (kind='work' AND state IN ('queued','publishing') AND slot_id IS NOT NULL)"
+                f"CREATE UNIQUE INDEX active_pr ON jobs(repo,pr) WHERE {pr_fence()}"
             )
             self.db.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS active_issue ON jobs(repo,target_number) WHERE kind='work' AND target_type='issue' AND (state IN ('reviewing','publishing','canceling') OR (state='queued' AND slot_id IS NOT NULL))"
@@ -565,11 +574,11 @@ class Store:
                     return None
                 kind = "review" if slot_row["role"] == "review" else "work"
                 choices = self.db.execute(
-                    """SELECT j.* FROM jobs j WHERE j.state='queued' AND j.kind=? AND j.retry_at<=? AND (j.slot_id IS NULL OR j.slot_id=?)
+                    f"""SELECT j.* FROM jobs j WHERE j.state='queued' AND j.kind=? AND j.retry_at<=? AND (j.slot_id IS NULL OR j.slot_id=?)
                     AND COALESCE(json_extract(j.data,'$.paused'),0)=0
                     AND NOT (COALESCE(json_extract(j.data,'$.harness_request.status'),'') IN ('pending','running') AND COALESCE(json_extract(j.data,'$.harness_request.expires_at'),0)>?)
                     AND NOT EXISTS(SELECT 1 FROM jobs a WHERE a.id<>j.id AND a.repo=j.repo AND (a.pr=j.pr OR (a.target_type='issue' AND j.target_type='issue' AND (a.target_number=j.target_number OR EXISTS(SELECT 1 FROM issue_members am JOIN issue_members jm ON jm.repo=am.repo AND jm.number=am.number WHERE am.job_id=a.id AND jm.job_id=j.id)))) AND
-                    (a.state IN ('reviewing','publishing','canceling') OR (a.kind='work' AND a.state='queued' AND a.slot_id IS NOT NULL))) ORDER BY j.created""",
+                    ({pr_fence("a")})) ORDER BY j.created""",
                     (kind, time.time(), slot, time.time()),
                 ).fetchall()
                 job = next(
@@ -597,6 +606,12 @@ class Store:
                 (slot, time.time(), job["id"]),
             )
         return self.job(job["id"])
+
+    def pr_busy(self, job):
+        return self.db.execute(
+            f"SELECT id FROM jobs WHERE repo=? AND pr=? AND id<>? AND ({pr_fence()}) LIMIT 1",
+            (job["repo"], job["pr"], job["id"]),
+        ).fetchone()
 
     def uncertain_pr(self, repo, head, head_repo_id=None, head_ref=None):
         for effect in self.db.execute(

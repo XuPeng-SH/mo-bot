@@ -577,8 +577,12 @@ class TestWorkflow(unittest.TestCase):
     def test_existing_database_migrates_without_replaying_completed_jobs(self):
         job = self.job()
         self.store.update(job["id"], state="done")
+        self.store.db.execute("DROP INDEX active_pr")
         for column in ("review_id", "review_event", "review_attempted"):
             self.store.db.execute(f"ALTER TABLE jobs DROP COLUMN {column}")
+        self.store.db.execute(
+            "CREATE UNIQUE INDEX active_pr ON jobs(repo,pr) WHERE state IN ('reviewing','publishing','canceling')"
+        )
         self.store.db.commit()
         other = Store(self.root / "state.sqlite3", "test-bot", 2)
         try:
