@@ -247,6 +247,25 @@ class TestWorkflow(unittest.TestCase):
         self.gh.submit_review.assert_called_once()
         self.assertEqual(self.store.job(j["id"])["review_id"], 100)
 
+    def test_complete_report_is_published_once_with_a_link_in_status_comment(self):
+        for own in (False, True):
+            with self.subTest(own=own):
+                j = self.job(pr=2 if own else 1)
+                j = self.store.claim(0)
+                self.service.save_result(j, self.store.slots()[0], assessment(j))
+                self.service.eligible.add(j["id"])
+                self.gh.pr.return_value["user"]["login"] = "me" if own else "other"
+                self.gh.find_review.return_value = None
+                self.service.publish(self.store.job(j["id"]))
+                formal = self.gh.submit_review.call_args.args
+                status = self.gh.patch_comment.call_args.args
+                self.assertEqual(formal[1], "COMMENT" if own else "APPROVE")
+                self.assertIn("Real entrance checked.", formal[2])
+                self.assertNotIn("Real entrance checked.", status[2])
+                self.assertNotIn("Assessment:", status[2])
+                self.assertIn("#pullrequestreview-100", status[2])
+                self.assertEqual(self.store.job(j["id"])["state"], "done")
+
     def test_old_head_not_published_as_current_review(self):
         j = self.job()
         j = self.store.claim(0)

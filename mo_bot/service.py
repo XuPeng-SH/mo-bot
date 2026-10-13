@@ -780,7 +780,13 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
             self.store.update(job["id"], review_attempted=1)
             review = self.github.submit_review(job, event, text)
         self.store.update(job["id"], review_id=review["id"], review_attempted=1)
-        self.github.patch_comment(job, "done", report_text(json.loads(job["result"])))
+        review_url = review.get("html_url") or (
+            f"https://github.com/{job['repo']}/pull/{job['pr']}"
+            f"#pullrequestreview-{review['id']}"
+        )
+        self.github.patch_comment(
+            job, "done", f"Review completed. [Read the assessment]({review_url})."
+        )
         self.store.update(job["id"], state="done", comment_state="done", error=None)
         LOG.info("published PR=%s head=%s job=%s", job["pr"], job["head"], job["id"])
 

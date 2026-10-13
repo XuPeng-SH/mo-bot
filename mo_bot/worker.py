@@ -2423,7 +2423,14 @@ Return every schema field. causes holds independently proven environment/flaky a
                     job, "done", result["summary"] + "\n\n" + "\n".join(outputs)
                 )
             self.store.dispose_evidence(job, "done")
-            self.checkpoint(job, data, state="done", slot_id=None, error=None)
+            self.checkpoint(
+                job,
+                data,
+                state="done",
+                slot_id=None,
+                error=None,
+                comment_state="done" if job["comment_id"] else job["comment_state"],
+            )
             if data.get("publication_ref"):
                 try:
                     self.ws.publication_git(

@@ -762,8 +762,27 @@ class Store:
                 )
 
     def carry_evidence(self, job, head, disposition):
+        metadata = json.loads(job["metadata"])
+        carried = {a["key"]: a for a in metadata.get("atoms", [])}
+        # A later repair may be triggered only by fresh CI failures. Its frozen
+        # input also includes PR feedback already handled on the source head;
+        # keep those dispositions through our accepted push, not old CI results.
+        observed = set(metadata.get("input_evidence_keys", []))
         with self.db:
-            for atom in json.loads(job["metadata"]).get("atoms", []):
+            for row in self.db.execute(
+                "SELECT key,payload FROM evidence WHERE repo=? AND number=? AND head=? AND disposition IN ('done','delivered')",
+                (job["repo"], job["target_number"], job["head"]),
+            ).fetchall():
+                if row["key"] in observed and row["key"] not in carried:
+                    atom = json.loads(row["payload"])
+                    if atom["kind"] in (
+                        "comment",
+                        "review_thread",
+                        "request_changes",
+                        "bot_finding",
+                    ):
+                        carried[atom["key"]] = atom
+            for atom in carried.values():
                 self.db.execute(
                     "INSERT INTO evidence(repo,number,head,key,payload,disposition,job_id) VALUES(?,?,?,?,?,?,?) ON CONFLICT(repo,number,head,key) DO UPDATE SET disposition=excluded.disposition,job_id=excluded.job_id",
                     (
@@ -783,9 +802,7 @@ class Store:
                 (job["repo"], job["target_number"], head),
             ).fetchall():
                 atoms = json.loads(queued["metadata"]).get("atoms", [])
-                handled = {
-                    a["key"] for a in json.loads(job["metadata"]).get("atoms", [])
-                }
+                handled = set(carried)
                 if atoms and all(a["key"] in handled for a in atoms):
                     self.db.execute(
                         "UPDATE jobs SET state='superseded',error='evidence already handled by delivered candidate',updated=? WHERE id=?",

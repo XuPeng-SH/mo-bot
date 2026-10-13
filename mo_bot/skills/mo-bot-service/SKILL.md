@@ -43,6 +43,13 @@ The service submits `REQUEST_CHANGES` for confirmed findings, `APPROVE` for a su
 
 ## Review status and history
 
+The complete assessment appears in the formal review. Its status comment links
+to that review instead of repeating the report. Initial comment-only repair
+admission asks the existing semantic session about those comments alone;
+informational notices do not warrant work merely because CI is pending. An
+accepted bot push preserves handled PR feedback from its frozen input across
+successive repairs, while older CI results remain scoped to their head.
+
 Each new turn receives shared `check-run` and `test-exec` launchers in its
 diagnostic directory. Isolation preflight checks private `/tmp` identity and
 writes plus loopback before test compilation. Tests bind only a dedicated

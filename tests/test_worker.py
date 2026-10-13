@@ -2180,6 +2180,78 @@ class TestWorker(unittest.TestCase):
         self.gh.prs[1]["head"]["sha"] = "d" * 40
         self.assertIsNotNone(self.w.pr_candidate(1))
 
+    def test_second_push_preserves_handled_feedback_without_inheriting_old_ci(self):
+        self.gh.comments_data = [
+            {"id": 5, "user": {"id": 9}, "body": "account notification"}
+        ]
+        self.gh.checks = [
+            {"id": 11, "name": "UT", "status": "completed", "conclusion": "failure"}
+        ]
+        first = self.w.pr_candidate(1)
+        self.s.store.enqueue(first)
+        job = self.s.store.job(self.s.store.work_key(first))
+        self.s.store.dispose_evidence(job, "done")
+        self.s.store.carry_evidence(job, NEW, "delivered")
+        self.s.store.update(job["id"], state="done")
+
+        self.gh.prs[1]["head"]["sha"] = NEW
+        self.gh.checks.append(
+            {"id": 12, "name": "SCA", "status": "completed", "conclusion": "failure"}
+        )
+        second = self.w.pr_candidate(1)
+        self.assertEqual([a["identity"] for a in second["atoms"]], [12])
+        self.s.store.enqueue(second)
+        job = self.s.store.job(self.s.store.work_key(second))
+        later = "d" * 40
+        self.s.store.carry_evidence(job, later, "delivered")
+        self.s.store.update(job["id"], state="done")
+        self.gh.prs[1]["head"]["sha"] = later
+        self.gh.checks = []
+        self.assertIsNone(self.w.pr_candidate(1))
+
+        # Source-head CI is not PR-level feedback and cannot be inherited just
+        # because its key appeared in the later repair's complete snapshot.
+        old_ci = next(a for a in first["atoms"] if a["kind"] == "check_failure")
+        self.assertIsNone(
+            self.s.store.db.execute(
+                "SELECT 1 FROM evidence WHERE head=? AND key=?", (later, old_ci["key"])
+            ).fetchone()
+        )
+        self.gh.comments_data[0]["body"] = "new actionable feedback"
+        self.assertIsNotNone(self.w.pr_candidate(1))
+
+    def test_push_does_not_dispose_unresolved_or_unseen_feedback(self):
+        self.gh.comments_data = [{"id": 5, "body": "handled feedback"}]
+        raw = self.w.gather_candidate(1)
+        self.s.store.fresh_evidence(raw["repo"], 1, HEAD, raw["atoms"])
+        first = self.w.pr_candidate(1, explicit=True)
+        self.s.store.enqueue(first)
+        job = self.s.store.job(self.s.store.work_key(first))
+        self.s.store.dispose_evidence(job, "done")
+        self.gh.comments_data += [
+            {"id": 6, "body": "unresolved feedback"},
+            {"id": 7, "body": "unseen feedback"},
+        ]
+        observations = self.w.gather_candidate(1)["atoms"]
+        self.s.store.fresh_evidence(raw["repo"], 1, HEAD, observations)
+        unseen = next(a for a in observations if a["identity"] == 7)
+        self.s.store.db.execute(
+            "UPDATE evidence SET disposition='done' WHERE head=? AND key=?",
+            (HEAD, unseen["key"]),
+        )
+        snapshot = {
+            **first,
+            "atoms": [],
+            "input_evidence_keys": [
+                a["key"] for a in observations if a["identity"] != 7
+            ],
+        }
+        copied = {**dict(job), "metadata": json.dumps(snapshot)}
+        self.s.store.carry_evidence(copied, NEW, "delivered")
+        self.gh.prs[1]["head"]["sha"] = NEW
+        candidate = self.w.pr_candidate(1)
+        self.assertEqual({a["identity"] for a in candidate["atoms"]}, {6, 7})
+
     def transport_failure(self, job):
         self.w.launch(self.slot, job)
         job = self.s.store.job(job["id"])
@@ -2336,12 +2408,20 @@ class TestWorker(unittest.TestCase):
         self.gh.comments_data = [
             {"id": 90, "body": "Automatic account notification: account link required"}
         ]
+        self.gh.checks = [
+            {"id": 91, "name": "SCA", "status": "in_progress", "conclusion": None}
+        ]
+        self.gh.runs = [{"id": 92, "status": "in_progress", "conclusion": None}]
         candidate = self.w.pr_candidate(1)
         self.s.store.enqueue(candidate)
         key = self.s.store.work_key(candidate)
         self.s.harness.poll()
         request = json.loads(self.s.store.job(key)["data"])["harness_request"]
         self.w.dispatch_classifier(semantic)
+        prompt = self.s.backend.start.call_args.args[3]
+        self.assertIn("INITIAL COMMENT ADMISSION", prompt)
+        self.assertIn('"failure_context": {}', prompt)
+        self.assertIn("MUST return ignore", prompt)
         self.w.classifier_complete(
             semantic["id"],
             self.harness_advice(

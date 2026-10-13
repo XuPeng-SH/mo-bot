@@ -359,6 +359,15 @@ class Harness:
             except OSError:
                 pass
         previous = data.get(job["phase"], {}).get("result", {})
+        observations = data.get("pending_input", {}).get("atoms", [])
+        initial_admission = (
+            request["reason"] == "new_evidence"
+            and not job["attempts"]
+            and not data.get("before")
+            and not data.get("operator_hint")
+            and bool(observations)
+            and all(a["kind"] == "comment" for a in observations)
+        )
         payload = {
             "request": request,
             "job_id": job["id"],
@@ -374,8 +383,11 @@ class Harness:
             "accepted_design_evidence": data.get("design", {})
             .get("result", {})
             .get("evidence", []),
-            "new_observations": data.get("pending_input", {}).get("atoms", []),
-            "failure_context": {
+            "initial_comment_admission": initial_admission,
+            "new_observations": observations,
+            "failure_context": {}
+            if initial_admission
+            else {
                 k: data.get("pending_input", {}).get("evidence", {}).get(k, [])
                 for k in ("checks", "runs", "statuses")
             },
@@ -387,6 +399,8 @@ class Harness:
         )
         if request["reason"] == "new_evidence":
             prompt += "\nCoordinate these new observations within the SAME task and preserved candidate. Use ignore only if ALL new observations are informational comments with no actionable feedback (e.g. service/account notifications); explain why. continue means review the added evidence while retaining useful work; replan means the accepted design is invalid. CI failures and formal review evidence cannot be dismissed by semantic advice. Correlate failed jobs with their run and attempt; downstream aggregates do not alone establish another product defect. Never require a new task or a full restart merely for new same-head evidence."
+            if initial_admission:
+                prompt += "\nThis is INITIAL COMMENT ADMISSION, not an existing repair to continue. Decide solely whether the supplied new_observations contain actionable repository feedback. If all are service/account notices, acknowledgements or other informational comments, you MUST return ignore. Return continue only for concrete actionable feedback in those comments. Previously handled findings, older tasks and pending CI do not create work here. Do not send an informational-only task through design, implementation or final review merely to reconcile unrelated CI."
         (directory / "request.json").write_text(json.dumps(payload, indent=2))
         self.pending[slot["id"]] = (job["id"], request)
         data["harness_request"]["status"] = "running"
