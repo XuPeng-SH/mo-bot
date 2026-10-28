@@ -69,7 +69,9 @@ class TestFormalReviews(unittest.TestCase):
 
 
 class TestOwnPRDiscovery(unittest.TestCase):
-    def own_snapshot(self, reviews, ci="not-green", mergeable="MERGEABLE", labels=()):
+    def own_snapshot(
+        self, reviews, ci="not-green", mergeable="MERGEABLE", labels=(), fields=None
+    ):
         queue = Mock()
         queue.all_prs.return_value = [
             {
@@ -80,6 +82,7 @@ class TestOwnPRDiscovery(unittest.TestCase):
                 "updatedAt": "now",
                 "mergeable": mergeable,
                 "reviews": {"nodes": reviews},
+                **(fields or {}),
             }
         ]
         queue.classify.return_value = ("excluded", "self-authored", None)
@@ -89,6 +92,71 @@ class TestOwnPRDiscovery(unittest.TestCase):
         )
         with patch("mo_bot.github.load_queue", return_value=queue):
             return discover(config)
+
+    def bot_review(
+        self, state="COMMENTED", head="a" * 40, author="me", service="previous-bot"
+    ):
+        return {
+            "author": {"login": author},
+            "state": state,
+            "commit": {"oid": head},
+            "body": "Assessment\n"
+            + marker(service, {"id": "old-job", "head": head}, "review"),
+        }
+
+    def test_manual_reviews_do_not_close_bot_admission(self):
+        for state in ("COMMENTED", "APPROVED", "CHANGES_REQUESTED"):
+            review = {
+                "author": {"login": "me"},
+                "state": state,
+                "commit": {"oid": "a" * 40},
+                "body": "Static only; no tests.",
+            }
+            self.assertEqual(len(self.own_snapshot([review])["candidates"]), 1)
+
+    def test_only_proven_merges_after_authenticated_bot_review_skip_discovery(self):
+        fields = {
+            "_defaultBranch": {"name": "main", "oid": "c" * 40},
+            "baseRefName": "main",
+        }
+        old = self.bot_review(head="b" * 40)
+        with patch("mo_bot.github.MergeOnlyReviews") as proof:
+            proof.return_value.matches.return_value = True
+            snapshot = self.own_snapshot([old], fields=fields)
+            self.assertFalse(snapshot["candidates"])
+            self.assertEqual(
+                snapshot["admission"]["1"]["reason"], "merge-only-reviewed"
+            )
+            self.assertEqual(snapshot["admission"]["1"]["reviewed_head"], "b" * 40)
+            proof.return_value.matches.assert_called_once()
+            proof.return_value.matches.return_value = False
+            self.assertEqual(
+                len(self.own_snapshot([old], fields=fields)["candidates"]), 1
+            )
+            proof.reset_mock()
+            manual = {**old, "body": "human review"}
+            self.assertEqual(
+                len(self.own_snapshot([manual], fields=fields)["candidates"]), 1
+            )
+            proof.assert_not_called()
+
+    def test_only_matching_authenticated_review_markers_close_admission(self):
+        cases = [
+            self.bot_review(author="someone"),
+            self.bot_review(state="PENDING"),
+            self.bot_review(state="DISMISSED"),
+            self.bot_review(head="b" * 40),
+        ]
+        for body in (
+            "<!-- mo-bot-review:v1 {bad} -->",
+            "<!-- mo-bot-review:v1 [] -->",
+            marker("stable", {"id": "old-job", "head": "b" * 40}, "review"),
+            marker("stable", {"id": "old-job", "head": "a" * 40}, "done"),
+        ):
+            cases.append({**self.bot_review(), "body": body})
+        for review in cases:
+            with self.subTest(review=review):
+                self.assertEqual(len(self.own_snapshot([review])["candidates"]), 1)
 
     def test_own_unreviewed_head_admitted_independently_of_ci(self):
         for ci in ("missing", "not-green", "stale (20d)", "fresh (0d)"):
@@ -123,7 +191,7 @@ class TestOwnPRDiscovery(unittest.TestCase):
     def test_formal_review_is_scoped_to_exact_head_and_ignores_drafts(self):
         for state in ("APPROVED", "CHANGES_REQUESTED", "COMMENTED"):
             with self.subTest(state=state):
-                current = {"state": state, "commit": {"oid": "a" * 40}}
+                current = self.bot_review(state=state)
                 snapshot = self.own_snapshot([current])
                 self.assertFalse(snapshot["candidates"])
                 self.assertEqual(
@@ -151,9 +219,7 @@ class TestOwnPRDiscovery(unittest.TestCase):
         snapshot = self.own_snapshot([old] * 100)
         self.assertFalse(snapshot["candidates"])
         self.assertEqual(snapshot["indeterminate"], [1])
-        snapshot = self.own_snapshot(
-            [old] * 99 + [{"state": "APPROVED", "commit": {"oid": "a" * 40}}]
-        )
+        snapshot = self.own_snapshot([old] * 99 + [self.bot_review(state="APPROVED")])
         self.assertEqual(snapshot["admission"]["1"]["reason"], "already-reviewed")
 
     def test_draft_and_explicit_exclusion_are_not_overridden(self):

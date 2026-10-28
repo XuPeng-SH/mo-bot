@@ -170,8 +170,9 @@ class Store:
                     self.db.execute(f"ALTER TABLE jobs ADD COLUMN {name} {decl}")
             self.db.execute("DROP INDEX IF EXISTS active_slot")
             self.db.execute("DROP INDEX IF EXISTS active_pr")
+            self.db.execute("DROP INDEX IF EXISTS review_identity")
             self.db.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS review_identity ON jobs(repo,pr,head) WHERE kind='review'"
+                "CREATE UNIQUE INDEX IF NOT EXISTS review_identity ON jobs(repo,pr,head,trigger_key) WHERE kind='review'"
             )
             self.db.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS work_identity ON jobs(repo,target_number,target_type,trigger_key,head) WHERE kind='work'"
@@ -235,23 +236,43 @@ class Store:
             if self.db.execute("PRAGMA foreign_key_check").fetchone():
                 raise ValueError("workflow migration failed foreign-key integrity")
 
-    def key(self, repo: str, pr: int, head: str) -> str:
+    def key(self, repo: str, pr: int, head: str, trigger: str = "") -> str:
         return hashlib.sha256(
-            f"{self.service_id}:{repo}:{pr}:{head}".encode()
+            (
+                f"{self.service_id}:{repo}:{pr}:{head}"
+                + (f":{trigger}" if trigger else "")
+            ).encode()
         ).hexdigest()[:24]
+
+    def review_uncertain(self, repo, pr):
+        return (
+            self.db.execute(
+                "SELECT 1 FROM jobs WHERE repo=? AND pr=? AND kind='review' AND state<>'done' AND (review_attempted=1 OR (claim_attempted=1 AND comment_id IS NULL)) LIMIT 1",
+                (repo, pr),
+            ).fetchone()
+            is not None
+        )
 
     def enqueue(self, candidate: dict) -> bool:
         kind = candidate.get("kind", "review")
         target_type = candidate.get("target_type", "pr")
         trigger = candidate.get("trigger_key", "")
         key = (
-            self.key(candidate["repo"], candidate["number"], candidate["headRefOid"])
+            self.key(
+                candidate["repo"], candidate["number"], candidate["headRefOid"], trigger
+            )
             if kind == "review"
             else self.work_key(candidate)
         )
         now = time.time()
         with self.db:
             self.db.execute("BEGIN IMMEDIATE")
+            if (
+                kind == "review"
+                and trigger
+                and self.review_uncertain(candidate["repo"], candidate["number"])
+            ):
+                return False
             # Repeated snapshots, including a previously failed task, never re-enqueue it.
             if self.db.execute("SELECT 1 FROM jobs WHERE id=?", (key,)).fetchone():
                 return False
@@ -284,7 +305,7 @@ class Store:
                         )
             self.db.execute(
                 """UPDATE jobs SET state='superseded',error='newer commit queued',updated=?
-                WHERE repo=? AND pr=? AND kind=? AND target_type=? AND head<>? AND state='queued' AND slot_id IS NULL""",
+                WHERE repo=? AND pr=? AND kind=? AND target_type=? AND (head<>? OR (?='review' AND trigger_key<>?)) AND state='queued' AND slot_id IS NULL""",
                 (
                     now,
                     candidate["repo"],
@@ -292,6 +313,8 @@ class Store:
                     kind,
                     target_type,
                     candidate["headRefOid"],
+                    kind,
+                    trigger,
                 ),
             )
             self.db.execute(
@@ -490,6 +513,23 @@ class Store:
             self.db.execute(
                 "UPDATE jobs SET " + ",".join(k + "=?" for k in fields) + " WHERE id=?",
                 (*fields.values(), key),
+            )
+
+    def fresh_review_retry(self, key, slot, data):
+        """Reserve a fresh conversation and retry atomically; retain publication fences."""
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            changed = self.db.execute(
+                "UPDATE jobs SET state='queued',slot_id=?,data=?,error=NULL,retry_at=0,updated=? "
+                "WHERE id=? AND kind='review' AND state='failed' AND result IS NULL "
+                "AND review_attempted=0 AND review_id IS NULL AND review_event IS NULL",
+                (slot, json.dumps(data), time.time(), key),
+            ).rowcount
+            if changed != 1:
+                raise ValueError("review changed before retry")
+            self.db.execute(
+                "UPDATE slots SET session_id=NULL,ready=0,generation=generation+1 WHERE id=?",
+                (slot,),
             )
 
     def slot_update(self, slot: int, **fields):

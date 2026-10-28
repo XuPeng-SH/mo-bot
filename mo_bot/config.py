@@ -6,6 +6,16 @@ import tomllib
 
 CLASSIFIER_MODEL = "gpt-6-luna"
 CLASSIFIER_EFFORT = "xhigh"
+DELIVERY_GATE_MODEL = "gpt-6.1-terra"
+DELIVERY_GATE_EFFORT = "max"
+
+
+def accepted_delivery_gate(model, effort):
+    """Recognize current gates and completed gates retained from before the change."""
+    return (model, effort) in {
+        (DELIVERY_GATE_MODEL, DELIVERY_GATE_EFFORT),
+        ("gpt-6.1-sol", "xhigh"),
+    }
 
 
 @dataclass(frozen=True)

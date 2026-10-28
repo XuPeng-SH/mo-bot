@@ -272,7 +272,11 @@ class TestWorker(unittest.TestCase):
                     {"reasoningEffort": "low"},
                     {"reasoningEffort": "xhigh"},
                 ],
-            }
+            },
+            {
+                "model": "gpt-6.1-terra",
+                "supportedReasoningEfforts": [{"reasoningEffort": "max"}],
+            },
         ]
         self.s.backend = Mock(dead=False)
         for slot in self.s.store.slots():
@@ -299,8 +303,11 @@ class TestWorker(unittest.TestCase):
         job = self.s.store.job(job["id"])
         before = self.ws.worker_state.return_value
         value = result(job, before, **changes)
-        model = "gpt-6.1-sol"
-        effort = "xhigh" if job["phase"] in ("design", "final_review") else "low"
+        model, effort = (
+            ("gpt-6.1-terra", "max")
+            if job["phase"] in ("design", "final_review")
+            else ("gpt-6.1-sol", "low")
+        )
         self.w.consume(job, self.slot, value, model, effort)
         return self.s.store.job(job["id"])
 
@@ -364,24 +371,38 @@ class TestWorker(unittest.TestCase):
                 job = self.s.store.claim(2)
         self.assertEqual(job["state"], "publishing")
         self.assertIsNone(self.s.store.claim(2))
-        self.assertEqual([x[1] for x in seen], ["low", "xhigh", "low", "xhigh"])
+        self.assertEqual(
+            [(x[0], x[1]) for x in seen],
+            [
+                ("gpt-6.1-sol", "low"),
+                ("gpt-6.1-terra", "max"),
+                ("gpt-6.1-sol", "low"),
+                ("gpt-6.1-terra", "max"),
+            ],
+        )
         self.assertEqual([x[2] for x in seen], [False, False, True, False])
         self.assertEqual({x[3] for x in seen}, {"thread-2"})
         self.assertEqual(self.s.store.slots()[2]["effort"], "low")
 
-    def test_gate_rejects_model_claim_without_actual_xhigh(self):
+    def test_gate_rejects_model_claim_without_actual_terra_max(self):
         job = self.phase(self.job())
         job = self.s.store.claim(2)
         self.w.launch(self.slot, job)
         job = self.s.store.job(job["id"])
-        with self.assertRaisesRegex(ValueError, "provenance"):
-            self.w.consume(
-                job,
-                self.slot,
-                result(job, self.ws.worker_state.return_value),
-                "gpt-6.1-sol",
-                "low",
-            )
+        for model, effort in (
+            ("gpt-6.1-sol", "low"),
+            ("gpt-6.1-sol", "xhigh"),
+            ("gpt-6.1-terra", "xhigh"),
+        ):
+            with self.subTest(model=model, effort=effort):
+                with self.assertRaisesRegex(ValueError, "provenance"):
+                    self.w.consume(
+                        job,
+                        self.slot,
+                        result(job, self.ws.worker_state.return_value),
+                        model,
+                        effort,
+                    )
 
     def test_missing_gate_capability_never_falls_back(self):
         self.s.models = []
@@ -525,7 +546,7 @@ class TestWorker(unittest.TestCase):
         self.assertEqual(updated["phase"], "design")
         self.assertNotIn("rebased", json.loads(updated["data"]))
         self.ws.worker_rebase.assert_not_called()
-        self.assertEqual(self.s.backend.start.call_args.args[0]["effort"], "xhigh")
+        self.assertEqual(self.s.backend.start.call_args.args[0]["effort"], "max")
 
     def test_from_input_reenters_same_failed_job_without_resetting_lifetime_attempts(
         self,
@@ -691,7 +712,7 @@ class TestWorker(unittest.TestCase):
         selected = self.s.backend.start.call_args.args[0]
         self.assertEqual(
             (selected["model"], selected["effort"], selected["source_write"]),
-            ("gpt-6.1-sol", "xhigh", False),
+            ("gpt-6.1-terra", "max", False),
         )
         self.ws.worker_finalize.assert_not_called()
         self.assertFalse(self.gh.writes)
@@ -1200,8 +1221,8 @@ class TestWorker(unittest.TestCase):
                 validation_complete=False,
                 limitations=["One more check is missing"],
             ),
-            "gpt-6.1-sol",
-            "xhigh",
+            "gpt-6.1-terra",
+            "max",
         )
         job = self.s.store.job(job["id"])
         self.assertEqual(json.loads(job["data"])["correction_stalls"], 0)
@@ -2051,8 +2072,8 @@ class TestWorker(unittest.TestCase):
             job,
             self.slot,
             result(job, self.ws.worker_state.return_value, classification="noop"),
-            "gpt-6.1-sol",
-            "xhigh",
+            "gpt-6.1-terra",
+            "max",
         )
         self.assertEqual(self.s.store.job(job["id"])["phase"], "final_review")
 
@@ -2074,8 +2095,8 @@ class TestWorker(unittest.TestCase):
                 job,
                 self.slot,
                 result(job, self.ws.worker_state.return_value),
-                "gpt-6.1-sol",
-                "xhigh",
+                "gpt-6.1-terra",
+                "max",
             )
 
     def test_failed_check_queues_repair_while_workflow_running_without_repeating(self):
@@ -2385,9 +2406,9 @@ class TestWorker(unittest.TestCase):
             self.s.command("cleanup_job", {"job_id": job["id"]})
         self.assertEqual(self.s.store.job(job["id"])["slot_id"], 2)
 
-    def test_rerun_control_cannot_bypass_frozen_xhigh_gate(self):
+    def test_rerun_control_cannot_bypass_frozen_delivery_gate(self):
         job = self.job()
-        with self.assertRaisesRegex(ValueError, "xhigh"):
+        with self.assertRaisesRegex(ValueError, "delivery gate"):
             self.s.command("rerun_job", {"job_id": job["id"], "run_id": 123})
         self.assertFalse(self.gh.writes)
 
@@ -3342,8 +3363,8 @@ class TestWorker(unittest.TestCase):
             "publication_ref": "refs/mo-bot/test/delivery/frozen",
             "candidate": NEW,
             "final_review": {
-                "model": "gpt-6.1-sol",
-                "effort": "xhigh",
+                "model": "gpt-6.1-terra",
+                "effort": "max",
                 "result": approval,
             },
         }
@@ -3380,6 +3401,25 @@ class TestWorker(unittest.TestCase):
         self.assertEqual(args[-1], NEW + ":refs/heads/fix/foo")
         self.assertTrue((self.s.job_dir(job) / "push-intent.json").is_file())
 
+    def test_existing_frozen_gate_can_finish_after_model_change(self):
+        job = self.job()
+        data = self.push_data(job)
+        data["final_review"].update(model="gpt-6.1-sol", effort="xhigh")
+        remote = self.remote(job)
+        pushed = self.w.push(job, data)
+        self.assertEqual(pushed["head"], NEW)
+        self.assertEqual(len(remote["pushes"]), 1)
+
+    def test_push_rejects_wrong_new_gate_provenance(self):
+        job = self.job()
+        data = self.push_data(job)
+        self.remote(job)
+        for model, effort in (("gpt-6.1-terra", "xhigh"), ("gpt-6-luna", "max")):
+            with self.subTest(model=model, effort=effort):
+                data["final_review"].update(model=model, effort=effort)
+                with self.assertRaisesRegex(ValueError, "gate approval"):
+                    self.w.push(job, data)
+
     def test_push_rejects_moved_ref_and_changed_final_candidate_without_write(self):
         job = self.job()
         data = self.push_data(job)
@@ -3390,7 +3430,7 @@ class TestWorker(unittest.TestCase):
         self.assertFalse(remote["pushes"])
         remote["head"] = HEAD
         data["final_review"]["result"]["candidate_head"] = "d" * 40
-        with self.assertRaisesRegex(ValueError, "xhigh approval"):
+        with self.assertRaisesRegex(ValueError, "gate approval"):
             self.w.push(job, data)
         self.assertFalse(remote["pushes"])
 

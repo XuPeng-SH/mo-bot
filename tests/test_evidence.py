@@ -71,6 +71,14 @@ class TestEvidence(unittest.TestCase):
         self.assertEqual(self.evidence(head="c" * 40), [])
         self.assertEqual(self.evidence(repo="other/repo"), [])
 
+    def test_current_gate_reuses_evidence_and_wrong_model_does_not(self):
+        self.data["final_review"].update(model="gpt-6.1-terra", effort="max")
+        self.save()
+        self.assertEqual(len(self.evidence()), 1)
+        self.data["final_review"]["model"] = "gpt-6-luna"
+        self.save()
+        self.assertEqual(self.evidence(), [])
+
     def test_retry_progress_ignores_failed_partial_and_repeated_checks(self):
         receipt = {
             "command": [

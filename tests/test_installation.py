@@ -432,6 +432,24 @@ for line in sys.stdin:
 
 
 class TestBundledDiscovery(unittest.TestCase):
+    def test_default_branch_evidence_is_bound_to_discovered_prs(self):
+        from unittest.mock import Mock
+
+        gh = Mock()
+        gh.api.return_value = {
+            "data": {
+                "repository": {
+                    "defaultBranchRef": {"name": "main", "target": {"oid": "a" * 40}},
+                    "pullRequests": {
+                        "nodes": [{"number": 1, "baseRefName": "main"}],
+                        "pageInfo": {"hasNextPage": False},
+                    },
+                }
+            }
+        }
+        pr = Queue(gh).all_prs("owner", "repo")[0]
+        self.assertEqual(pr["_defaultBranch"], {"name": "main", "oid": "a" * 40})
+
     def test_pagination_uses_shared_github_client(self):
         from unittest.mock import Mock
 

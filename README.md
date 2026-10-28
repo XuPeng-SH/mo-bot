@@ -55,9 +55,18 @@ mo-botctl job JOB_ID
 mo-botctl progress SLOT
 ```
 
-The service retains its marked PR status comment and submits a commit-pinned formal review: `request_changes` → `REQUEST_CHANGES`, `approve` → `APPROVE`, and `needs_validation` → `COMMENT`. PRs authored by the configured reviewer or authenticated account receive `COMMENT` for every assessment. Own PRs without a published formal review on the current head are admitted without waiting for CI, while draft/exclusion/mergeability gates still apply. A review POST is fenced durably; uncertain responses are reconciled by authenticated markers, never blindly repeated. Existing completed jobs are not republished. Reviews run against detached frozen checkouts; only diagnostic directories are writable by the model. It is a trusted local automation using the owner's identities, not a multi-tenant security boundary.
+The service retains its marked PR status comment and submits a commit-pinned formal review: `request_changes` → `REQUEST_CHANGES`, `approve` → `APPROVE`, and `needs_validation` → `COMMENT`. PRs authored by the configured reviewer or authenticated account receive `COMMENT` for every assessment. Own PRs without an authenticated, marked bot review on the current head are admitted without waiting for CI, while draft/exclusion/mergeability gates still apply. A review POST is fenced durably; uncertain responses are reconciled by authenticated markers, never blindly repeated. Existing completed jobs are not republished. Reviews run against detached frozen checkouts; only diagnostic directories are writable by the model. It is a trusted local automation using the owner's identities, not a multi-tenant security boundary.
 
 User systemd deployments need their outbound proxy environment explicitly configured when required. `KillMode=control-group` prevents orphaned model/tool work on restart. To survive the last logout, user lingering must be enabled by the machine administrator (`loginctl enable-linger USER`); the current machine denied this operation for xupeng.
+
+Automatic review skips a new head when an authenticated marked bot review covers
+an earlier head and every subsequent first-parent commit is a clean merge from
+the repository's default branch (normally `main`). Git recomputes each merge tree
+to verify that no edits were added inside the merge. Conflict resolutions, new
+feature commits, merges from other branches, and unavailable proof keep normal
+review admission. Discovery reports `merge-only-reviewed` and the original
+`reviewed_head`; it does not publish a review claiming validation of the new SHA.
+Explicit `mo-botctl enqueue PR` bypasses this filter too.
 
 ## Verification
 
@@ -89,8 +98,8 @@ contract. The installer provides both skills; no file under an operator's home i
 required. An optional `issue_skill` configuration supplies additional custom
 instructions; omit it for the bundled workflow. Existing external skills are not
 overwritten by installation: preserve or relocate them before migrating to the
-bundled skill. Triage → actual `gpt-6.1-sol/xhigh` design → writable
-implementation → actual `gpt-6.1-sol/xhigh` overall review run as native turns in
+bundled skill. Triage → actual `gpt-6.1-terra/max` design → writable
+implementation → actual `gpt-6.1-terra/max` overall review run as native turns in
 one retained session. Blocked work backs off without a lifetime failure; mandatory gates cannot be lowered
 by changing the session default. Unknown CI causes and unavailable validation
 block delivery. Proven environment/existing flaky failures retain causal evidence
@@ -219,12 +228,24 @@ a stopped task without deleting evidence or bypassing uncertain-write fences.
 Rerun follows the approved frozen plan, cause issues and current-head/latest-run
 budget checks. Repeated publication/Actions operations reconcile prior effects.
 
-Configured-owner PRs labelled `do-not-merge/wip` are excluded from review and
-repair, including explicit enqueue/repair. Labels are checked at discovery,
-launch and publication. Adding the label interrupts an active turn through the
-existing source-preserving retry path; queued tasks wait without consuming a
-model slot. Removing it permits normal admission; operator-paused tasks still
-require explicit resume.
+Configured-owner PRs labelled `do-not-merge/wip` are excluded from automatic
+review and repair. Explicit review enqueue overrides review admission filters
+(WIP, draft, exclusions, CI and already-reviewed) through launch and publication.
+Repair retains its WIP restriction. Automatic tasks wait through the existing
+source-preserving retry path; removing the label permits normal admission.
+Operator-paused tasks still require explicit resume. Existing active review jobs
+are promoted to forced admission without duplicating work; completed reviews and
+uncertain publication are not replayed. New or edited nonempty human discussion
+can admit a separate review round on the same head; unchanged discussion coalesces.
+The reviewer receives all paginated PR comments, inline replies and formal reviews
+with a chronological index. Before accepting a decision, the coordinator verifies
+a discussion-assessment ledger covering every nonempty item, including dispositions,
+rationale and evidence for substantive conclusions. Authors and previous reviewers
+are held to the same evidence standard. Documented design choices are evaluated
+against their actual contracts, rather than treating the previous bot verdict as
+authority. Before an unattempted formal publication, changed human discussion
+supersedes the saved assessment and queues a fresh context round. Each round has
+separate markers and publication fences; bot output cannot cause review loops.
 
 All phases and retries of a task share its Go build/module caches. Stage `tmp`
 and task `cache` are disposable: save validation logs, reports and evidence in
@@ -276,7 +297,7 @@ REST: `GET /api/pools`, `POST /api/pools/review` or `/api/pools/worker` with `{"
 
 ## Own-PR admission
 
-An own PR without a published formal review on its current commit can enter review
+An own PR without an authenticated, marked bot review on its current commit can enter review
 while CI is pending, missing or failed. A new head starts a new review identity;
 reviews on previous commits do not suppress it. Draft/exclusion/mergeability gates
 remain. Own assessments publish formal COMMENT reviews with exact-head markers.
@@ -330,3 +351,8 @@ Independent environment/flaky CI failures (including transient GitHub API and
 proven flaky TLS/network failures) do not automatically create GitHub issues.
 The default `worker.cause_issues = false` retains causal evidence and bounded
 approved reruns; uncertain previous writes still require reconciliation.
+
+Ordinary manual reviews, including `COMMENTED` reviews by the configured reviewer,
+do not satisfy bot review admission. Bot review markers must identify the exact
+head, a service/job and review state, and be authored by the configured reviewer.
+Previously used bot service identities still count.
