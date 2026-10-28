@@ -1,6 +1,6 @@
 ---
 name: issue-to-pr
-description: Explicit-only general issue-resolution workflow with evidence reuse, gpt-6.1-sol/xhigh design and final review, implementation, validation, and PR delivery. Use only when the user explicitly invokes $issue-to-pr; ordinary issue, bug, review, or optimization requests do not activate it.
+description: Explicit-only general issue-resolution workflow with evidence reuse, gpt-6.1-terra/max design and final review, implementation, validation, and PR delivery. Use only when the user explicitly invokes $issue-to-pr; ordinary issue, bug, review, or optimization requests do not activate it.
 ---
 
 # Issue to PR
@@ -16,9 +16,9 @@ For direct user invocation, the agent owns the authorized workflow and delivery 
 ## Roles and scope
 
 - In direct mode, the current agent owns investigation, reproduction, implementation, QA challenges, validation, and authorized delivery. Coordinator-assigned ownership follows the worker contract above.
-- **The `gpt-6.1-sol` model with `xhigh` reasoning must produce the solution/design before implementation and perform the final overall review before submission.** These gates apply to every task using this skill, not only complex issues.
+- **The `gpt-6.1-terra` model with `max` reasoning must produce the solution/design before implementation and perform the final overall review before submission.** These gates apply to every task using this skill, not only complex issues.
 - Use a supported delegation or CLI interface that explicitly selects the model and reasoning effort. Record the actual model, effort, reviewed revision, and review artifact/session ID. Do not infer model selection from a prompt or claim that current-agent self-review satisfies a separately requested model review.
-- Discover an available invocation mechanism once and reuse it. If `gpt-6.1-sol` with `xhigh` reasoning is unavailable, report the exact missing capability and request an alternative; continue independent investigation but do not silently bypass either gate.
+- Discover an available invocation mechanism once and reuse it. If `gpt-6.1-terra` with `max` reasoning is unavailable, report the exact missing capability and request an alternative; continue independent investigation but do not silently bypass either gate.
 - Honor the user's existing authorization. Invocation does not authorize unrelated changes, deployment, merging, or destructive operations. A fix-to-PR request includes ordinary commits, pushes, and PR creation; a diagnosis-only request ends with evidence and recommendations.
 - Use repository instructions and relevant domain skills for build, platform prerequisites, testing, and PR templates. Do not create new universal requirements from one repository's conventions.
 
@@ -46,7 +46,7 @@ Reproduce through the public interface and trace the real code boundary where fe
 
 Each experiment must answer an unresolved question or challenge a specific assumption. Stop exploration once the causal explanation and acceptance boundary are sufficient for design. Do not reopen rejected hypotheses without new evidence.
 
-### 2. gpt-6.1-sol / xhigh solution and design
+### 2. gpt-6.1-terra / max solution and design
 
 Provide the model with scope, exact source revision, relevant code, reproduced behavior, controls, confirmed facts, rejected hypotheses, evidence IDs, and unresolved questions. Ask it to design from this evidence and inspect the causal code; do not ask it to repeat completed discovery.
 
@@ -71,13 +71,13 @@ Challenge the fix using realistic inputs and execution paths that could falsify 
 
 Cover plausible neighboring defects in the same mechanism. Expand implementation only when a concrete counterexample or reachable contract violation justifies it. Record why an apparent theoretical risk cannot occur when established system invariants exclude it.
 
-### 5. gpt-6.1-sol / xhigh overall review and correction loop
+### 5. gpt-6.1-terra / max overall review and correction loop
 
-Give `gpt-6.1-sol` with `xhigh` reasoning the complete change map, current diff/revision, accepted design, surrounding production boundaries, QA counterexamples, and evidence ledger. Require an overall review of design, correctness, performance, unhappy paths, compatibility, and test quality. Request actionable findings with location, trigger, impact, evidence, and a proposed correction; distinguish confirmed defects from unproven concerns.
+Give `gpt-6.1-terra` with `max` reasoning the complete change map, current diff/revision, accepted design, surrounding production boundaries, QA counterexamples, and evidence ledger. Require an overall review of design, correctness, performance, unhappy paths, compatibility, and test quality. Request actionable findings with location, trigger, impact, evidence, and a proposed correction; distinguish confirmed defects from unproven concerns.
 
-Resolve material findings, explain rejected findings with evidence, and validate affected paths. Return to `gpt-6.1-sol` with `xhigh` reasoning for re-review. Re-review focuses on new changes and invalidated conclusions while reconciling them with the entire design; a delta review must not omit cross-component interactions. Unchanged, still-valid review evidence remains usable.
+Resolve material findings, explain rejected findings with evidence, and validate affected paths. Return to `gpt-6.1-terra` with `max` reasoning for re-review. Re-review focuses on new changes and invalidated conclusions while reconciling them with the entire design; a delta review must not omit cross-component interactions. Unchanged, still-valid review evidence remains usable.
 
-Converge when acceptance criteria are met, relevant checks pass, and `gpt-6.1-sol` with `xhigh` reasoning reports no unresolved material blocker. Do not invent work to fill review rounds. If the same unresolved finding recurs without new evidence or progress, identify the missing experiment/decision instead of repeating the review blindly.
+Converge when acceptance criteria are met, relevant checks pass, and `gpt-6.1-terra` with `max` reasoning reports no unresolved material blocker. Do not invent work to fill review rounds. If the same unresolved finding recurs without new evidence or progress, identify the missing experiment/decision instead of repeating the review blindly.
 
 ### 6. Deliver
 
@@ -95,7 +95,7 @@ Use the repository PR template. Describe the final problem and behavior, causal 
 
 Commit, push, and create/update the PR when within the user's authorized scope. Verify remote revision and publication once. Do not rebase merely to chase the latest base; rebase when requested or needed to resolve a real dependency/conflict. If rebasing, invalidate only evidence affected by changed dependencies.
 
-Report the PR, revision, `gpt-6.1-sol` / `xhigh` design and review evidence, key validation, and remaining checks. Do not claim pending CI passed. Wait or monitor CI only when requested or required by the agreed completion criterion.
+Report the PR, revision, `gpt-6.1-terra` / `max` design and review evidence, key validation, and remaining checks. Do not claim pending CI passed. Wait or monitor CI only when requested or required by the agreed completion criterion.
 
 ## No duplicate exploration or validation
 

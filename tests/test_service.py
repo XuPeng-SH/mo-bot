@@ -113,8 +113,14 @@ class TestWorkflow(unittest.TestCase):
             self.service.artifacts.future.result(timeout=5)
         self.assertFalse((directory / "tmp").exists())
 
-    def test_owner_wip_blocks_review_launch_and_publication_before_writes(self):
+    def test_owner_wip_blocks_automatic_review_launch_and_publication_before_writes(
+        self,
+    ):
         job = self.job()
+        self.store.update(
+            job["id"], metadata=json.dumps({**candidate(), "forced": False})
+        )
+        job = self.store.job(job["id"])
         self.gh.pr.return_value["user"] = {"login": "me"}
         self.gh.pr.return_value["labels"] = [{"name": "do-not-merge/wip"}]
         self.service.launch(self.store.slots()[0], job)
@@ -132,8 +138,12 @@ class TestWorkflow(unittest.TestCase):
         self.service.publish(self.store.job(job["id"]))
         self.assertEqual(self.store.job(job["id"])["state"], "done")
 
-    def test_owner_wip_interrupt_is_a_resumable_wait_even_for_forced_review(self):
+    def test_owner_wip_interrupt_is_a_resumable_wait_for_automatic_review(self):
         job = self.job()
+        self.store.update(
+            job["id"], metadata=json.dumps({**candidate(), "forced": False})
+        )
+        job = self.store.job(job["id"])
         self.store.update(job["id"], state="reviewing", slot_id=0, attempts=99)
         turn = Mock(completed=True, model="fake", effort="xhigh")
         turn.result.side_effect = RuntimeError("owner-wip")
@@ -201,6 +211,78 @@ class TestWorkflow(unittest.TestCase):
         finally:
             other.close()
 
+    def test_force_upgrades_existing_automatic_task_and_ignores_discovery_filters(self):
+        job = self.job()
+        self.store.update(
+            job["id"],
+            metadata=json.dumps({**candidate(), "forced": False}),
+            error="owner-wip",
+            retry_at=time.time() + 60,
+        )
+        self.gh.api.return_value = {
+            **self.gh.pr.return_value,
+            "user": {"login": "me"},
+            "labels": [{"name": "do-not-merge/wip"}],
+            "draft": True,
+        }
+        result = self.service.command("enqueue", {"pr": 1, "force": True})
+        self.assertEqual(result["job"]["id"], job["id"])
+        self.assertTrue(json.loads(result["job"]["metadata"])["forced"])
+        self.assertIsNone(result["job"]["error"])
+        self.assertEqual(result["job"]["retry_at"], 0)
+        for reason in (
+            "owner-wip",
+            "already-reviewed",
+            "merge-only-reviewed",
+            "explicitly-excluded",
+            "draft",
+            "not-green",
+        ):
+            self.service.scan(
+                {
+                    "heads": {"1": job["head"]},
+                    "candidates": [],
+                    "admission": {
+                        "1": {
+                            "head": job["head"],
+                            "state": "excluded",
+                            "reason": reason,
+                        }
+                    },
+                }
+            )
+            self.assertEqual(self.store.job(job["id"])["state"], "queued")
+            self.assertIn(job["id"], self.service.eligible)
+        # Force does not make a frozen review valid after its PR head changes.
+        self.service.scan({"heads": {"1": "b" * 40}, "candidates": [], "admission": {}})
+        self.assertEqual(self.store.job(job["id"])["state"], "superseded")
+
+    def test_force_admits_wip_draft_and_publishes_despite_policy_wait(self):
+        self.gh.api.return_value = {
+            **self.gh.pr.return_value,
+            "user": {"login": "me"},
+            "labels": [{"name": "do-not-merge/wip"}],
+            "draft": True,
+        }
+        result = self.service.command("enqueue", {"pr": 1, "force": True})
+        self.assertTrue(result["enqueued"])
+        job = self.store.job(result["job"]["id"])
+        self.gh.pr.return_value = self.gh.api.return_value
+        self.service.backend = Mock()
+        self.gh.owned_marker.return_value = {"state": "reviewing"}
+        self.gh.ensure_comment.return_value = {"id": 99}
+        self.gh.evidence.return_value = {}
+        self.service.launch(self.store.slots()[0], job)
+        self.workspace.prepare.assert_called_once()
+        self.gh.ensure_comment.assert_called_once()
+        self.service.save_result(
+            job, self.store.slots()[0], assessment(job), "fake", "xhigh"
+        )
+        self.service.eligible.discard(job["id"])
+        self.service.publish(self.store.job(job["id"]))
+        self.gh.submit_review.assert_called_once()
+        self.assertEqual(self.store.job(job["id"])["state"], "done")
+
     def test_force_is_not_a_duplicate_review_override(self):
         self.gh.api.return_value = self.gh.pr.return_value
         first = self.service.command("enqueue", {"pr": 1, "force": True})
@@ -209,6 +291,44 @@ class TestWorkflow(unittest.TestCase):
         self.assertFalse(second["enqueued"])
         self.assertEqual(first["job"]["id"], second["job"]["id"])
         self.assertEqual(len(self.store.jobs()), 1)
+
+    def test_merge_only_skipped_job_can_be_forced_without_replaying_remote_effects(
+        self,
+    ):
+        job = self.job()
+        self.store.update(
+            job["id"], metadata=json.dumps({**candidate(), "forced": False})
+        )
+        self.service.scan(
+            {
+                "heads": {"1": job["head"]},
+                "candidates": [],
+                "admission": {
+                    "1": {
+                        "head": job["head"],
+                        "state": "excluded",
+                        "reason": "merge-only-reviewed",
+                    }
+                },
+            }
+        )
+        self.assertEqual(self.store.job(job["id"])["state"], "superseded")
+        self.gh.api.return_value = self.gh.pr.return_value
+        result = self.service.command("enqueue", {"pr": 1, "force": True})
+        self.assertTrue(result["enqueued"])
+        self.assertEqual(result["job"]["state"], "queued")
+        self.assertTrue(json.loads(result["job"]["metadata"])["forced"])
+        self.assertIn(job["id"], self.service.eligible)
+        # A previously claimed/published task retains its reconciliation fence.
+        self.store.update(
+            job["id"],
+            state="superseded",
+            error="merge-only-reviewed",
+            claim_attempted=1,
+        )
+        result = self.service.command("enqueue", {"pr": 1, "force": True})
+        self.assertFalse(result["enqueued"])
+        self.assertEqual(result["job"]["state"], "superseded")
 
     def test_remote_done_prevents_review_after_database_loss(self):
         self.gh.find_comment.return_value = {"id": 99}
@@ -408,6 +528,12 @@ class TestWorkflow(unittest.TestCase):
         self.assertIn(review_instructions(), prompt)
         self.assertIn(job["head"], prompt)
         self.assertIn(job["id"], prompt)
+        self.assertEqual(
+            self.service.backend.start.call_args.args[4]["properties"]["decision"][
+                "enum"
+            ],
+            ["approve", "request_changes"],
+        )
 
         manifest = json.loads(
             (self.root / "jobs" / job["id"] / "attempt-1/evidence.json").read_text()
@@ -416,6 +542,37 @@ class TestWorkflow(unittest.TestCase):
         self.assertEqual(manifest["local_validation"][0]["job_id"], key)
         self.assertEqual(manifest["local_validation"][0]["candidate_head"], job["head"])
         self.assertIn("local_validation", prompt)
+
+    def test_review_selects_one_repository_skill_from_the_assigned_checkout(self):
+        self.service.backend = Mock(dead=False)
+        self.gh.evidence.return_value = {}
+        canonical = self.root / ".agents/skills/mo-self-review/SKILL.md"
+        legacy = self.root / ".claude/skills/mo-self-review/SKILL.md"
+        for number, (paths, selected) in enumerate(
+            (
+                ([canonical, legacy], canonical),
+                ([canonical], canonical),
+                ([legacy], legacy),
+                ([], "none in this checkout"),
+            ),
+            1,
+        ):
+            with self.subTest(selected=str(selected), available=len(paths)):
+                for path in (canonical, legacy):
+                    path.unlink(missing_ok=True)
+                for path in paths:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text("Repository-specific review rules")
+                job = self.job(pr=number)
+                self.store.update(job["id"], comment_id=99)
+                self.service.launch(self.store.slots()[0], self.store.job(job["id"]))
+                prompt = self.service.backend.start.call_args.args[3]
+                entries = [
+                    line
+                    for line in prompt.splitlines()
+                    if line.startswith("Repository review entry:")
+                ]
+                self.assertEqual(entries, [f"Repository review entry: {selected}."])
 
     def test_new_review_loads_edited_skill_without_restart(self):
         skill = self.root / "SKILL.md"
@@ -459,7 +616,23 @@ class TestWorkflow(unittest.TestCase):
                     decision=decision,
                     findings=[finding] if decision == "request_changes" else [],
                 )
-                self.service.save_result(job, self.store.slots()[0], result)
+                if decision == "needs_validation":
+                    # Already-checkpointed historical assessments still publish;
+                    # they must not pass through the new-result admission gate.
+                    self.store.update(
+                        job["id"],
+                        state="publishing",
+                        result=json.dumps(
+                            {
+                                "assessment": result,
+                                "session_id": "old-thread",
+                                "slot": 0,
+                                "generation": 0,
+                            }
+                        ),
+                    )
+                else:
+                    self.service.save_result(job, self.store.slots()[0], result)
                 self.service.eligible.add(job["id"])
                 self.service.publish(self.store.job(job["id"]))
                 self.assertEqual(self.gh.submit_review.call_args.args[1], event)
@@ -488,6 +661,10 @@ class TestWorkflow(unittest.TestCase):
 
     def test_publication_admission_wait_is_visible_paced_and_reuses_assessment(self):
         job = self.job()
+        self.store.update(
+            job["id"], metadata=json.dumps({**candidate(), "forced": False})
+        )
+        job = self.store.job(job["id"])
         self.service.save_result(job, self.store.slots()[0], assessment(job))
         saved_result = self.store.job(job["id"])["result"]
         self.service.admission["1"] = {
@@ -596,6 +773,19 @@ class TestWorkflow(unittest.TestCase):
                     self.store.slots()[0],
                     dict(assessment(job), decision=decision, findings=findings),
                 )
+
+    def test_new_needs_validation_result_cannot_reach_publication(self):
+        job = self.job()
+        with self.assertRaisesRegex(ValueError, "invalid result enum"):
+            self.service.save_result(
+                job,
+                self.store.slots()[0],
+                dict(assessment(job), decision="needs_validation"),
+            )
+        saved = self.store.job(job["id"])
+        self.assertEqual(saved["state"], "queued")
+        self.assertIsNone(saved["result"])
+        self.gh.submit_review.assert_not_called()
 
     def test_existing_database_migrates_without_replaying_completed_jobs(self):
         job = self.job()
@@ -717,6 +907,102 @@ class TestWorkflow(unittest.TestCase):
                 workspace=self.workspace,
             )
         self.assertEqual([dict(s) for s in self.store.slots()], before)
+
+    def test_fresh_review_retry_pins_new_threads_and_retains_identity(self):
+        for number, slot in ((1, 0), (2, 1)):
+            job = self.job(pr=number)
+            self.store.update(
+                job["id"],
+                state="failed",
+                attempts=3,
+                comment_id=99 + number,
+                claim_attempted=1,
+            )
+            result = self.service.command(
+                "retry_job", {"job_id": job["id"], "fresh_session": True}
+            )
+            self.assertEqual(result["state"], "queued")
+            self.assertEqual(result["slot_id"], slot)
+            self.assertEqual(result["attempts"], 3)
+            self.assertEqual(result["comment_id"], 99 + number)
+            self.assertEqual(result["data"]["review_recovery_base"], 3)
+            selected = self.store.slots()[slot]
+            self.assertIsNone(selected["session_id"])
+            self.assertEqual(selected["ready"], 0)
+            self.assertEqual(selected["generation"], 1)
+            self.assertIn(job["id"], self.service.eligible)
+        # A slot cannot steal a task reserved for the other fresh thread.
+        self.store.slot_update(1, ready=1, session_id="new-1")
+        claimed = self.store.claim(1, self.service.eligible)
+        self.assertEqual(claimed["pr"], 2)
+        self.gh.submit_review.assert_not_called()
+
+    def test_fresh_review_retry_refuses_unsafe_replay_without_slot_changes(self):
+        job = self.job()
+        self.store.update(job["id"], state="failed", comment_id=99)
+        before = [dict(s) for s in self.store.slots()]
+        for fields in (
+            {"review_attempted": 1},
+            {"review_id": 77},
+            {"review_event": "APPROVE"},
+            {"result": "{}"},
+            {"state": "done"},
+        ):
+            with self.subTest(fields=fields):
+                self.store.update(job["id"], **fields)
+                with self.assertRaises(ValueError):
+                    self.service.command(
+                        "retry_job", {"job_id": job["id"], "fresh_session": True}
+                    )
+                self.store.update(
+                    job["id"],
+                    state="failed",
+                    result=None,
+                    review_attempted=0,
+                    review_id=None,
+                    review_event=None,
+                )
+        self.gh.find_review.return_value = {"id": 88}
+        with self.assertRaisesRegex(ValueError, "remote review"):
+            self.service.command(
+                "retry_job", {"job_id": job["id"], "fresh_session": True}
+            )
+        self.gh.find_review.return_value = None
+        self.gh.pr.return_value["head"]["sha"] = "changed"
+        with self.assertRaises(RuntimeError):
+            self.service.command(
+                "retry_job", {"job_id": job["id"], "fresh_session": True}
+            )
+        self.assertEqual([dict(s) for s in self.store.slots()], before)
+        self.assertEqual(self.store.job(job["id"])["state"], "failed")
+
+    def test_fresh_review_retry_waits_for_idle_slot_and_recovery_budget_renews(self):
+        job = self.job()
+        self.store.update(job["id"], state="failed", attempts=3, comment_id=99)
+        self.service.turns = {
+            0: (Mock(completed=False), None),
+            1: (Mock(completed=False), None),
+        }
+        with self.assertRaisesRegex(ValueError, "no idle"):
+            self.service.command(
+                "retry_job", {"job_id": job["id"], "fresh_session": True}
+            )
+        self.service.turns.clear()
+        self.service.command("retry_job", {"job_id": job["id"], "fresh_session": True})
+        slot = self.store.slots()[0]
+        self.service.backend = Mock(dead=False)
+        self.service.backend.session.return_value = (
+            {"thread": {"id": "new-thread"}},
+            False,
+        )
+        self.service.open_session(slot)
+        self.assertEqual(self.store.slots()[0]["session_id"], "new-thread")
+        self.assertIsNone(self.service.backend.session.call_args.args[0]["session_id"])
+        self.service.turns.clear()  # Complete the mocked warmup before dispatch.
+        self.gh.evidence.return_value = {}
+        self.service.launch(self.store.slots()[0], self.store.job(job["id"]))
+        self.assertEqual(self.store.job(job["id"])["attempts"], 4)
+        self.assertEqual(self.service.turns[0][1], job["id"])
 
     def test_online_resize_reuses_sessions_and_persists_over_startup_defaults(self):
         first = self.service.command("resize_pool", {"role": "review", "sessions": 3})
@@ -1076,14 +1362,23 @@ class TestWorkflow(unittest.TestCase):
         ):
             self.service.scan(discover(self.config))
             self.assertIn(job["id"], self.service.eligible)
-            pr["reviews"]["nodes"] = [
-                {
-                    "author": {"login": "me"},
-                    "state": "CHANGES_REQUESTED",
-                    "commit": {"oid": job["head"]},
-                    "submittedAt": now,
-                }
-            ]
+            # Ordinary decisive reviews must not suppress this bot's review.
+            for state in ("APPROVED", "CHANGES_REQUESTED", "COMMENTED"):
+                pr["reviews"]["nodes"] = [
+                    {
+                        "author": {"login": "me"},
+                        "state": state,
+                        "commit": {"oid": job["head"]},
+                        "body": "Manual review",
+                        "submittedAt": now,
+                    }
+                ]
+                self.service.scan(discover(self.config))
+                self.assertIn(job["id"], self.service.eligible)
+            pr["reviews"]["nodes"][0].update(
+                state="CHANGES_REQUESTED",
+                body="Assessment\n" + marker("test-bot", job, "review"),
+            )
             self.service.scan(discover(self.config))
         self.assertEqual(self.store.job(job["id"])["state"], "superseded")
         self.assertIsNone(self.store.claim(0, self.service.eligible))

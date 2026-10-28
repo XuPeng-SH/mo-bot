@@ -508,7 +508,7 @@ SCHEMA = {
         "head_sha": {"type": "string"},
         "decision": {
             "type": "string",
-            "enum": ["approve", "request_changes", "needs_validation"],
+            "enum": ["approve", "request_changes"],
         },
         "summary": {"type": "string"},
         "findings": {

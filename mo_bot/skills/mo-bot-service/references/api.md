@@ -15,6 +15,7 @@ Default address: `http://127.0.0.1:8989`. Every request requires `Authorization:
 | `GET /api/alerts` | Publication errors/manual fences and native inactivity warnings |
 | `POST /api/service/drain` / `resume` with `{"reason":"…"}` | Persisted dispatch/publication pause; active turns finish into checkpoints |
 | `POST /api/jobs/JOB_ID/pause` / `resume` / `retry` with `{}` | Checkpoint pause/resume or reconcile saved publication; worker resume/retry accept optional `{"hint":"…"}` for the next model turn |
+| `POST /api/jobs/JOB_ID/retry` with `{"fresh_session":true}` | Retry a stopped failed unpublished review on the unchanged open head; rotate an idle review thread and reserve it for the same job/comment. Refuses publication uncertainty or existing reviews. CLI: `retry JOB_ID --fresh-session` |
 | `POST /api/jobs/JOB_ID/cleanup` with `{}` | Cancel stopped task, free resources, retain evidence; uncertain effects are refused |
 | `POST /api/jobs/JOB_ID/rerun` with `{"run_id":123}` | Frozen approved current-head Actions rerun, with cause issues and outbox/budget guards |
 | `POST /api/jobs/JOB_ID/guide` with `{"text":"…"}` | Durable worker task guidance through shared Luna xhigh harness; inspect `data.harness_request` / `harness_result` for eventual action, question or fallback |
@@ -45,7 +46,7 @@ One durable job/comment does not guarantee exactly-once physical model execution
 
 Job status includes `review_event`, `review_attempted` and `review_id`, alongside the existing `comment_id`/`comment_state`. A `done` job published under the current policy has a marked, commit-pinned GitHub review and a final status comment. Legacy completed jobs may have no review ID and are not replayed.
 
-The review policy is maintained in the repository's `mo-bot-review` skill. Approvals map to APPROVE, confirmed findings to REQUEST_CHANGES, and material validation gaps to COMMENT. Own PRs always receive COMMENT while retaining the assessment. Force enqueue can publish both a formal review and the status comment; it never bypasses per-head uniqueness.
+The review policy is maintained in the repository's `mo-bot-review` skill. New assessments choose approve or request_changes: supported approvals map to APPROVE; actionable defects and demonstrated unmet required validation contracts map to REQUEST_CHANGES. Historical needs_validation results map to COMMENT. Own PRs always receive COMMENT while retaining the assessment. Force enqueue can publish both a formal review and the status comment; same-head re-review requires changed nonempty human discussion and receives a new durable context identity. It never replays a completed publication.
 
 A durable `review_attempted=1` fences a non-idempotent POST. If its response is uncertain, the scheduler reads authenticated service/job/head review markers. A matching terminal review resumes the saved transaction; an absent or mismatched marker requires manual reconciliation and is never blindly POSTed again. Status reads do not authorize reconciliation writes. An already-submitted review may remove the PR from discovery eligibility; status-comment completion still proceeds without rerunning the model.
 
@@ -114,3 +115,14 @@ slots. Transport is stdio over SSH; REST remains loopback local.
 For a failed worker, `POST /api/jobs/JOB_ID/retry` with `{"from_input":true}` preserves prior diagnostics/source archives and restarts the same job/comment from its frozen input at design or triage. Existing implementation/final validation is not reused. Active tools, done/superseded tasks and attempted remote effects are rejected. Omit `from_input` to restore a preserved source at its existing phase.
 
 Worker resume/retry accept `hint` (up to 8,000 characters); it is task-scoped, durable across turns, and an empty string clears it. Active turns use session chat/steer. Publishing has no model turn and refuses hints; write reconciliation remains separate. Transport failures retain automatic publication backoff. A new PR head supersedes an unpublished assessment. Same-head observations coalesce into the existing unattempted task and are coordinated at a checkpoint; `data.pending_evidence_count` reports their count in summaries, while the full job retains `pending_input`. Source and reviewed candidate refs survive continuation. Attempted remote effects retain reconciliation fences.
+
+Explicit review enqueue (`force=true`) overrides WIP/draft/exclusion/CI and
+already-reviewed/merge-only-reviewed admission through launch and publication. It promotes an active
+automatic task to forced admission; it does not replay completed or uncertain
+publications. Automatic already-reviewed detection requires an authenticated bot
+review marker matching the exact current head; ordinary reviews do not count.
+The `merge-only-reviewed` exception instead proves that the authenticated marked
+earlier head changed solely by clean default-branch merges, recomputing each tree.
+Admission retains `reviewed_head`, without publishing a review on the new SHA.
+A new/edited nonempty human comment can admit a distinct same-head contextual round; unchanged discussions coalesce. Per-head/context uniqueness and per-job publication fences remain. Force can revive an unclaimed task skipped solely by this rule; prior attempted
+remote effects retain their existing reconciliation fence.

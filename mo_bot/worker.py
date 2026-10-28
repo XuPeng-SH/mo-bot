@@ -9,7 +9,13 @@ from urllib.parse import quote, urlencode
 from pathlib import Path
 
 from .codex import SourceChanged, completed_result
-from .config import CLASSIFIER_EFFORT, CLASSIFIER_MODEL
+from .config import (
+    CLASSIFIER_EFFORT,
+    CLASSIFIER_MODEL,
+    DELIVERY_GATE_EFFORT,
+    DELIVERY_GATE_MODEL,
+    accepted_delivery_gate,
+)
 from .discovery import Discovery
 from .evidence import completed_checks
 from .review_queue import OwnerWip, owner_wip
@@ -711,6 +717,7 @@ class Worker:
             j["id"]
             for j in active
             if self.s.admission.get(str(j["pr"]), {}).get("reason") == "owner-wip"
+            and not (j["kind"] == "review" and json.loads(j["metadata"]).get("forced"))
         )
 
     def scan(self, own_prs, assigned_issues=(), issue_error=None):
@@ -1307,7 +1314,7 @@ class Worker:
     def model_slot(self, slot, phase):
         selected = dict(slot)
         if phase in ("design", "final_review"):
-            selected.update(model="gpt-6.1-sol", effort="xhigh")
+            selected.update(model=DELIVERY_GATE_MODEL, effort=DELIVERY_GATE_EFFORT)
         selected["source_write"] = phase == "implement"
         model = next(
             (
@@ -1630,7 +1637,7 @@ Return every schema field. causes holds independently proven environment/flaky a
             raise ValueError("worker result identity mismatch")
         expected = dict(slot)
         if job["phase"] in ("design", "final_review"):
-            expected.update(model="gpt-6.1-sol", effort="xhigh")
+            expected.update(model=DELIVERY_GATE_MODEL, effort=DELIVERY_GATE_EFFORT)
         if (model, effort) != (expected["model"], expected["effort"]):
             raise ValueError("worker phase model provenance mismatch")
         data = json.loads(job["data"])
@@ -2300,14 +2307,13 @@ Return every schema field. causes holds independently proven environment/flaky a
         candidate = data["candidate"]
         final = data["final_review"]
         if (
-            final["model"] != "gpt-6.1-sol"
-            or final["effort"] != "xhigh"
+            not accepted_delivery_gate(final["model"], final["effort"])
             or final["result"]["candidate_head"] != candidate
             or not final["result"]["accepted"]
             or not final["result"]["validation_complete"]
             or final["result"]["findings"]
         ):
-            raise ValueError("delivery lacks exact candidate xhigh approval")
+            raise ValueError("delivery lacks exact candidate gate approval")
         branch = data["publication_ref"]
         self.ws.verify_publication(job, branch, candidate)
         actor = self.actor()

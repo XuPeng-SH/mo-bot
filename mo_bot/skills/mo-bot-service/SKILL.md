@@ -29,17 +29,33 @@ Default config is `~/.config/mo-bot/config.toml`. Override with `--config PATH` 
 
 ## Review policy
 
-Configured-owner PRs with `do-not-merge/wip` are excluded from both review and
-repair. Admission, task launch and publication recheck the policy; explicit
-enqueue/repair does not bypass it. An active task waits with its source and
-assessment retained, and label removal allows normal admission again. Operator
-paused tasks still need the existing explicit resume control.
+Configured-owner PRs with `do-not-merge/wip` are excluded from automatic review
+and repair. Explicit review enqueue overrides review policy filters, including
+WIP, draft, exclusion, CI and already-reviewed admission, through launch and
+publication. Repair retains its WIP restriction. Automatic tasks wait with their
+source/assessment retained; label removal allows normal admission again.
+Operator-paused tasks still need explicit resume.
 
 Review commentary and assessment reports are written in English, as required by the repository review/worker skills. Existing published assessments are not rewritten solely to change language.
 
 The repository's [mo-bot-review skill](../mo-bot-review/SKILL.md) owns reviewer prompt guidance and the decision/publication contract. The coordinator reads it for every new assigned review and snapshots the prompt for recovery. Edit that skill to change review guidance; do not maintain a parallel prompt in this operator skill. `scripts/install.py` installs both repository skills into agent discovery paths.
 
-The service submits `REQUEST_CHANGES` for confirmed findings, `APPROVE` for a supported approval, and `COMMENT` for material validation gaps. Own PRs without a published formal review on the current head are admitted without waiting for CI; draft/exclusion/mergeability gates still apply. Reviews on older heads do not suppress a new commit. Own PRs receive `COMMENT` regardless of assessment. A completed failed check/status admits repair while sibling checks/workflows are running, subject to the existing target fence and evidence deduplication. A completed legacy comment-only job is not replayed. Each new result produces at most one marked formal review plus its existing status comment.
+Each task selects its checkout's `.agents/skills/mo-self-review/SKILL.md`, or
+the `.claude` entry only when the former is absent, and records that path in the
+prompt. The repository owns engineering/domain rules; mo-bot-review owns the
+external-review procedure. Discussion bodies are read once through the complete
+index, with raw records available for extra context. Inspect the saved prompt
+and execution history when checking which rules actually ran.
+
+New reviews return only `request_changes` or `approve`, enforced by the generation schema and result validation. Actionable defects and demonstrated unmet required validation contracts map to `REQUEST_CHANGES`; supported approvals map to `APPROVE`. Historical `needs_validation` assessments remain readable and map to `COMMENT`. Own PRs without an authenticated, marked bot review on the current head are admitted without waiting for CI; draft/exclusion/mergeability gates still apply. Reviews on older heads do not suppress a new commit. Own PRs receive `COMMENT` regardless of assessment because GitHub prevents self-approval and self-requested changes. A completed failed check/status admits repair while sibling checks/workflows are running, subject to the existing target fence and evidence deduplication. A completed legacy comment-only job is not replayed. Each new result produces at most one marked formal review plus its existing status comment.
+
+Automatic discovery skips `merge-only-reviewed` heads when an authenticated,
+marked earlier bot review is followed solely by clean default-branch merges.
+Git recomputes each merge tree; conflict resolutions, extra edits, other feature
+commits, or missing proof retain normal review admission. The admission entry
+retains `reviewed_head`; this is not a published review or validation of the new
+SHA. Explicit force enqueue bypasses this rule, including an unclaimed task
+previously superseded solely for `merge-only-reviewed`.
 
 ## Review status and history
 
@@ -80,7 +96,8 @@ For completed jobs, report `result.assessment.decision`, summary/findings, actua
 
 ## Requested operations
 
-- Enqueue: `mo-botctl enqueue PR_NUMBER`. This is force admission: it bypasses CI/draft/author/exclusion filters and can start a review and publish a status comment and a formal GitHub review under the review policy. Execute when requested; a status request does not authorize enqueue. Same PR/head returns the existing job and does not repeat a review.
+- Enqueue: `mo-botctl enqueue PR_NUMBER`. This is force admission: it bypasses CI/draft/author/exclusion/WIP/already-reviewed filters and can start a review and publish a status comment and a formal GitHub review under the review policy. Execute when requested; a status request does not authorize enqueue. Same PR/head with unchanged discussion reuses the existing job and promotes active automatic jobs to forced admission. New or edited substantive human discussion after a completed review creates a separately marked contextual review round, retaining prior results and per-round write fences. Completed publications and uncertain writes are never replayed. Automatic discovery also admits such discussion updates subject to normal policy gates.
+- Fresh review retry: `mo-botctl retry JOB_ID --fresh-session` retries a failed, unpublished review on its unchanged open PR head using a new native thread in an idle enabled review slot. It retains job/comment identity and lifetime attempts, renews the bounded recovery allowance, and reserves that slot for the task. Saved assessments, attempted/uncertain publication, existing remote reviews and live/reserved slots are refused. Check the new session ID and actual turn; admission alone does not prove model authentication works.
 - Converse: `mo-botctl chat SLOT 'message'`. Idle chat occupies the slot; active chat steers its existing turn. Inspect job/head first to target the intended review. `events` streams live output; `history SLOT` retrieves the latest 20 native items; use `history SLOT --cursor CURSOR` with the returned `nextCursor` for older items.
 - Select model: inspect `models`, then `mo-botctl model SLOT MODEL --effort xhigh`. Change preserves thread/history and job/comment identity. A busy turn is interrupted and the same task continues via a native turn/start with the new model; idle switching starts a brief confirmation turn. Success means the native turn was started, not merely a database setting. In-flight requests are interrupted rather than hot-swapped.
 - Interrupt: `mo-botctl interrupt SLOT` only when requested. It cancels that turn and supersedes its current review task; it is not a transparent session recovery action.
@@ -103,7 +120,7 @@ The existing local `classifier` slot shares its reusable `gpt-6-luna/xhigh` sess
 
 Use `mo-botctl guide JOB_ID 'continue the missing validation / revise the invalid plan / pause …'` for task-level natural-language guidance. `POST /api/jobs/JOB_ID/guide` accepts `{"text":"…"}`. It applies to queued, running or failed worker tasks, never publishing/terminal completed tasks or attempted remote effects. Existing `chat SLOT`, `pause`, `resume`, `retry --hint` remain direct controls; prefer them for an urgent deterministic operation or when the semantic model is unavailable.
 
-Harness may steer the exact active turn, suggest concrete continuation, return an invalidated plan to the mandatory read-only xhigh design gate, ask for missing input, or route explicit operator pause/resume through existing controls. Its `wait` action identifies an unavailable external prerequisite and a readiness check. At a preserved, unleased checkpoint it uses the existing queued state and durable retry deadline (5 minutes to 1 hour), retaining source/evidence and releasing model capacity. Active work must checkpoint before waiting. `data.recovery_wait`, `wait_reason`, `next_retry_at` and alerts expose the prerequisite. New feedback, operator `guide`/resume/retry, or deadline expiry can resume the same task; a dependency wait is not an operator pause or permanent failure. Recover supported local setup before using wait. Automatic advice cannot pause; no recommendation approves, publishes, reruns CI or changes a frozen target. Low-confidence advice asks instead of acting. Blocked questions receive a bounded wait; active workers can continue independent work without assuming an answer. Check `job.data.harness_request` and `harness_result` for IDs, reason, deadline, action, explanation and execution status, also exposed in status summaries and `harness/result` events. An acknowledgement only queues advice; it is not proof that an action ran. Uncertain steering acknowledgements are reported without replaying the message.
+Harness may steer the exact active turn, suggest concrete continuation, return an invalidated plan to the mandatory read-only gpt-6.1-terra/max design gate, ask for missing input, or route explicit operator pause/resume through existing controls. Its `wait` action identifies an unavailable external prerequisite and a readiness check. At a preserved, unleased checkpoint it uses the existing queued state and durable retry deadline (5 minutes to 1 hour), retaining source/evidence and releasing model capacity. Active work must checkpoint before waiting. `data.recovery_wait`, `wait_reason`, `next_retry_at` and alerts expose the prerequisite. New feedback, operator `guide`/resume/retry, or deadline expiry can resume the same task; a dependency wait is not an operator pause or permanent failure. Recover supported local setup before using wait. Automatic advice cannot pause; no recommendation approves, publishes, reruns CI or changes a frozen target. Low-confidence advice asks instead of acting. Blocked questions receive a bounded wait; active workers can continue independent work without assuming an answer. Check `job.data.harness_request` and `harness_result` for IDs, reason, deadline, action, explanation and execution status, also exposed in status summaries and `harness/result` events. An acknowledgement only queues advice; it is not proof that an action ran. Uncertain steering acknowledgements are reported without replaying the message.
 
 Independent environment/flaky failures do not create GitHub issues by default (`worker.cause_issues=false`). This includes transient size-label GitHub API socket resets and proven flaky TLS/network failures. Keep logs, concrete control evidence, PR/task explanation and bounded approved reruns. An existing attempted cause-issue write still needs reconciliation; disabling new writes never drops an uncertainty fence. Do not enable cause-issue publication unless the operator explicitly requests it.
 
@@ -117,7 +134,7 @@ Uncertain matches and classifier/model failures remain separate issue jobs.
 Automatic PR discovery stays limited to the configured owner. Explicit assignments freeze operator authority and initial guidance in SQLite; workers execute that scope without requiring PR authorship. For another author's PR, the scheduler retains the original source identity and uses the operator's owned upstream fork for delivery, opening a marked repair PR against the original author's source branch. The original upstream PR number remains the task target. Saved reviews awaiting admission do not block repair execution; active review turns and uncertain review writes retain their fences. Inspect role, phase, error and native session in jobs/sessions.
 `[worker] sessions` controls delivery capacity; its default model is
 gpt-6.1-sol/low. Worker assignments live in repo-owned mo-bot-worker; the bundled
-issue-to-pr workflow owns shared requirements and mandatory xhigh design/final
+issue-to-pr workflow owns shared requirements and mandatory gpt-6.1-terra/max design/final
 gates. Do not bypass default-ref guards
 or retry uncertain GitHub writes manually.
 
@@ -127,7 +144,7 @@ Inspect `nodes` and each session's `node` before diagnosing remote execution.
 `GET /api/nodes` shows transport, endpoint, connectivity/cleanup errors and each
 remote account's model catalog; `/api/models` is the local catalog. History,
 progress, chat and model commands use the global slot ID and route to its original
-host. Worker mandatory design/final xhigh gates remain in force.
+host. Worker mandatory design/final gpt-6.1-terra/max gates remain in force.
 
 Only Codex runs remotely. Queue/SQLite/source/tests/Git/GitHub and API stay local;
 remote tools use `host_exec` back to the coordinator sandbox. Do not install a
@@ -197,7 +214,7 @@ cannot be blindly restored. Publication retry reconciles the existing outbox;
 it does not repeat the model task. Cleanup cancels a stopped task and frees its
 lease/ref, retaining diagnostics/source evidence. It refuses uncertain remote
 effects; reconcile first. Completed/superseded tasks cannot be replayed. Ordinary `retry` restores a preserved failed source and retains the current phase. If an older failure lacks a recoverable source checkpoint, explicitly use `mo-botctl retry JOB_ID --from-input`: it retains prior diagnostics/source archives, restarts the same job/comment at design (or triage) on the frozen input, and invalidates subsequent implementation/validation. It refuses attempted remote effects and live tools. Explicit retries reset interruption recovery counts while preserving lifetime attempt numbers. Incomplete worker assessments do not terminate delivery: blocked triage advances to the design gate, while blocked design/implementation continues its current phase with retained gaps and source. Unknown causes remain unapproved; missing validation must be investigated or executed, never treated as a pass. Worker correction and lifetime turn counts do not terminate delivery. An identical incomplete assessment for the same phase, source and gaps enters exponential backoff (one minute to one hour), preserves source, releases its model slot and reports an alert; the normal queue restores it when capacity is available. A changed candidate or rejection resets backoff. Explicit resume/retry can queue preserved source even when all worker slots are busy. Automatic admission remains bounded. An explicit `repair PR` can reconsider input after the automatic admission budget is exhausted and reuses an already active matching task. Rerun
-requires the actual frozen xhigh gate, approved run ID, verified causal evidence,
+requires the actual frozen delivery gate, approved run ID, verified causal evidence,
 current head/latest attempt and budget; repeated requests reconcile the same effect.
 
 Before deployment, `mo-botctl drain --reason 'deployment …'` freezes new turns and
@@ -221,3 +238,19 @@ source and model/node selection. No deletion or forced task cancellation.
 Report enabled capacity separately from draining work; temporary active work can
 exceed the new enabled capacity. Reenable before idle chat/model changes; active
 progress/steering remains available. Global deployment drain still blocks launches.
+
+## Discussion-aware review rounds
+
+All PR issue comments, inline review comments/replies and formal review bodies are
+paginated into frozen evidence with a chronological discussion_index. Automated
+notices and authenticated marked mo-bot output remain visible but cannot trigger
+review loops. New/edited substantive human discussion can reopen the same head;
+unchanged snapshots coalesce. An unattempted assessment whose discussion changed
+before publication is retained as superseded and a fresh context round is queued.
+Each round has its own job ID/markers and at most one formal review. Existing
+uncertain writes must be reconciled before another round is admitted.
+
+Frozen evidence includes up to 32 issue references from official closing links,
+PR prose and human discussion; unavailable or omitted context is marked. Before
+publication, changes to the PR body or linked issues supersede the saved result.
+Issue-only changes after publication do not automatically schedule a new review.

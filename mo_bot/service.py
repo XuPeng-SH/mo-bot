@@ -24,10 +24,17 @@ from .nodes import Nodes
 from .remote import CleanupPending, recover_host_tools
 from .harness import Harness
 from .github import GitHub
+from .review_context import (
+    inventory,
+    digest,
+    new_since,
+    validate_ledger,
+    linked_issue_digest,
+)
 from .store import Store
 from .worker import Worker
 from .discovery import Discovery
-from .config import CLASSIFIER_EFFORT, CLASSIFIER_MODEL
+from .config import CLASSIFIER_EFFORT, CLASSIFIER_MODEL, accepted_delivery_gate
 from .artifacts import Artifacts
 from .evidence import local_validation
 from .review_queue import OwnerWip, owner_wip
@@ -327,7 +334,10 @@ class Service:
         heads = snapshot["heads"]
         for job in self.store.jobs(("queued", "reviewing", "publishing")):
             status = admission.get(str(job["pr"]), {})
-            if status.get("reason") == "owner-wip":
+            forced_review = job["kind"] == "review" and json.loads(job["metadata"]).get(
+                "forced"
+            )
+            if status.get("reason") == "owner-wip" and not forced_review:
                 self.eligible.discard(job["id"])
                 for turn, key in self.turns.values():
                     if key == job["id"]:
@@ -344,7 +354,8 @@ class Service:
             elif (
                 not forced
                 and status.get("head") == job["head"]
-                and status.get("reason") in ("already-reviewed", "explicitly-excluded")
+                and status.get("reason")
+                in ("already-reviewed", "merge-only-reviewed", "explicitly-excluded")
                 and not job["review_attempted"]
             ):
                 reason = status["reason"]
@@ -357,10 +368,14 @@ class Service:
                 )
         for candidate in snapshot["candidates"]:
             key = self.store.key(
-                candidate["repo"], candidate["number"], candidate["headRefOid"]
+                candidate["repo"],
+                candidate["number"],
+                candidate["headRefOid"],
+                candidate.get("trigger_key", ""),
             )
             if not self.store.job(key):
-                self.store.enqueue(candidate)
+                if not self.store.enqueue(candidate):
+                    continue
                 LOG.info(
                     "discovered PR=%s head=%s job=%s",
                     candidate["number"],
@@ -373,7 +388,10 @@ class Service:
             for j in self.store.jobs(("queued", "reviewing", "publishing"))
             if json.loads(j["metadata"]).get("forced")
             and heads.get(str(j["pr"])) == j["head"]
-            and admission.get(str(j["pr"]), {}).get("reason") != "owner-wip"
+            and (
+                j["kind"] == "review"
+                or admission.get(str(j["pr"]), {}).get("reason") != "owner-wip"
+            )
         )
         self.last_scan_at = time.time()
         self.scan_error = None
@@ -415,7 +433,9 @@ class Service:
             return self.worker.launch(slot, job)
         if job:
             pr = self.github.pr(job)
-            if owner_wip(pr, self.config.reviewer):
+            if owner_wip(pr, self.config.reviewer) and not json.loads(
+                job["metadata"]
+            ).get("forced"):
                 self.eligible.discard(job["id"])
                 self.store.update(
                     job["id"], state="queued", slot_id=None, error="owner-wip"
@@ -439,7 +459,10 @@ class Service:
                     job["id"], state="superseded", error="PR changed before dispatch"
                 )
                 return
-            if job["attempts"] > self.config.max_recoveries:
+            if (
+                job["attempts"] - json.loads(job["data"]).get("review_recovery_base", 0)
+                > self.config.max_recoveries
+            ):
                 self.store.update(
                     job["id"], state="failed", error="recovery budget exhausted"
                 )
@@ -489,38 +512,45 @@ class Service:
             directory = self.job_dir(job) / f"attempt-{attempt}"
             directory.mkdir(parents=True, exist_ok=True)
             evidence = self.github.evidence(job, pr)
+            metadata = json.loads(job["metadata"])
+            if isinstance(evidence.get("discussion_digest"), str):
+                metadata["discussion_digest"] = evidence["discussion_digest"]
+            if isinstance(evidence.get("linked_issue_digest"), str):
+                metadata["linked_issue_digest"] = evidence["linked_issue_digest"]
+                metadata["linked_issue_complete"] = evidence["linked_issues"][
+                    "complete"
+                ]
+            self.store.update(job["id"], metadata=json.dumps(metadata))
+            job = self.store.job(job["id"])
             evidence["local_validation"] = local_validation(
                 self.store, self.config.state_dir, job
             )
             (directory / "evidence.json").write_text(json.dumps(evidence, indent=2))
             workspace, merge_base = self.workspace.prepare(slot_id, job, pr, directory)
+            repository_skill = next(
+                (
+                    path
+                    for path in (
+                        workspace / ".agents/skills/mo-self-review/SKILL.md",
+                        workspace / ".claude/skills/mo-self-review/SKILL.md",
+                    )
+                    if path.is_file()
+                ),
+                None,
+            )
             prompt = (
                 review_instructions()
                 + f"""\nYou are mo-bot reusable review slot {slot_id}, generation {slot["generation"]}.
 CURRENT TASK replaces any previous PR task: job={job["id"]}, repository={job["repo"]},
 PR={job["pr"]}, HEAD={job["head"]}, merge-base={merge_base}. Only these frozen sources
 and {directory}/evidence.json establish facts for this PR. Earlier PR facts are not evidence.
-Read {directory}/change.patch and surrounding owners/callers. Follow applicable
-mo-self-review instructions. Review the COMPLETE delta, design/ownership, correctness,
-performance, unhappy paths, compatibility, comments and test quality. Reuse valid exact-input
-CI/author evidence; run only checks that resolve concrete gaps. Missing evidence is not a pass.
-Read evidence.json's local_validation before executing tests. It carries same-repository,
-exact-candidate worker final gates and retained artifact inventories. Independently reconcile
-their command/source/exit receipts, logs and scope; an accepted gate is evidence, not your
-verdict. Failed-before controls and obsolete receipts may coexist with successful checks.
-Use retained native-input ledgers and validation environment files to identify compatible
-builds before rebuilding. Export the assigned task cache environment before invoking Go,
-including toolchain bootstrap; do not fall back to shared host caches. Read-only source
-does not prevent building prerequisites in the assigned writable diagnostic directory
-through the repository build owner. If setup fails, first recover matching evidence and
-prerequisites, continue source review and isolate the remaining behavioral gap. A local
-setup failure alone must not erase traceable validation of the current candidate.
-Source must remain unchanged. Put diagnostic artifacts only under {directory}; use its
-disk-backed tmp directory. Before native tests verify the current revision's native provenance
-through the repository build/test owner; retained artifacts may belong to an earlier PR.
-Do not spawn subagents, publish comments/reviews, mutate GitHub, rerun CI, commit, push or merge.
-The coordinator owns publication. Findings need location, concrete trigger, impact and evidence.
-Return the required JSON with job_id={job["id"]} and head_sha={job["head"]}; no speculative blockers.
+Repository review entry: {repository_skill or "none in this checkout"}.
+Change: {directory}/change.patch. Read the complete delta and relevant owners/consumers.
+Evidence: {directory}/evidence.json, including discussion_index, linked_issues and local_validation.
+Diagnostic directory: {directory}; keep review-plan.md, discussion-assessment.json, probes
+and validation evidence here. Use its disk-backed tmp directory and assigned task caches.
+Source must remain unchanged. Return the required JSON with job_id={job["id"]}
+and head_sha={job["head"]}; the coordinator owns publication.
 This is attempt {attempt} of the SAME logical job; consult earlier attempt artifacts in
 {directory.parent} to recover completed evidence instead of repeating it blindly.
 """
@@ -554,16 +584,22 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
         validate_result(result, SCHEMA)
         if result.get("job_id") != job["id"] or result.get("head_sha") != job["head"]:
             raise ValueError("review result identity mismatch")
-        if result.get("decision") not in (
-            "approve",
-            "request_changes",
-            "needs_validation",
-        ):
-            raise ValueError("invalid review decision")
         if bool(result["findings"]) != (result["decision"] == "request_changes"):
             raise ValueError(
                 "confirmed findings require request_changes; other decisions need no findings"
             )
+        if job["turn_dir"]:
+            directory = Path(job["turn_dir"])
+            evidence_path = directory / "evidence.json"
+            if evidence_path.exists():
+                rows = json.loads(evidence_path.read_text()).get("discussion_index")
+                if rows and any(row["body"].strip() for row in rows):
+                    ledger_path = directory / "discussion-assessment.json"
+                    if not ledger_path.exists():
+                        raise ValueError(
+                            "discussion-assessment.json is required before a review decision"
+                        )
+                    validate_ledger(rows, json.loads(ledger_path.read_text()))
         envelope = {
             "assessment": result,
             "model": actual_model or slot["model"],
@@ -676,7 +712,9 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
                         "queued"
                         if message == "owner-wip"
                         or (
-                            job["attempts"] <= self.config.max_recoveries
+                            job["attempts"]
+                            - json.loads(job["data"]).get("review_recovery_base", 0)
+                            <= self.config.max_recoveries
                             and not isinstance(error, SourceChanged)
                         )
                         else "failed"
@@ -716,7 +754,8 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
                 self.store.update(job["id"], error=None, retry_at=0)
             return
         pr = self.github.pr(job)
-        if owner_wip(pr, self.config.reviewer):
+        forced = json.loads(job["metadata"]).get("forced")
+        if owner_wip(pr, self.config.reviewer) and not forced:
             self.store.update(job["id"], error="owner-wip", retry_at=time.time() + 60)
             return
         if pr["state"] != "open" or pr["head"]["sha"] != job["head"]:
@@ -732,7 +771,11 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
                 error="head changed before publication",
             )
             return
-        if job["id"] not in self.eligible and not job["review_attempted"]:
+        if (
+            job["id"] not in self.eligible
+            and not job["review_attempted"]
+            and not forced
+        ):
             admission = self.admission.get(str(job["pr"]), {})
             author = (pr.get("user") or {}).get("login", "").casefold()
             own_authors = {
@@ -748,6 +791,79 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
                 # Retain the assessment; a policy wait needs no model replay or
                 # repeated GitHub read on every scheduler tick.
                 self.store.update(job["id"], retry_at=time.time() + 60)
+                return
+        metadata = json.loads(job["metadata"])
+        previous_digest = metadata.get("discussion_digest")
+        previous_issue_digest = metadata.get("linked_issue_digest")
+        if (previous_digest or previous_issue_digest) and not job["review_attempted"]:
+            current_digest, current_issue_digest = (
+                previous_digest,
+                previous_issue_digest,
+            )
+            discussion = None
+            if previous_digest:
+                discussion = self.github.discussion(job)
+                rows = inventory(discussion, self.github.author)
+                current_digest = digest(rows)
+            # A discussion change already requires a new review. Avoid an
+            # unrelated issue lookup before enqueuing that fresh snapshot.
+            if previous_issue_digest and current_digest == previous_digest:
+                issues = self.github.linked_issues(job, pr, discussion)
+                unavailable = "linked issue evidence unavailable before publication"
+                if (
+                    metadata.get("linked_issue_complete")
+                    and not issues["complete"]
+                    and job["error"] != unavailable
+                ):
+                    # Retry once for transient errors. If the evidence remains
+                    # unavailable, review a new snapshot that discloses that.
+                    self.store.update(
+                        job["id"],
+                        error=unavailable,
+                        retry_at=time.time() + 60,
+                    )
+                    return
+                current_issue_digest = linked_issue_digest(
+                    pr, issues, self.github.author
+                )
+            discussion_changed = current_digest != previous_digest
+            issue_changed = current_issue_digest != previous_issue_digest
+            if discussion_changed or issue_changed:
+                # Preserve the assessment and markers. Changed input is a new
+                # review round, not a replay of a non-idempotent POST.
+                reason = (
+                    "linked issue or PR description" if issue_changed else "discussion"
+                )
+                self.github.patch_comment(
+                    job,
+                    "superseded",
+                    f"Review {reason} changed before publication; a fresh contextual review is queued.",
+                )
+                self.store.update(
+                    job["id"],
+                    state="superseded",
+                    comment_state="superseded",
+                    error=f"{reason} changed before publication",
+                    slot_id=None,
+                )
+                trigger = (
+                    f"review-context:{current_digest or ''}:{current_issue_digest}"
+                    if issue_changed
+                    else "discussion:" + current_digest
+                )
+                candidate = {
+                    **metadata,
+                    "discussion_digest": current_digest,
+                    "linked_issue_digest": current_issue_digest,
+                    "context_review": True,
+                    "trigger_key": trigger,
+                }
+                self.store.enqueue(candidate)
+                key = self.store.key(
+                    job["repo"], job["pr"], job["head"], candidate["trigger_key"]
+                )
+                if self.store.job(key):
+                    self.eligible.add(key)
                 return
         envelope = json.loads(job["result"])
         text = report_text(envelope)
@@ -1273,7 +1389,7 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
                 ).fetchone()
                 if current or reserved:
                     raise ValueError(
-                        "worker model change requires idle slot; mandatory xhigh gates cannot be lowered"
+                        "worker model change requires idle slot; mandatory delivery gates cannot be lowered"
                     )
                 self.store.slot_update(slot["id"], model=model, effort=effort)
                 selected = next(s for s in self.store.slots() if s["id"] == slot["id"])
@@ -1372,8 +1488,6 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
             if args.get("force") is not True:
                 raise ValueError("manual admission requires explicit force=true")
             pr = self.github.api(f"repos/{self.config.repository}/pulls/{pr_number}")
-            if owner_wip(pr, self.config.reviewer):
-                raise OwnerWip("owner-wip")
             if pr["state"] != "open":
                 raise ValueError("only open PRs can be queued")
             candidate = {
@@ -1383,9 +1497,82 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
                 "forced": True,
             }
             key = self.store.key(candidate["repo"], pr_number, candidate["headRefOid"])
-            existing_job = self.store.job(key)
+            # Prefer a live/latest round over the legacy per-head job. Completed
+            # rounds are immutable; changed discussion receives its own identity.
+            rounds = [
+                j
+                for j in self.store.jobs()
+                if j["kind"] == "review"
+                and j["repo"] == candidate["repo"]
+                and j["pr"] == pr_number
+                and j["head"] == candidate["headRefOid"]
+            ]
+            existing_job = rounds[0] if rounds else None
             if existing_job:
-                return {"enqueued": False, "job": dict(existing_job)}
+                key = existing_job["id"]
+                if existing_job["state"] == "done":
+                    discussion = self.github.discussion(existing_job)
+                    rows = inventory(discussion, self.github.author)
+                    fingerprint = digest(rows)
+                    old_digest = json.loads(existing_job["metadata"]).get(
+                        "discussion_digest"
+                    )
+                    published_at = (
+                        next(
+                            (
+                                r.get("submitted_at")
+                                for r in discussion["reviews"]
+                                if r.get("id") == existing_job["review_id"]
+                            ),
+                            None,
+                        )
+                        or existing_job["updated"]
+                    )
+                    changed = (
+                        fingerprint != old_digest
+                        if old_digest
+                        else new_since(rows, published_at)
+                    )
+                    if changed:
+                        if self.store.review_uncertain(candidate["repo"], pr_number):
+                            raise ValueError(
+                                "prior review writes require reconciliation before contextual re-review"
+                            )
+                        candidate.update(
+                            context_review=True,
+                            discussion_digest=fingerprint,
+                            trigger_key="discussion:" + fingerprint,
+                        )
+                        key = self.store.key(
+                            candidate["repo"],
+                            pr_number,
+                            candidate["headRefOid"],
+                            candidate["trigger_key"],
+                        )
+                        existing_job = self.store.job(key)
+            if existing_job:
+                skipped_merge = (
+                    existing_job["state"] == "superseded"
+                    and existing_job["error"] == "merge-only-reviewed"
+                    and not existing_job["claim_attempted"]
+                    and not existing_job["review_attempted"]
+                    and not existing_job["comment_id"]
+                    and not existing_job["result"]
+                )
+                if (
+                    existing_job["state"] in ("queued", "reviewing", "publishing")
+                    or skipped_merge
+                ):
+                    metadata = json.loads(existing_job["metadata"])
+                    metadata["forced"] = True
+                    update = {"metadata": json.dumps(metadata)}
+                    if skipped_merge:
+                        update.update(state="queued", error=None, retry_at=0)
+                    if existing_job["error"] == "owner-wip":
+                        update.update(error=None, retry_at=0)
+                    self.store.update(key, **update)
+                    self.eligible.add(key)
+                return {"enqueued": skipped_merge, "job": dict(self.store.job(key))}
             remote = self.github.find_comment(
                 {
                     "id": key,
@@ -1654,6 +1841,7 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
                             continue
                         if (
                             self.store.job(job["id"])["attempts"]
+                            - json.loads(job["data"]).get("review_recovery_base", 0)
                             > self.config.max_recoveries
                         ):
                             self.store.update(
@@ -1718,6 +1906,69 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
             raise ValueError(
                 "publishing has no model turn; reconcile or use a fresh-input task"
             )
+        if "fresh_session" in args and type(args["fresh_session"]) is not bool:
+            raise ValueError("fresh_session must be a boolean")
+        if args.get("fresh_session"):
+            if (
+                action != "retry_job"
+                or job["kind"] != "review"
+                or job["state"] != "failed"
+                or current
+                or args.get("from_input")
+            ):
+                raise ValueError("fresh_session requires a stopped failed review")
+            if (
+                job["result"]
+                or job["review_attempted"]
+                or job["review_id"]
+                or job["review_event"]
+                or data.get("manual_reconciliation")
+            ):
+                raise ValueError(
+                    "saved or attempted publication requires reconciliation"
+                )
+            if job["claim_attempted"] and not job["comment_id"]:
+                raise ValueError("uncertain comment creation requires reconciliation")
+            pr = self.github.pr(job)
+            if pr["state"] != "open" or pr["head"]["sha"] != job["head"]:
+                raise SourceChanged("PR changed; cannot resume old review")
+            if owner_wip(pr, self.config.reviewer) and not json.loads(
+                job["metadata"]
+            ).get("forced"):
+                raise ValueError("owner-wip")
+            if self.github.find_review(job) is not None:
+                raise ValueError("remote review exists; reconcile before retry")
+            slot = next(
+                (
+                    s
+                    for s in self.store.slots()
+                    if s["role"] == "review"
+                    and s["enabled"]
+                    and s["id"] not in self.turns
+                    and not self.store.db.execute(
+                        "SELECT 1 FROM jobs WHERE slot_id=? AND state IN ('queued','reviewing','canceling','publishing')",
+                        (s["id"],),
+                    ).fetchone()
+                ),
+                None,
+            )
+            if slot is None:
+                raise ValueError("no idle unreserved review slot")
+            data.update(
+                paused=False,
+                review_recovery_base=job["attempts"],
+                fresh_session_retry={
+                    "at": time.time(),
+                    "slot": slot["id"],
+                    "previous_session_id": slot["session_id"],
+                    "generation": slot["generation"] + 1,
+                },
+            )
+            self.store.fresh_review_retry(job["id"], slot["id"], data)
+            self.node_session_retry.pop(slot["id"], None)
+            self.eligible.add(job["id"])
+            LOG.warning("fresh review retry job=%s slot=%s", job["id"], slot["id"])
+            return self.command("job", {"job_id": job["id"]})
         if "from_input" in args and type(args["from_input"]) is not bool:
             raise ValueError("from_input must be a boolean")
         if args.get("from_input"):
@@ -1796,12 +2047,9 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
                 job["kind"] != "work"
                 or not approved.get("accepted")
                 or not approved.get("validation_complete")
-                or final.get("model") != "gpt-6.1-sol"
-                or final.get("effort") != "xhigh"
+                or not accepted_delivery_gate(final.get("model"), final.get("effort"))
             ):
-                raise ValueError(
-                    "rerun requires the accepted frozen xhigh delivery gate"
-                )
+                raise ValueError("rerun requires the accepted frozen delivery gate")
             run = args.get("run_id")
             permitted = {
                 r

@@ -5,6 +5,8 @@ import json
 from pathlib import Path
 import re
 
+from .config import DELIVERY_GATE_EFFORT, DELIVERY_GATE_MODEL
+
 
 def completed_checks(directory):
     """Identify new successful executions for retry pacing, never for approval."""
@@ -56,7 +58,11 @@ def local_validation(store, state_dir, job):
             result.get("candidate_head") != job["head"]
             or result.get("accepted") is not True
             or result.get("validation_complete") is not True
-            or gate.get("effort") != "xhigh"
+            or not (
+                gate.get("effort") == "xhigh"
+                or (gate.get("model"), gate.get("effort"))
+                == (DELIVERY_GATE_MODEL, DELIVERY_GATE_EFFORT)
+            )
         ):
             continue
         root = Path(state_dir) / "jobs" / previous["id"]

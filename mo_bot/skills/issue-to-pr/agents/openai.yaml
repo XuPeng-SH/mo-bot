@@ -1,6 +1,6 @@
 interface:
   display_name: "Issue to PR"
-  short_description: "Evidence-led fixes with gpt-6.1-sol/xhigh design and review"
-  default_prompt: "Use $issue-to-pr to investigate this problem, obtain gpt-6.1-sol/xhigh design and review, implement and validate the fix, and deliver the authorized PR."
+  short_description: "Evidence-led fixes with gpt-6.1-terra/max design and review"
+  default_prompt: "Use $issue-to-pr to investigate this problem, obtain gpt-6.1-terra/max design and review, implement and validate the fix, and deliver the authorized PR."
 policy:
   allow_implicit_invocation: false

@@ -53,6 +53,11 @@ def _main():
             p.add_argument("--run-id", type=int, required=True)
         if name == "retry":
             p.add_argument(
+                "--fresh-session",
+                action="store_true",
+                help="retry an unpublished failed review in a new conversation",
+            )
+            p.add_argument(
                 "--from-input",
                 action="store_true",
                 help="retain diagnostics and restart a failed worker from its frozen source",
@@ -116,6 +121,8 @@ def _main():
     elif args.command in ("pause", "resume", "retry", "cleanup", "rerun"):
         endpoint = f"/api/jobs/{args.job_id}/{args.command}"
         body = {"run_id": args.run_id} if args.command == "rerun" else {}
+        if args.command == "retry" and args.fresh_session:
+            body["fresh_session"] = True
         if args.command == "retry" and args.from_input:
             body["from_input"] = True
         if args.command in ("resume", "retry") and args.hint is not None:

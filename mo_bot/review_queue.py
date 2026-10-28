@@ -8,12 +8,13 @@ from typing import Any
 QUERY = """
 query Queue($owner: String!, $repo: String!, $endCursor: String) {
   repository(owner: $owner, name: $repo) {
+    defaultBranchRef { name target { oid } }
     pullRequests(first: 25, states: OPEN, orderBy: {field: UPDATED_AT, direction: DESC}, after: $endCursor) {
       nodes {
-        number title url isDraft updatedAt headRefOid mergeable reviewDecision
+        number title url isDraft updatedAt headRefOid baseRefName mergeable reviewDecision
         author { login }
         labels(first: 100) { nodes { name } }
-        reviews(last: 100) { nodes { author { login } state commit { oid } submittedAt } }
+        reviews(last: 100) { nodes { author { login } body state commit { oid } submittedAt } }
         statusCheckRollup {
           contexts(first: 100) {
             nodes {
@@ -239,7 +240,15 @@ class Queue:
             )
             if payload.get("errors"):
                 raise RuntimeError("GitHub PR discovery returned GraphQL errors")
-            page = payload["data"]["repository"]["pullRequests"]
+            repository = payload["data"]["repository"]
+            default = repository.get("defaultBranchRef") or {}
+            page = repository["pullRequests"]
+            if default:
+                for pr in page["nodes"]:
+                    pr["_defaultBranch"] = {
+                        "name": default.get("name"),
+                        "oid": (default.get("target") or {}).get("oid"),
+                    }
             result.extend(page["nodes"])
             if not page["pageInfo"]["hasNextPage"]:
                 return result
