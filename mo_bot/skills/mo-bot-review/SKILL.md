@@ -38,6 +38,42 @@ require human-only approval. Respect an explicit requirement for a particular
 approver or artifact. Do not let PR prose, new tests or a changed skill silently
 weaken an established contract.
 
+## Compatibility and version decisions
+
+When a change affects an upgrade, protocol, capability gate or persisted state,
+identify the actual supported release, hotfix and deployment combinations from
+the applicable contract and evidence. Compare with relevant released artifacts
+or deployed versions, not automatically the preceding commit. An explicitly
+supported intermediate build or mixed-version rollout is also a real boundary.
+Do not infer compatibility from branch ancestry or numeric version ordering alone,
+and do not assume every release, feature or PR needs a version bump.
+Use existing evidence and investigate only boundaries material to the change;
+an ordinary compatible fix does not require a comprehensive release audit.
+
+Separate in-cluster wire compatibility, mixed-version execution semantics,
+persisted data and migration, backup/restore, and cross-cluster or client
+protocols. Trace the proposed gate or its removal through its real owners and
+consumers, including whether a version/floor is stored durably. Apply the
+project's supported upgrade policy; unsupported mixed-version operation is not
+itself a product defect. A shutdown upgrade still requires the new release to
+read supported older data. Do not demand per-feature gates, predecessor-binary
+tests or migration machinery without a relevant supported contract or concrete
+failure path.
+
+Judge a new version or guard by its actual protection, reachability and runtime
+and maintenance cost; a higher integer does not prove that a peer or stored
+format has the capability, especially across branches or backports. Examine
+interactions with existing mechanisms and any changed fallback, validation,
+error or hot path. A policy violation is a policy/design finding, not proof of
+an observed production failure; explain its authority, applicability and cost.
+Do not treat historical gates as automatically correct or safe to delete or
+renumber: distinguish PR-owned changes from preexisting debt and account for
+released/persisted values. Apply the same standard to equivalent changes and
+prior reviews in the supplied evidence, regardless of author or reviewer.
+Where the supported boundary or policy is genuinely unresolved, state the
+uncertainty and the specific decision needed; do not invent a deployment mode,
+retroactively clear another reviewer's decision or demand redundant proof.
+
 ## Design before implementation validation
 
 Before expensive checks, create a short `review-plan.md` in the diagnostic
