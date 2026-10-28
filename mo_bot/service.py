@@ -527,36 +527,30 @@ class Service:
             )
             (directory / "evidence.json").write_text(json.dumps(evidence, indent=2))
             workspace, merge_base = self.workspace.prepare(slot_id, job, pr, directory)
+            repository_skill = next(
+                (
+                    path
+                    for path in (
+                        workspace / ".agents/skills/mo-self-review/SKILL.md",
+                        workspace / ".claude/skills/mo-self-review/SKILL.md",
+                    )
+                    if path.is_file()
+                ),
+                None,
+            )
             prompt = (
                 review_instructions()
                 + f"""\nYou are mo-bot reusable review slot {slot_id}, generation {slot["generation"]}.
 CURRENT TASK replaces any previous PR task: job={job["id"]}, repository={job["repo"]},
 PR={job["pr"]}, HEAD={job["head"]}, merge-base={merge_base}. Only these frozen sources
 and {directory}/evidence.json establish facts for this PR. Earlier PR facts are not evidence.
-Read every entry in evidence.json discussion_index and the complete raw comment/review lists.
-Save discussion-assessment.json with source keys, dispositions and evidence for substantive
-concerns and rebuttals; explicitly reconcile prior bot findings with author counterevidence.
-Read {directory}/change.patch and surrounding owners/callers. Follow applicable
-mo-self-review instructions. Review the COMPLETE delta, design/ownership, correctness,
-performance, unhappy paths, compatibility, comments and test quality. Reuse valid exact-input
-CI/author evidence; run only checks that resolve concrete gaps. Missing evidence is not a pass.
-Read evidence.json's local_validation before executing tests. It carries same-repository,
-exact-candidate worker final gates and retained artifact inventories. Independently reconcile
-their command/source/exit receipts, logs and scope; an accepted gate is evidence, not your
-verdict. Failed-before controls and obsolete receipts may coexist with successful checks.
-Use retained native-input ledgers and validation environment files to identify compatible
-builds before rebuilding. Export the assigned task cache environment before invoking Go,
-including toolchain bootstrap; do not fall back to shared host caches. Read-only source
-does not prevent building prerequisites in the assigned writable diagnostic directory
-through the repository build owner. If setup fails, first recover matching evidence and
-prerequisites, continue source review and isolate the remaining behavioral gap. A local
-setup failure alone must not erase traceable validation of the current candidate.
-Source must remain unchanged. Put diagnostic artifacts only under {directory}; use its
-disk-backed tmp directory. Before native tests verify the current revision's native provenance
-through the repository build/test owner; retained artifacts may belong to an earlier PR.
-Do not spawn subagents, publish comments/reviews, mutate GitHub, rerun CI, commit, push or merge.
-The coordinator owns publication. Findings need location, concrete trigger, impact and evidence.
-Return the required JSON with job_id={job["id"]} and head_sha={job["head"]}; no speculative blockers.
+Repository review entry: {repository_skill or "none in this checkout"}.
+Change: {directory}/change.patch. Read the complete delta and relevant owners/consumers.
+Evidence: {directory}/evidence.json, including discussion_index, linked_issues and local_validation.
+Diagnostic directory: {directory}; keep review-plan.md, discussion-assessment.json, probes
+and validation evidence here. Use its disk-backed tmp directory and assigned task caches.
+Source must remain unchanged. Return the required JSON with job_id={job["id"]}
+and head_sha={job["head"]}; the coordinator owns publication.
 This is attempt {attempt} of the SAME logical job; consult earlier attempt artifacts in
 {directory.parent} to recover completed evidence instead of repeating it blindly.
 """
@@ -590,12 +584,6 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
         validate_result(result, SCHEMA)
         if result.get("job_id") != job["id"] or result.get("head_sha") != job["head"]:
             raise ValueError("review result identity mismatch")
-        if result.get("decision") not in (
-            "approve",
-            "request_changes",
-            "needs_validation",
-        ):
-            raise ValueError("invalid review decision")
         if bool(result["findings"]) != (result["decision"] == "request_changes"):
             raise ValueError(
                 "confirmed findings require request_changes; other decisions need no findings"

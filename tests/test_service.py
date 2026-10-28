@@ -528,6 +528,12 @@ class TestWorkflow(unittest.TestCase):
         self.assertIn(review_instructions(), prompt)
         self.assertIn(job["head"], prompt)
         self.assertIn(job["id"], prompt)
+        self.assertEqual(
+            self.service.backend.start.call_args.args[4]["properties"]["decision"][
+                "enum"
+            ],
+            ["approve", "request_changes"],
+        )
 
         manifest = json.loads(
             (self.root / "jobs" / job["id"] / "attempt-1/evidence.json").read_text()
@@ -536,6 +542,37 @@ class TestWorkflow(unittest.TestCase):
         self.assertEqual(manifest["local_validation"][0]["job_id"], key)
         self.assertEqual(manifest["local_validation"][0]["candidate_head"], job["head"])
         self.assertIn("local_validation", prompt)
+
+    def test_review_selects_one_repository_skill_from_the_assigned_checkout(self):
+        self.service.backend = Mock(dead=False)
+        self.gh.evidence.return_value = {}
+        canonical = self.root / ".agents/skills/mo-self-review/SKILL.md"
+        legacy = self.root / ".claude/skills/mo-self-review/SKILL.md"
+        for number, (paths, selected) in enumerate(
+            (
+                ([canonical, legacy], canonical),
+                ([canonical], canonical),
+                ([legacy], legacy),
+                ([], "none in this checkout"),
+            ),
+            1,
+        ):
+            with self.subTest(selected=str(selected), available=len(paths)):
+                for path in (canonical, legacy):
+                    path.unlink(missing_ok=True)
+                for path in paths:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text("Repository-specific review rules")
+                job = self.job(pr=number)
+                self.store.update(job["id"], comment_id=99)
+                self.service.launch(self.store.slots()[0], self.store.job(job["id"]))
+                prompt = self.service.backend.start.call_args.args[3]
+                entries = [
+                    line
+                    for line in prompt.splitlines()
+                    if line.startswith("Repository review entry:")
+                ]
+                self.assertEqual(entries, [f"Repository review entry: {selected}."])
 
     def test_new_review_loads_edited_skill_without_restart(self):
         skill = self.root / "SKILL.md"
@@ -579,7 +616,23 @@ class TestWorkflow(unittest.TestCase):
                     decision=decision,
                     findings=[finding] if decision == "request_changes" else [],
                 )
-                self.service.save_result(job, self.store.slots()[0], result)
+                if decision == "needs_validation":
+                    # Already-checkpointed historical assessments still publish;
+                    # they must not pass through the new-result admission gate.
+                    self.store.update(
+                        job["id"],
+                        state="publishing",
+                        result=json.dumps(
+                            {
+                                "assessment": result,
+                                "session_id": "old-thread",
+                                "slot": 0,
+                                "generation": 0,
+                            }
+                        ),
+                    )
+                else:
+                    self.service.save_result(job, self.store.slots()[0], result)
                 self.service.eligible.add(job["id"])
                 self.service.publish(self.store.job(job["id"]))
                 self.assertEqual(self.gh.submit_review.call_args.args[1], event)
@@ -720,6 +773,19 @@ class TestWorkflow(unittest.TestCase):
                     self.store.slots()[0],
                     dict(assessment(job), decision=decision, findings=findings),
                 )
+
+    def test_new_needs_validation_result_cannot_reach_publication(self):
+        job = self.job()
+        with self.assertRaisesRegex(ValueError, "invalid result enum"):
+            self.service.save_result(
+                job,
+                self.store.slots()[0],
+                dict(assessment(job), decision="needs_validation"),
+            )
+        saved = self.store.job(job["id"])
+        self.assertEqual(saved["state"], "queued")
+        self.assertIsNone(saved["result"])
+        self.gh.submit_review.assert_not_called()
 
     def test_existing_database_migrates_without_replaying_completed_jobs(self):
         job = self.job()
