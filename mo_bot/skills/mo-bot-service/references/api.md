@@ -1,5 +1,13 @@
 # Service API
 
+Status includes `review_batch_size`. Session `job_ids` lists all current batch
+members; legacy `job_id` remains the anchor. `token_usage` contains native thread
+totals and, when a previous total was observed, the current turn's difference.
+Batch members share one token counter. Full job data retains
+`review_batch.directory` for the shared prompt/events/usage; each `turn_dir`
+still owns that PR's evidence and checkpoint. Finished members may already be
+published while the batch's other member is running.
+
 Default address: `http://127.0.0.1:8989`. Every request requires `Authorization: Bearer <token>` from the configured state directory's `api-token` file (mode 0600). Use the repository client to keep tokens out of argv/logs. Local requests must bypass outbound proxies. Remote access: SSH tunnel to the loopback port; there is no public listener or CORS access.
 
 | Request | Result |
@@ -35,10 +43,13 @@ Status is a snapshot: inspect `updated_at`. Network/git preparation can delay sc
 `worker_discovery_exclusions` reports known PR policy restrictions separately
 from `worker_discovery_errors` and outage alerts. Both are refreshed by discovery;
 an exclusion is not a permanent task failure or permission to bypass the policy.
-A saved review awaiting admission retains `publishing` and exposes `wait_reason`
-and `next_retry_at`; it does not consume another model turn.
+A saved review retains `publishing` during transport retries or an active task
+for the same PR, without another model turn. CI, mergeability and discovery
+admission apply to new review execution, not to completed-result publication.
 
 Automatic admission uses the bundled review-queue policy (or an explicitly configured replacement): open, non-draft, mergeable PR, green latest CI attempts, fresh CI evidence, and missing decisive review or newer commits after requested changes. Self-authored PRs are eligible without waiting for CI when the current head has no published formal review (APPROVED, CHANGES_REQUESTED or COMMENTED); older-head reviews, pending/dismissed reviews and ordinary issue comments do not close this gate. They retain draft/exclusion/mergeability gates and receive COMMENT-only reviews. Incomplete review evidence waits for reliable discovery. Generated config has no default exclusions; legacy config without an exclude list retains its prior default. Forced admission bypasses those filters but requires an open PR and cannot reset any existing commit task. Head changes cancel older work. Publication rechecks head; review comments include full SHA, stable service ID and ownership marker. Only comments by the authenticated GitHub user count.
+
+`[review.author_review_delays]` optionally maps GitHub author logins to whole minutes after the exact head commit. The table is reloaded on discovery and immediately before dispatch, so additions, changes and removals take effect without restarting the service. Missing commit evidence blocks automatic admission. Explicit force enqueue bypasses this delay.
 
 One durable job/comment does not guarantee exactly-once physical model execution after an opaque crash: bounded recovery may continue/recompute interrupted work. Completed checkpoints are published without another model turn. Never run this stable identity against different state databases simultaneously; local lock and SQLite fences do not provide a distributed GitHub lock.
 
@@ -97,7 +108,7 @@ are not polled again; transient read errors have bounded persisted backoff.
 
 ## Discovery and recovery
 
-Saved review assessments awaiting CI/admission release the PR execution fence; active turns and attempted review writes still fence repairs. Review publication waits while repair execution owns the PR. Review and worker discovery use bounded read-only child processes. A complete, validated snapshot is required before reconciliation: timeout, malformed/partial output and provider errors never imply that PRs closed. Same-head automatic tasks already decisively reviewed are superseded; transient CI/mergeability waits retain the job and expose a wait reason. Explicit force admission and already-attempted publication keep their original safety contract. During discovery, automatic review dispatch pauses until fresh success, while operator commands and retained worker tasks remain serviced.
+Saved unattempted review assessments release the PR execution fence; active turns and attempted review writes still fence repairs. Review publication waits while repair execution owns the PR. Review and worker discovery use bounded read-only child processes. A complete, validated snapshot is required before reconciliation: timeout, malformed/partial output and provider errors never imply that PRs closed. Same-head automatic tasks already decisively reviewed are superseded; transient CI/mergeability waits retain queued model work and expose a wait reason. Completed reviews publish independently of those admission filters. Explicit force admission and already-attempted publication keep their original safety contract. During discovery, automatic review dispatch pauses until fresh success, while operator commands and retained worker tasks remain serviced.
 
 One job's I/O/publication failure sets its persistent `retry_at` and cannot force a global dispatch cooldown. Saved review publication releases its model slot; delivery workers retain affine slots through model phases, then freeze reviewed commits and release slots before publication. Retry deadlines survive restart. Single-instance locking precedes SQLite migration. Recovery accepts only the exact session/turn recorded in the artifact provenance, not any completed event in a reused log. Shutdown fails queued operator commands instead of leaving their futures unresolved.
 
@@ -124,5 +135,5 @@ review marker matching the exact current head; ordinary reviews do not count.
 The `merge-only-reviewed` exception instead proves that the authenticated marked
 earlier head changed solely by clean default-branch merges, recomputing each tree.
 Admission retains `reviewed_head`, without publishing a review on the new SHA.
-A new/edited nonempty human comment can admit a distinct same-head contextual round; unchanged discussions coalesce. Per-head/context uniqueness and per-job publication fences remain. Force can revive an unclaimed task skipped solely by this rule; prior attempted
+A new/edited nonempty human comment can admit a distinct same-head contextual round; unchanged discussions coalesce. An automatic contextual assessment can record `unchanged` without a duplicate formal review only when the authenticated exact-head prior review remains valid and the head, discussion and linked-issue inputs still match; force requires a full review. Per-head/context uniqueness and per-job publication fences remain. Force can revive an unclaimed task skipped solely by this rule; prior attempted
 remote effects retain their existing reconciliation fence.

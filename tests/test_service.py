@@ -1,4 +1,5 @@
 import json
+import sqlite3
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -112,6 +113,95 @@ class TestWorkflow(unittest.TestCase):
             self.service.tick()
             self.service.artifacts.future.result(timeout=5)
         self.assertFalse((directory / "tmp").exists())
+
+    def test_terminal_comment_selection_preserves_null_deadline_and_state_rules(self):
+        cases = (
+            ("failed", 10, None, 100, True),
+            ("superseded", 11, "reviewing", 0, True),
+            ("failed", 12, "failed", 0, False),
+            ("superseded", 13, "superseded", 0, False),
+            ("failed", None, None, 0, False),
+            ("failed", 0, None, 0, False),
+            ("failed", 14, "reviewing", 101, False),
+            ("done", 15, "reviewing", 0, False),
+            ("queued", 16, "reviewing", 0, False),
+            ("publishing", 17, "reviewing", 0, False),
+        )
+        expected = set()
+        terminal = set()
+        for number, (state, comment_id, comment_state, retry_at, due) in enumerate(
+            cases, 1
+        ):
+            job = self.job(pr=number)
+            self.store.update(
+                job["id"],
+                state=state,
+                comment_id=comment_id,
+                comment_state=comment_state,
+                retry_at=retry_at,
+            )
+            if due:
+                expected.add(job["id"])
+            if state in ("done", "failed", "superseded"):
+                terminal.add(job["id"])
+        self.assertEqual(
+            {j["id"] for j in self.store.terminal_comments(now=100)}, expected
+        )
+        self.assertEqual({j["id"] for j in self.store.terminal_jobs()}, terminal)
+
+    def test_terminal_polling_and_cleanup_do_not_read_large_evidence_columns(self):
+        job = self.job()
+        evidence = "x" * 3_000_000
+        self.store.update(
+            job["id"],
+            state="failed",
+            comment_id=99,
+            metadata=json.dumps({"evidence": evidence}),
+            data=json.dumps({"evidence": evidence}),
+            result=evidence,
+        )
+
+        def deny_evidence(action, table, column, database, trigger):
+            if (
+                action == sqlite3.SQLITE_READ
+                and table == "jobs"
+                and column in {"metadata", "data", "result"}
+            ):
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        self.store.db.set_authorizer(deny_evidence)
+        try:
+            comments = self.store.terminal_comments()
+            cleanup = self.store.terminal_jobs()
+        finally:
+            self.store.db.set_authorizer(None)
+        self.assertEqual([j["id"] for j in comments], [job["id"]])
+        self.assertEqual([j["id"] for j in cleanup], [job["id"]])
+        self.assertEqual(self.store.job(job["id"])["result"], evidence)
+
+    def test_terminal_comment_failure_retries_after_deadline_then_stops_polling_it(
+        self,
+    ):
+        job = self.job()
+        self.store.update(
+            job["id"], state="failed", comment_id=99, error="review stopped"
+        )
+        self.service.backend = Mock(dead=False)
+        self.service.next_scan = float("inf")
+        self.gh.patch_comment.side_effect = [RuntimeError("GitHub unavailable"), None]
+        self.service.tick()
+        waiting = self.store.job(job["id"])
+        self.assertGreater(waiting["retry_at"], time.time())
+        self.assertIsNone(waiting["comment_state"])
+        self.service.tick()
+        self.assertEqual(self.gh.patch_comment.call_count, 1)
+        self.store.update(job["id"], retry_at=time.time() - 1)
+        self.service.tick()
+        self.assertEqual(self.gh.patch_comment.call_count, 2)
+        self.assertEqual(self.store.job(job["id"])["comment_state"], "failed")
+        self.service.tick()
+        self.assertEqual(self.gh.patch_comment.call_count, 2)
 
     def test_owner_wip_blocks_automatic_review_launch_and_publication_before_writes(
         self,
@@ -532,7 +622,7 @@ class TestWorkflow(unittest.TestCase):
             self.service.backend.start.call_args.args[4]["properties"]["decision"][
                 "enum"
             ],
-            ["approve", "request_changes"],
+            ["approve", "request_changes", "unchanged"],
         )
 
         manifest = json.loads(
@@ -659,38 +749,52 @@ class TestWorkflow(unittest.TestCase):
         self.assertEqual(saved["state"], "done")
         self.assertEqual(saved["review_event"], "COMMENT")
 
-    def test_publication_admission_wait_is_visible_paced_and_reuses_assessment(self):
+    def test_completed_review_publishes_without_discovery_admission(self):
+        for number, reason in enumerate(
+            ("not-green", "missing", "merge-conflict", "refreshing"), 1
+        ):
+            with self.subTest(reason=reason):
+                job = self.job(pr=number)
+                self.store.update(
+                    job["id"],
+                    metadata=json.dumps({**candidate(pr=number), "forced": False}),
+                )
+                job = self.store.job(job["id"])
+                self.service.save_result(job, self.store.slots()[0], assessment(job))
+                saved_result = self.store.job(job["id"])["result"]
+                self.service.admission[str(number)] = {
+                    "head": job["head"],
+                    "state": "excluded",
+                    "reason": reason,
+                }
+                self.service.eligible.clear()
+                self.gh.find_review.return_value = None
+                self.service.refresh_status()
+                status = next(
+                    j for j in self.service.status["jobs"] if j["id"] == job["id"]
+                )
+                self.assertIsNone(status["wait_reason"])
+                self.service.publish(self.store.job(job["id"]))
+                saved = self.store.job(job["id"])
+                self.assertEqual(saved["state"], "done")
+                self.assertEqual(saved["result"], saved_result)
+                self.assertEqual(saved["attempts"], job["attempts"])
+        self.assertEqual(self.gh.submit_review.call_count, 4)
+        self.workspace.prepare.assert_not_called()
+
+    def test_ci_failure_does_not_bypass_head_validation(self):
         job = self.job()
         self.store.update(
             job["id"], metadata=json.dumps({**candidate(), "forced": False})
         )
         job = self.store.job(job["id"])
         self.service.save_result(job, self.store.slots()[0], assessment(job))
-        saved_result = self.store.job(job["id"])["result"]
-        self.service.admission["1"] = {
-            "head": job["head"],
-            "state": "excluded",
-            "reason": "not-green",
-        }
+        self.service.admission["1"] = {"head": job["head"], "reason": "not-green"}
+        self.service.eligible.clear()
+        self.gh.pr.return_value["head"]["sha"] = "c" * 40
         self.service.publish(self.store.job(job["id"]))
-        waiting = self.store.job(job["id"])
-        self.assertEqual(waiting["state"], "publishing")
-        self.assertGreater(waiting["retry_at"], time.time())
-        self.assertFalse(waiting["review_attempted"])
+        self.assertEqual(self.store.job(job["id"])["state"], "superseded")
         self.gh.submit_review.assert_not_called()
-        self.service.refresh_status()
-        status = next(j for j in self.service.status["jobs"] if j["id"] == job["id"])
-        self.assertEqual(
-            status["wait_reason"], "review publication awaiting admission: not-green"
-        )
-        self.assertFalse(status["attention_required"])
-        self.assertEqual(status["next_retry_at"], waiting["retry_at"])
-
-        self.service.eligible.add(job["id"])
-        self.service.publish(waiting)
-        self.gh.submit_review.assert_called_once()
-        self.assertEqual(self.store.job(job["id"])["state"], "done")
-        self.assertEqual(self.store.job(job["id"])["result"], saved_result)
 
     def test_active_task_wait_clears_old_error_once_and_publishes_on_release(self):
         job = self.job()

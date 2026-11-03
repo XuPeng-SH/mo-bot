@@ -56,6 +56,7 @@ class Backend:
         self.write_lock = threading.Lock()
         self.counter = 0
         self.turns = {}
+        self.token_totals = {}
         self.dead = False
         self.closed = False
         owner_path = config.state_dir / "backend-owner.json"
@@ -179,6 +180,10 @@ class Backend:
                         turn = self.turns.get(thread)
                         if turn:
                             turn.accept(event)
+                        if event.get("method") == "thread/tokenUsage/updated":
+                            total = params.get("tokenUsage", {}).get("total")
+                            if isinstance(total, dict):
+                                self.token_totals[thread] = total
                     self.events.emit(event)
         except (
             OSError,
@@ -315,6 +320,10 @@ class Turn:
         self.log_bytes = 0
         self.early = []
         self.early_bytes = 0
+        self.token_usage = None
+        self.usage_baseline = dict(
+            backend.__dict__.get("token_totals", {}).get(self.session_id, {})
+        )
         params = {
             "threadId": self.session_id,
             "cwd": str(directory),
@@ -325,6 +334,7 @@ class Turn:
             "sandboxPolicy": {
                 "type": "workspaceWrite",
                 "writableRoots": [str(directory)]
+                + slot.get("review_directories", [])
                 + (
                     [str(cache_root)]
                     if not cache_root.is_relative_to(directory)
@@ -382,6 +392,28 @@ class Turn:
         turn_id = params.get("turnId") or params.get("turn", {}).get("id")
         if self.turn_id and turn_id and self.turn_id != turn_id:
             return
+        if (
+            event.get("method") == "thread/tokenUsage/updated"
+            and turn_id == self.turn_id
+        ):
+            total = params.get("tokenUsage", {}).get("total", {})
+            if (
+                isinstance(total, dict)
+                and total
+                and all(type(v) is int and v >= 0 for v in total.values())
+            ):
+                delta = {k: v - self.usage_baseline.get(k, 0) for k, v in total.items()}
+                self.token_usage = {
+                    "thread_id": self.session_id,
+                    "turn_id": self.turn_id,
+                    "thread_total": total,
+                    "turn_tokens": delta
+                    if self.usage_baseline and all(v >= 0 for v in delta.values())
+                    else None,
+                }
+                (self.directory / "token-usage.json").write_text(
+                    json.dumps(self.token_usage)
+                )
         if (
             event.get("method", "").startswith("item/")
             or event.get("method") == "turn/completed"

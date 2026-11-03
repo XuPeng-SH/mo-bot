@@ -13,6 +13,80 @@ from mo_bot.rpc import Backend, Events, Turn
 
 
 class TestRPC(unittest.TestCase):
+    def test_usage_is_a_turn_delta_and_batch_diagnostics_do_not_grant_source_writes(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = Config("test", root, "o/r", "me", root)
+            baseline = {
+                "inputTokens": 1000,
+                "cachedInputTokens": 800,
+                "outputTokens": 100,
+            }
+            backend = Mock(
+                config=cfg,
+                host_config=cfg,
+                lock=threading.RLock(),
+                turns={},
+                token_totals={"thread": baseline},
+            )
+            backend.turn_params.side_effect = lambda turn, params: params
+            backend.call.return_value = {"turn": {"id": "turn"}}
+            peer = root / "jobs/peer/attempt-1"
+            source = root / "source"
+            turn = Turn(
+                backend,
+                {
+                    "session_id": "thread",
+                    "model": "fake",
+                    "effort": "low",
+                    "review_directories": [str(peer)],
+                },
+                root / "jobs/main/attempt-1",
+                source,
+                "batch",
+                None,
+            )
+            writable = backend.call.call_args.args[1]["sandboxPolicy"]["writableRoots"]
+            self.assertIn(str(peer), writable)
+            self.assertNotIn(str(source), writable)
+            event = {
+                "method": "thread/tokenUsage/updated",
+                "params": {
+                    "threadId": "thread",
+                    "turnId": "turn",
+                    "tokenUsage": {
+                        "total": {
+                            "inputTokens": 1500,
+                            "cachedInputTokens": 1200,
+                            "outputTokens": 150,
+                        }
+                    },
+                },
+            }
+            turn.accept(event)
+            turn.accept(
+                event
+            )  # Duplicate cumulative notification is not another request.
+            self.assertEqual(
+                turn.token_usage["turn_tokens"],
+                {"inputTokens": 500, "cachedInputTokens": 400, "outputTokens": 50},
+            )
+            saved = json.loads((turn.directory / "token-usage.json").read_text())
+            self.assertEqual(saved, turn.token_usage)
+            event["params"]["turnId"] = "old-turn"
+            event["params"]["tokenUsage"]["total"] = {"inputTokens": 99999}
+            turn.accept(event)
+            self.assertEqual(turn.token_usage, saved)
+            event["params"]["turnId"] = "turn"
+            turn.usage_baseline = {}
+            turn.accept(event)
+            self.assertIsNone(turn.token_usage["turn_tokens"])
+            turn.usage_baseline = {"inputTokens": 100000}
+            turn.accept(event)
+            self.assertIsNone(turn.token_usage["turn_tokens"])
+
     def test_job_cache_is_shared_and_included_in_sandbox_without_source_write(self):
         with tempfile.TemporaryDirectory(prefix="mo bot ") as tmp:
             root = Path(tmp)

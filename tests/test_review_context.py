@@ -174,6 +174,17 @@ class TestContextReviewRounds(unittest.TestCase):
                 {**json.loads(j["metadata"]), "discussion_digest": "old"}
             ),
         )
+        self.store.update(
+            j["id"],
+            metadata=json.dumps(
+                {**json.loads(self.store.job(j["id"])["metadata"]), "forced": False}
+            ),
+        )
+        self.service.eligible.clear()
+        self.service.admission[str(j["pr"])] = {
+            "head": j["head"],
+            "reason": "not-green",
+        }
         self.gh.discussion.return_value = discussion()
         self.service.publish(self.store.job(j["id"]))
         self.gh.submit_review.assert_not_called()
@@ -315,3 +326,147 @@ class TestDiscussionLedger(unittest.TestCase):
             self.assertEqual(case.store.job(j["id"])["state"], "publishing")
         finally:
             case.tearDown()
+
+
+class TestUnchangedContextReview(unittest.TestCase):
+    setUp = fixtures.TestWorkflow.setUp
+    tearDown = fixtures.TestWorkflow.tearDown
+
+    def make_prior(self):
+        head = "a" * 40
+        return {
+            "id": 123,
+            "state": "APPROVED",
+            "commit_id": head,
+            "submitted_at": "2026-10-26T13:00:00Z",
+            "user": {"login": "me"},
+            "body": "Approved\n"
+            + marker("test-bot", {"id": "old", "head": head}, "review"),
+            "html_url": "https://github.com/matrixorigin/matrixone/pull/1#pullrequestreview-123",
+        }
+
+    def make_job(self, forced=False):
+        from tests.test_service import candidate
+
+        c = candidate()
+        c.update(forced=forced, context_review=True, trigger_key="discussion:abc")
+        self.store.enqueue(c)
+        key = self.store.key(c["repo"], 1, c["headRefOid"], c["trigger_key"])
+        job = self.store.job(key)
+        metadata = json.loads(job["metadata"])
+        metadata["context_prior_review_id"] = 123
+        self.store.update(key, metadata=json.dumps(metadata))
+        self.service.eligible.add(key)
+        return self.store.job(key)
+
+    def test_unchanged_records_without_duplicate_formal_review(self):
+        j = self.make_job()
+        self.gh.discussion.return_value = {
+            **discussion(),
+            "reviews": [self.make_prior()],
+        }
+        result = assessment(j)
+        result.update(
+            decision="unchanged", summary="New comment only repeats resolved context."
+        )
+        self.service.save_result(j, self.store.slots()[0], result)
+        self.service.publish(self.store.job(j["id"]))
+        self.gh.submit_review.assert_not_called()
+        self.assertEqual(self.store.job(j["id"])["state"], "done")
+        self.assertIsNone(self.store.job(j["id"])["review_id"])
+        self.assertIn("previous review", self.gh.patch_comment.call_args.args[2])
+
+    def test_forced_and_unverified_cannot_skip_review(self):
+        for forced, prior in [(True, 123), (False, None)]:
+            with self.subTest(forced=forced, prior=prior):
+                j = self.make_job(forced)
+                meta = json.loads(j["metadata"])
+                meta["context_prior_review_id"] = prior
+                self.store.update(j["id"], metadata=json.dumps(meta))
+                j = self.store.job(j["id"])
+                result = assessment(j)
+                result.update(decision="unchanged", summary="No new issue.")
+                with self.assertRaisesRegex(ValueError, "prior review"):
+                    self.service.save_result(j, self.store.slots()[0], result)
+                self.store.db.execute("DELETE FROM jobs WHERE id=?", (j["id"],))
+                self.store.db.commit()
+
+    def test_dismissed_prior_prevents_suppression(self):
+        j = self.make_job()
+        result = assessment(j)
+        result.update(decision="unchanged", summary="No new issue.")
+        self.service.save_result(j, self.store.slots()[0], result)
+        self.gh.discussion.return_value = {
+            **discussion(),
+            "reviews": [{**self.make_prior(), "state": "DISMISSED"}],
+        }
+        self.service.publish(self.store.job(j["id"]))
+        self.gh.submit_review.assert_not_called()
+        self.assertEqual(self.store.job(j["id"])["state"], "queued")
+        self.assertIsNone(self.store.job(j["id"])["result"])
+
+    def test_force_during_pending_unchanged_requeues_full_review(self):
+        j = self.make_job()
+        result = assessment(j)
+        result.update(decision="unchanged", summary="No new issue.")
+        self.service.save_result(j, self.store.slots()[0], result)
+        meta = json.loads(self.store.job(j["id"])["metadata"])
+        meta["forced"] = True
+        self.store.update(j["id"], metadata=json.dumps(meta))
+        self.service.publish(self.store.job(j["id"]))
+        self.assertEqual(self.store.job(j["id"])["state"], "queued")
+        self.assertIsNone(self.store.job(j["id"])["result"])
+        self.gh.submit_review.assert_not_called()
+
+    def test_discovery_keeps_context_round_eligible(self):
+        j = self.make_job()
+        from tests.test_service import candidate
+
+        c = candidate()
+        c["forced"] = False
+        snapshot = {
+            "heads": {"1": c["headRefOid"]},
+            "candidates": [c],
+            "admission": {
+                "1": {"head": c["headRefOid"], "state": "candidate", "reason": "fresh"}
+            },
+        }
+        self.service.scan(snapshot)
+        self.assertIn(j["id"], self.service.eligible)
+        self.assertEqual(self.store.job(j["id"])["state"], "queued")
+
+    def test_new_discussion_at_publication_is_not_suppressed(self):
+        j = self.make_job()
+        meta = json.loads(j["metadata"])
+        meta["discussion_digest"] = "stale"
+        self.store.update(j["id"], metadata=json.dumps(meta))
+        j = self.store.job(j["id"])
+        result = assessment(j)
+        result.update(decision="unchanged", summary="No change at the frozen input.")
+        self.service.save_result(j, self.store.slots()[0], result)
+        self.gh.discussion.return_value = {
+            **discussion(),
+            "reviews": [self.make_prior()],
+        }
+        self.service.publish(self.store.job(j["id"]))
+        self.assertEqual(self.store.job(j["id"])["state"], "superseded")
+        self.gh.submit_review.assert_not_called()
+        self.assertTrue(
+            any(x["state"] == "queued" for x in self.store.jobs() if x["id"] != j["id"])
+        )
+
+    def test_force_after_unchanged_starts_fresh_full_review(self):
+        j = self.make_job()
+        self.gh.discussion.return_value = {
+            **discussion(),
+            "reviews": [self.make_prior()],
+        }
+        result = assessment(j)
+        result.update(decision="unchanged", summary="No change.")
+        self.service.save_result(j, self.store.slots()[0], result)
+        self.service.publish(self.store.job(j["id"]))
+        self.gh.api.return_value = self.gh.pr.return_value
+        response = self.service.command("enqueue", {"pr": 1, "force": True})
+        self.assertTrue(response["enqueued"])
+        self.assertNotEqual(response["job"]["id"], j["id"])
+        self.assertTrue(json.loads(response["job"]["metadata"])["forced"])
