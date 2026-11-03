@@ -36,6 +36,33 @@ NON_EXECUTION_CHECKS = {"Summary", "Mergify Merge Protections", "Mergify Merge Q
 DECISIVE_REVIEW_STATES = {"APPROVED", "CHANGES_REQUESTED"}
 
 
+def author_review_delay_minutes(pr: dict[str, Any], delays: dict[str, int]) -> int:
+    """Return the configured automatic-review delay for a PR author."""
+    author = (pr.get("author") or pr.get("user") or {}).get("login", "")
+    return delays.get(author.casefold(), 0)
+
+
+def automatic_review_not_before(
+    pr: dict[str, Any], delays: dict[str, int], commit
+) -> dt.datetime | None:
+    """Return the earliest automatic review time using the exact head commit."""
+    minutes = author_review_delay_minutes(pr, delays)
+    if minutes <= 0:
+        return None
+    if commit.get("oid") != pr.get("headRefOid", (pr.get("head") or {}).get("sha")):
+        raise ValueError("latest PR commit does not match the discovered head")
+    committed = commit.get("committedDate") or commit.get("committed_at")
+    if not isinstance(committed, str) or not committed:
+        raise ValueError("latest PR commit timestamp is unavailable")
+    try:
+        committed_at = dt.datetime.fromisoformat(committed.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise ValueError("latest PR commit timestamp is invalid") from error
+    if committed_at.tzinfo is None:
+        raise ValueError("latest PR commit timestamp has no timezone")
+    return committed_at + dt.timedelta(minutes=minutes)
+
+
 class OwnerWip(ValueError):
     """Owner's WIP label is an admission wait, not a task failure."""
 

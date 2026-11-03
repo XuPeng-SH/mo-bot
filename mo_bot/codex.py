@@ -131,9 +131,13 @@ class Workspace:
     def path(self, slot):
         return self.config.state_dir / "slots" / str(slot) / "source"
 
-    def clean(self, slot):
+    def clean(self, slot, head=None):
         path = self.path(slot)
-        return not path.exists() or not self.git("status", "--porcelain", cwd=path)
+        if not path.exists():
+            return head is None
+        return not self.git("status", "--porcelain", cwd=path) and (
+            head is None or self.git("rev-parse", "HEAD", cwd=path) == head
+        )
 
     def ensure(self, slot, head=None):
         path = self.path(slot)
@@ -508,7 +512,7 @@ SCHEMA = {
         "head_sha": {"type": "string"},
         "decision": {
             "type": "string",
-            "enum": ["approve", "request_changes"],
+            "enum": ["approve", "request_changes", "unchanged"],
         },
         "summary": {"type": "string"},
         "findings": {

@@ -60,6 +60,20 @@ class TestInstallation(unittest.TestCase):
             initialize(self.config, "owner/repo", self.source, "other")
         self.assertEqual(previous, self.config.read_bytes())
 
+    def test_matrixone_initialization_applies_packaged_policy_without_host_paths(self):
+        with patch("pathlib.Path.home", return_value=self.root):
+            initialize(self.config, "matrixorigin/matrixone", self.source, "XuPeng-SH")
+        with patch("mo_bot.config.shutil.which", return_value="/fake/executable"):
+            config = Config.load(self.config)
+        self.assertEqual(config.batch_size, 2)
+        self.assertEqual(config.python_sdk_review_slot, 1)
+        self.assertEqual(config.python_sdk_path_prefixes, ("clients/python/",))
+        self.assertEqual(
+            config.author_review_delays, {"matrixadventurer": 20, "xupeng-sh": 10}
+        )
+        self.assertEqual(config.worker_sessions, 0)
+        self.assertNotIn("/home/xupeng", self.config.read_text())
+
     def test_reinstall_and_uninstall_preserve_config_and_state(self):
         self.config.write_text("user config")
         state = self.root / "state.sqlite3"

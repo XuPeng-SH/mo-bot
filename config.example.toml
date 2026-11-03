@@ -10,6 +10,11 @@ source_dir = "~/src/repository"
 # Optional custom discovery policy; bundled policy is the default.
 # queue_script = "~/custom/review_queue.py"
 sessions = 2
+# Opt in to at most two already-queued ordinary PRs per local review turn.
+# No waiting to fill a batch; force, follow-ups, retries and SSH turns stay single.
+batch_size = 1
+# Per-member patch byte limit; larger changes are reviewed individually.
+batch_max_patch_bytes = 120000
 model = "gpt-6-astra"
 reasoning_effort = "xhigh"
 exclude = []
@@ -20,6 +25,18 @@ command_timeout_seconds = 45
 minimum_free_gib = 20
 codex = "codex"
 gh = "gh"
+
+# Optional automatic-review delay by PR author, in minutes after the latest
+# head commit. This table is hot-reloaded during discovery and before dispatch.
+[review.author_review_delays]
+MatrixAdventurer = 20
+# OtherAuthor = 20
+
+# Route PRs touching Python SDK files through this review slot and model.
+# Model/effort are pinned to gpt-6.1-sol/xhigh by the service.
+[review.python_sdk]
+slot = 1
+path_prefixes = ["clients/python/"]
 
 [api]
 host = "127.0.0.1"

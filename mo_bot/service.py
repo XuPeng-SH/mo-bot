@@ -1,4 +1,5 @@
 from concurrent.futures import Future
+import datetime as dt
 import queue
 import threading
 import fcntl
@@ -30,27 +31,46 @@ from .review_context import (
     new_since,
     validate_ledger,
     linked_issue_digest,
+    prior_bot_review,
 )
 from .store import Store
 from .worker import Worker
 from .discovery import Discovery
-from .config import CLASSIFIER_EFFORT, CLASSIFIER_MODEL, accepted_delivery_gate
+from .config import (
+    CLASSIFIER_EFFORT,
+    CLASSIFIER_MODEL,
+    Config,
+    PYTHON_SDK_REVIEW_EFFORT,
+    PYTHON_SDK_REVIEW_MODEL,
+    accepted_delivery_gate,
+)
 from .artifacts import Artifacts
 from .evidence import local_validation
-from .review_queue import OwnerWip, owner_wip
+from .review_queue import (
+    OwnerWip,
+    author_review_delay_minutes,
+    automatic_review_not_before,
+    owner_wip,
+)
+from .review_batch import ReviewBatch, turn_jobs
 
 
 LOG = logging.getLogger("mo-bot")
 REVIEW_SKILL = Path(__file__).parent / "skills/mo-bot-review/SKILL.md"
 
 
-def review_instructions():
+def review_instructions(*, batch=False):
     # Read per launch: policy edits apply to the next assigned review without a
     # service restart. Each native turn persists its actual prompt for recovery.
     text = REVIEW_SKILL.read_text()
     if not text.startswith("---\n"):
         raise ValueError("review skill frontmatter missing")
-    return text.split("---", 2)[2].strip()
+    instructions = text.split("---", 2)[2].strip()
+    if batch:
+        instructions += (
+            "\n\n" + (REVIEW_SKILL.parent / "references/batch.md").read_text()
+        )
+    return instructions
 
 
 WARMUP_SCHEMA = {
@@ -164,12 +184,18 @@ class Service:
                 if definition
                 else "local",
             )
-            if not slot["model"] or slot["role"] == "classifier":
+            python_sdk_slot = (
+                slot["role"] == "review"
+                and config.python_sdk_review_slot == slot["pool_index"]
+            )
+            if not slot["model"] or slot["role"] == "classifier" or python_sdk_slot:
                 self.store.slot_update(
                     slot["id"],
                     model=(
                         CLASSIFIER_MODEL
                         if slot["role"] == "classifier"
+                        else PYTHON_SDK_REVIEW_MODEL
+                        if python_sdk_slot
                         else override.get(
                             "model",
                             config.worker_model
@@ -180,6 +206,8 @@ class Service:
                     effort=(
                         CLASSIFIER_EFFORT
                         if slot["role"] == "classifier"
+                        else PYTHON_SDK_REVIEW_EFFORT
+                        if python_sdk_slot
                         else override.get(
                             "reasoning_effort",
                             config.worker_effort
@@ -200,6 +228,7 @@ class Service:
         self.status = {}
         self.models = []
         self.turns = {}  # Only live RPC turn handles; persistent workflow is in SQLite.
+        self.batches = ReviewBatch(self)
         self.artifacts = Artifacts(config.state_dir)
         self.eligible = set()
         self.last_error = None
@@ -267,6 +296,9 @@ class Service:
                 try:
                     if slot is None:
                         raise ValueError("recovery slot missing")
+                    if json.loads(job["data"]).get("review_batch"):
+                        self.batches.recover(job, slot)
+                        continue
                     result, provenance = completed_result(directory, slot["session_id"])
                     if not self.workspace.clean(slot["id"]):
                         raise ValueError("source changed during recovery")
@@ -340,7 +372,7 @@ class Service:
             if status.get("reason") == "owner-wip" and not forced_review:
                 self.eligible.discard(job["id"])
                 for turn, key in self.turns.values():
-                    if key == job["id"]:
+                    if job["id"] in turn_jobs(turn, key):
                         turn.error = "owner-wip"
                         turn.stop()
                 continue
@@ -366,7 +398,21 @@ class Service:
                     error=reason,
                     slot_id=job["slot_id"] if job["state"] == "reviewing" else None,
                 )
+        pending_contexts = {}
+        for pending in self.store.jobs(("queued", "reviewing", "publishing")):
+            if pending["kind"] == "review" and json.loads(pending["metadata"]).get(
+                "context_review"
+            ):
+                identity = (pending["repo"], pending["pr"], pending["head"])
+                pending_contexts.setdefault(identity, []).append(pending["id"])
         for candidate in snapshot["candidates"]:
+            identity = (candidate["repo"], candidate["number"], candidate["headRefOid"])
+            pending_context = pending_contexts.get(identity, [])
+            if pending_context and not candidate.get("trigger_key"):
+                # A generic discovery candidate must not supersede a queued
+                # contextual round merely because its durable key differs.
+                self.eligible.update(pending_context)
+                continue
             key = self.store.key(
                 candidate["repo"],
                 candidate["number"],
@@ -374,15 +420,25 @@ class Service:
                 candidate.get("trigger_key", ""),
             )
             if not self.store.job(key):
-                if not self.store.enqueue(candidate):
-                    continue
-                LOG.info(
-                    "discovered PR=%s head=%s job=%s",
-                    candidate["number"],
-                    candidate["headRefOid"],
-                    key,
-                )
-            self.eligible.add(key)
+                if self.store.enqueue(candidate):
+                    LOG.info(
+                        "discovered PR=%s head=%s job=%s",
+                        candidate["number"],
+                        candidate["headRefOid"],
+                        key,
+                    )
+            queued = self.store.job(key)
+            if queued:
+                if (
+                    queued["state"] == "queued"
+                    and queued["error"] == "author-review-cooldown"
+                ):
+                    self.store.update(key, error=None, retry_at=0)
+                self.eligible.add(key)
+            # Discovery normally identifies a PR/head, whereas an in-flight
+            # contextual round has its own input digest in its durable key.
+            # Admit that round too; publication still revalidates all inputs.
+            self.eligible.update(pending_context)
         self.eligible.update(
             j["id"]
             for j in self.store.jobs(("queued", "reviewing", "publishing"))
@@ -427,125 +483,229 @@ class Service:
             self.next_scan = time.monotonic() + min(60, self.config.poll_seconds)
             LOG.warning("review discovery blocked: %s", error)
 
-    def launch(self, slot, job=None):
+    def prepare_review(self, slot, job, source_slot=None):
         slot_id = slot["id"]
-        if job and job["kind"] == "work":
-            return self.worker.launch(slot, job)
-        if job:
-            pr = self.github.pr(job)
-            if owner_wip(pr, self.config.reviewer) and not json.loads(
-                job["metadata"]
-            ).get("forced"):
-                self.eligible.discard(job["id"])
-                self.store.update(
-                    job["id"], state="queued", slot_id=None, error="owner-wip"
+        source_slot = slot_id if source_slot is None else source_slot
+        pr = self.github.pr(job)
+        if owner_wip(pr, self.config.reviewer) and not json.loads(job["metadata"]).get(
+            "forced"
+        ):
+            self.eligible.discard(job["id"])
+            self.store.update(
+                job["id"], state="queued", slot_id=None, error="owner-wip"
+            )
+            return
+        if self.store.uncertain_pr(
+            job["repo"],
+            pr["head"]["sha"],
+            (pr["head"].get("repo") or {}).get("id"),
+            pr["head"].get("ref"),
+        ):
+            self.store.update(
+                job["id"],
+                state="queued",
+                slot_id=None,
+                error="possibly created worker PR awaits issue outbox reconciliation",
+            )
+            return
+        if pr["state"] != "open" or pr["head"]["sha"] != job["head"]:
+            self.store.update(
+                job["id"], state="superseded", error="PR changed before dispatch"
+            )
+            return
+        metadata = json.loads(job["metadata"])
+        if not metadata.get("forced"):
+            policy_config = (
+                Config.load(self.config_path) if self.config_path else self.config
+            )
+            delays = policy_config.author_review_delays
+            if author_review_delay_minutes(pr, delays):
+                committed_at = metadata.get("head_commit_date")
+                if committed_at:
+                    commit = {"oid": job["head"], "committed_at": committed_at}
+                else:
+                    remote_commit = self.github.api(
+                        f"repos/{job['repo']}/commits/{job['head']}"
+                    )
+                    commit_details = remote_commit.get("commit") or {}
+                    committer = commit_details.get("committer") or {}
+                    commit = {
+                        "oid": remote_commit.get("sha"),
+                        "committed_at": committer.get("date"),
+                    }
+                not_before = automatic_review_not_before(pr, delays, commit)
+                if not_before and time.time() < not_before.timestamp():
+                    self.eligible.discard(job["id"])
+                    self.store.update(
+                        job["id"],
+                        state="queued",
+                        slot_id=None,
+                        error="author-review-cooldown",
+                    )
+                    self.admission[str(job["pr"])] = {
+                        "head": job["head"],
+                        "state": "excluded",
+                        "reason": "author-review-cooldown",
+                        "eligible_at": not_before.astimezone(
+                            dt.timezone.utc
+                        ).isoformat(),
+                    }
+                    LOG.info(
+                        "delayed PR review PR=%s head=%s until=%s",
+                        job["pr"],
+                        job["head"],
+                        not_before.astimezone(dt.timezone.utc).isoformat(),
+                    )
+                    return
+        route_previous = None
+        if self.config.python_sdk_review_slot is not None:
+            data = json.loads(job["data"])
+            route_previous = data.get("review_route")
+            python_sdk = self.python_sdk_review(pr, job, data)
+            if python_sdk:
+                target = next(
+                    (
+                        candidate
+                        for candidate in self.store.slots(include_disabled=True)
+                        if candidate["role"] == "review"
+                        and candidate["pool_index"]
+                        == self.config.python_sdk_review_slot
+                    ),
+                    None,
                 )
-                return
-            if self.store.uncertain_pr(
-                job["repo"],
-                pr["head"]["sha"],
-                (pr["head"].get("repo") or {}).get("id"),
-                pr["head"].get("ref"),
-            ):
+                if target is None:
+                    raise RuntimeError(
+                        "configured Python SDK review slot is unavailable"
+                    )
+                if slot_id != target["id"] or (slot["model"], slot["effort"]) != (
+                    PYTHON_SDK_REVIEW_MODEL,
+                    PYTHON_SDK_REVIEW_EFFORT,
+                ):
+                    self.store.update(
+                        job["id"],
+                        state="queued",
+                        slot_id=target["id"],
+                        error=(
+                            f"routed to {PYTHON_SDK_REVIEW_MODEL}/"
+                            f"{PYTHON_SDK_REVIEW_EFFORT} for Python SDK review"
+                        ),
+                        retry_at=0,
+                    )
+                    LOG.info(
+                        "routed Python SDK review PR=%s head=%s to slot=%s",
+                        job["pr"],
+                        job["head"],
+                        target["id"],
+                    )
+                    return
+            elif route_previous and route_previous.get("python_sdk"):
                 self.store.update(
                     job["id"],
                     state="queued",
                     slot_id=None,
-                    error="possibly created worker PR awaits issue outbox reconciliation",
+                    error=None,
+                    retry_at=0,
                 )
                 return
-            if pr["state"] != "open" or pr["head"]["sha"] != job["head"]:
-                self.store.update(
-                    job["id"], state="superseded", error="PR changed before dispatch"
-                )
-                return
-            if (
-                job["attempts"] - json.loads(job["data"]).get("review_recovery_base", 0)
-                > self.config.max_recoveries
-            ):
-                self.store.update(
-                    job["id"], state="failed", error="recovery budget exhausted"
-                )
-                return
-            if not job["comment_id"]:
-                comment = self.github.find_comment(job)
-                if not comment:
-                    if job["claim_attempted"]:
-                        self.store.update(
-                            job["id"],
-                            state="failed",
-                            slot_id=None,
-                            error="ambiguous comment creation; remote marker absent; manual reconciliation required",
-                        )
-                        return
-                    self.store.update(job["id"], claim_attempted=1)
-                    comment = self.github.ensure_comment(job)
-                    job = self.store.job(job["id"])
-                marker = self.github.owned_marker(comment, job)
-                if not marker:
-                    raise RuntimeError("created claim has no valid ownership marker")
-                if not job["claim_attempted"] and marker["state"] != "done":
+        if (
+            job["attempts"] - json.loads(job["data"]).get("review_recovery_base", 0)
+            > self.config.max_recoveries
+        ):
+            self.store.update(
+                job["id"], state="failed", error="recovery budget exhausted"
+            )
+            return
+        if not job["comment_id"]:
+            comment = self.github.find_comment(job)
+            if not comment:
+                if job["claim_attempted"]:
                     self.store.update(
                         job["id"],
                         state="failed",
                         slot_id=None,
-                        comment_id=comment["id"],
-                        comment_state=marker["state"],
-                        error="remote claim restored; no duplicate review",
+                        error="ambiguous comment creation; remote marker absent; manual reconciliation required",
                     )
                     return
-                if marker["state"] == "done":
-                    self.store.update(
-                        job["id"],
-                        state="done",
-                        comment_id=comment["id"],
-                        comment_state="done",
-                        slot_id=None,
-                    )
-                    return
+                self.store.update(job["id"], claim_attempted=1)
+                comment = self.github.ensure_comment(job)
+                job = self.store.job(job["id"])
+            marker = self.github.owned_marker(comment, job)
+            if not marker:
+                raise RuntimeError("created claim has no valid ownership marker")
+            if not job["claim_attempted"] and marker["state"] != "done":
                 self.store.update(
-                    job["id"], comment_id=comment["id"], comment_state=marker["state"]
+                    job["id"],
+                    state="failed",
+                    slot_id=None,
+                    comment_id=comment["id"],
+                    comment_state=marker["state"],
+                    error="remote claim restored; no duplicate review",
                 )
-            job = self.store.job(job["id"])
-            attempt = job["attempts"] + 1
-            self.store.update(job["id"], attempts=attempt)
-            directory = self.job_dir(job) / f"attempt-{attempt}"
-            directory.mkdir(parents=True, exist_ok=True)
-            evidence = self.github.evidence(job, pr)
-            metadata = json.loads(job["metadata"])
-            if isinstance(evidence.get("discussion_digest"), str):
-                metadata["discussion_digest"] = evidence["discussion_digest"]
-            if isinstance(evidence.get("linked_issue_digest"), str):
-                metadata["linked_issue_digest"] = evidence["linked_issue_digest"]
-                metadata["linked_issue_complete"] = evidence["linked_issues"][
-                    "complete"
-                ]
-            self.store.update(job["id"], metadata=json.dumps(metadata))
-            job = self.store.job(job["id"])
-            evidence["local_validation"] = local_validation(
-                self.store, self.config.state_dir, job
+                return
+            if marker["state"] == "done":
+                self.store.update(
+                    job["id"],
+                    state="done",
+                    comment_id=comment["id"],
+                    comment_state="done",
+                    slot_id=None,
+                )
+                return
+            self.store.update(
+                job["id"], comment_id=comment["id"], comment_state=marker["state"]
             )
-            (directory / "evidence.json").write_text(json.dumps(evidence, indent=2))
-            workspace, merge_base = self.workspace.prepare(slot_id, job, pr, directory)
-            repository_skill = next(
-                (
-                    path
-                    for path in (
-                        workspace / ".agents/skills/mo-self-review/SKILL.md",
-                        workspace / ".claude/skills/mo-self-review/SKILL.md",
-                    )
-                    if path.is_file()
-                ),
-                None,
-            )
-            prompt = (
-                review_instructions()
-                + f"""\nYou are mo-bot reusable review slot {slot_id}, generation {slot["generation"]}.
-CURRENT TASK replaces any previous PR task: job={job["id"]}, repository={job["repo"]},
+        job = self.store.job(job["id"])
+        attempt = job["attempts"] + 1
+        self.store.update(job["id"], attempts=attempt)
+        directory = self.job_dir(job) / f"attempt-{attempt}"
+        directory.mkdir(parents=True, exist_ok=True)
+        evidence = self.github.evidence(job, pr)
+        metadata = json.loads(job["metadata"])
+        prior = None
+        if metadata.get("context_review") and not metadata.get("forced"):
+            prior = prior_bot_review(evidence, self.github.author, job["head"])
+        metadata["context_prior_review_id"] = prior["id"] if prior else None
+        if isinstance(evidence.get("discussion_digest"), str):
+            metadata["discussion_digest"] = evidence["discussion_digest"]
+        if isinstance(evidence.get("linked_issue_digest"), str):
+            metadata["linked_issue_digest"] = evidence["linked_issue_digest"]
+            metadata["linked_issue_complete"] = evidence["linked_issues"]["complete"]
+        self.store.update(job["id"], metadata=json.dumps(metadata))
+        job = self.store.job(job["id"])
+        evidence["local_validation"] = local_validation(
+            self.store, self.config.state_dir, job
+        )
+        (directory / "evidence.json").write_text(json.dumps(evidence, indent=2))
+        workspace, merge_base = self.workspace.prepare(source_slot, job, pr, directory)
+        repository_skill = next(
+            (
+                path
+                for path in (
+                    workspace / ".agents/skills/mo-self-review/SKILL.md",
+                    workspace / ".claude/skills/mo-self-review/SKILL.md",
+                )
+                if path.is_file()
+            ),
+            None,
+        )
+        context_instruction = (
+            f"This is an automatic same-head discussion follow-up. Previous authenticated review ID {prior['id']} is in evidence.json. First assess what changed against that review. If the new context adds no material finding, correction, or decision change, return decision=unchanged with a reason and validation, without repeating a full review. If uncertain or the context changes the assessment, conduct the necessary review and return approve or request_changes.\n"
+            if prior
+            else "This assignment requires a complete review; do not return unchanged.\n"
+        )
+        change_instruction = (
+            "Inspect the prior review and changed discussion first; trace relevant code only as needed."
+            if prior
+            else "Read the complete delta and relevant owners/consumers."
+        )
+        prompt = (
+            context_instruction
+            + f"""\nYou are mo-bot reusable review slot {slot_id}, generation {slot["generation"]}.
+CURRENT TASK (or independently scoped member of the current batch): job={job["id"]}, repository={job["repo"]},
 PR={job["pr"]}, HEAD={job["head"]}, merge-base={merge_base}. Only these frozen sources
 and {directory}/evidence.json establish facts for this PR. Earlier PR facts are not evidence.
 Repository review entry: {repository_skill or "none in this checkout"}.
-Change: {directory}/change.patch. Read the complete delta and relevant owners/consumers.
+Change: {directory}/change.patch. {change_instruction}
 Evidence: {directory}/evidence.json, including discussion_index, linked_issues and local_validation.
 Diagnostic directory: {directory}; keep review-plan.md, discussion-assessment.json, probes
 and validation evidence here. Use its disk-backed tmp directory and assigned task caches.
@@ -554,31 +714,127 @@ and head_sha={job["head"]}; the coordinator owns publication.
 This is attempt {attempt} of the SAME logical job; consult earlier attempt artifacts in
 {directory.parent} to recover completed evidence instead of repeating it blindly.
 """
+        )
+        return {
+            "job": self.store.job(job["id"]),
+            "directory": directory,
+            "workspace": workspace,
+            "prompt": prompt,
+        }
+
+    def python_sdk_review(self, pr, job, data):
+        """Classify a frozen PR head/base before creating its review claim."""
+        base_sha = (pr.get("base") or {}).get("sha")
+        if not isinstance(base_sha, str) or not base_sha:
+            raise ValueError("PR base SHA unavailable for model routing")
+        cached = data.get("review_route")
+        if (
+            isinstance(cached, dict)
+            and cached.get("head") == job["head"]
+            and cached.get("base") == base_sha
+            and cached.get("prefixes") == list(self.config.python_sdk_path_prefixes)
+            and type(cached.get("python_sdk")) is bool
+        ):
+            return cached["python_sdk"]
+
+        files = self.github.pull_files(job)
+        changed_files = pr.get("changed_files")
+        if type(changed_files) is not int or not isinstance(files, list):
+            raise ValueError(
+                "incomplete PR file list; refusing to select a review model"
             )
-            schema = SCHEMA
-        else:
-            directory = (
-                self.config.state_dir
-                / "slots"
-                / str(slot_id)
-                / f"warmup-{slot['generation']}"
+        truncated = 0 < len(files) < changed_files
+        if len(files) != changed_files and not truncated:
+            raise ValueError(
+                "incomplete PR file list; refusing to select a review model"
             )
-            workspace = self.slot_workspace(slot)
-            prompt = f"You are persistent mo-bot review slot {slot_id}. Future turns provide a new exact PR scope. Do not inspect files, run tools, or contact GitHub. Reply only with JSON ready=true."
-            schema = WARMUP_SCHEMA
-            if slot["role"] == "classifier":
-                prompt = f"You are persistent mo-bot issue similarity session {slot_id}. Future turns ask whether issue reports describe the same underlying cause and can be fixed together. Do not inspect repositories, use tools, or contact GitHub. Reply only with JSON ready=true."
-        if job:
-            self.store.update(job["id"], turn_dir=str(directory))
-        turn = self.backend.start(slot, directory, workspace, prompt, schema)
-        self.turns[slot_id] = (turn, None if job is None else job["id"])
+        paths = []
+        for entry in files:
+            if not isinstance(entry, dict) or not isinstance(
+                entry.get("filename"), str
+            ):
+                raise ValueError(
+                    "malformed PR file list; refusing to select a review model"
+                )
+            paths.append(entry["filename"])
+            previous = entry.get("previous_filename")
+            if previous is not None:
+                if not isinstance(previous, str):
+                    raise ValueError("malformed renamed PR path")
+                paths.append(previous)
+
+        current = self.github.pr(job)
+        current_base = (current.get("base") or {}).get("sha")
+        if (
+            current.get("state") != "open"
+            or (current.get("head") or {}).get("sha") != job["head"]
+        ):
+            raise SourceChanged("PR head changed during model routing")
+        if current_base != base_sha:
+            raise RuntimeError(
+                "PR base advanced during model routing; retry classification"
+            )
+
+        prefixes = tuple(
+            prefix.casefold() for prefix in self.config.python_sdk_path_prefixes
+        )
+        python_sdk = truncated or any(
+            path.casefold().startswith(prefix) for path in paths for prefix in prefixes
+        )
+        data["review_route"] = {
+            "head": job["head"],
+            "base": base_sha,
+            "python_sdk": python_sdk,
+            "prefixes": list(self.config.python_sdk_path_prefixes),
+        }
+        self.store.update(job["id"], data=json.dumps(data))
+        return python_sdk
+
+    def start_review(self, slot, prepared):
+        job = prepared["job"]
+        directory = prepared["directory"]
+        data = json.loads(job["data"])
+        data.pop("review_batch", None)
+        self.store.update(job["id"], turn_dir=str(directory), data=json.dumps(data))
+        turn = self.backend.start(
+            slot,
+            directory,
+            prepared["workspace"],
+            review_instructions() + "\n" + prepared["prompt"],
+            SCHEMA,
+        )
+        self.turns[slot["id"]] = (turn, job["id"])
         self.refresh_status()
         LOG.info(
             "started slot=%s session=%s job=%s",
-            slot_id,
+            slot["id"],
             slot["session_id"],
-            None if job is None else job["id"],
+            job["id"],
         )
+
+    def launch(self, slot, job=None):
+        if job:
+            if job["kind"] == "work":
+                return self.worker.launch(slot, job)
+            prepared = self.prepare_review(slot, job)
+            if prepared:
+                self.start_review(slot, prepared)
+            return
+        slot_id = slot["id"]
+        directory = (
+            self.config.state_dir
+            / "slots"
+            / str(slot_id)
+            / f"warmup-{slot['generation']}"
+        )
+        workspace = self.slot_workspace(slot)
+        prompt = f"You are persistent mo-bot review slot {slot_id}. Future turns provide a new exact PR scope. Do not inspect files, run tools, or contact GitHub. Reply only with JSON ready=true."
+        schema = WARMUP_SCHEMA
+        if slot["role"] == "classifier":
+            prompt = f"You are persistent mo-bot issue similarity session {slot_id}. Future turns ask whether issue reports describe the same underlying cause and can be fixed together. Do not inspect repositories, use tools, or contact GitHub. Reply only with JSON ready=true."
+        turn = self.backend.start(slot, directory, workspace, prompt, schema)
+        self.turns[slot_id] = (turn, None)
+        self.refresh_status()
 
     def save_result(self, job, slot, result, actual_model=None, actual_effort=None):
         validate_result(result, SCHEMA)
@@ -588,6 +844,20 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
             raise ValueError(
                 "confirmed findings require request_changes; other decisions need no findings"
             )
+        if result["decision"] == "unchanged":
+            metadata = json.loads(job["metadata"])
+            if (
+                not metadata.get("context_review")
+                or metadata.get("forced")
+                or type(metadata.get("context_prior_review_id")) is not int
+                or job["review_attempted"]
+                or job["review_id"]
+            ):
+                raise ValueError(
+                    "unchanged requires an automatic contextual follow-up with a prior review"
+                )
+            if not result["summary"].strip() or not result["validation"]:
+                raise ValueError("unchanged requires a reason and validation")
         if job["turn_dir"]:
             directory = Path(job["turn_dir"])
             evidence_path = directory / "evidence.json"
@@ -620,6 +890,8 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
         )
 
     def finish(self, slot_id, turn, key):
+        if turn.__dict__.get("review_jobs"):
+            return self.batches.finish(slot_id, turn, key)
         slot = next(
             s for s in self.store.slots(include_disabled=True) if s["id"] == slot_id
         )
@@ -771,27 +1043,9 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
                 error="head changed before publication",
             )
             return
-        if (
-            job["id"] not in self.eligible
-            and not job["review_attempted"]
-            and not forced
-        ):
-            admission = self.admission.get(str(job["pr"]), {})
-            author = (pr.get("user") or {}).get("login", "").casefold()
-            own_authors = {
-                self.config.reviewer.casefold(),
-                self.github.author.casefold(),
-            }
-            own_pr_still_unreviewed = (
-                author in own_authors
-                and admission.get("head") == job["head"]
-                and admission.get("reason") == "self-authored"
-            )
-            if not own_pr_still_unreviewed:
-                # Retain the assessment; a policy wait needs no model replay or
-                # repeated GitHub read on every scheduler tick.
-                self.store.update(job["id"], retry_at=time.time() + 60)
-                return
+        # Discovery eligibility selects new model work, not completed reports.
+        # CI failure, merge conflicts or a discovery refresh must not withhold
+        # an assessment. Live head/context checks and write fences still apply.
         metadata = json.loads(job["metadata"])
         previous_digest = metadata.get("discussion_digest")
         previous_issue_digest = metadata.get("linked_issue_digest")
@@ -866,6 +1120,46 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
                     self.eligible.add(key)
                 return
         envelope = json.loads(job["result"])
+        if envelope["assessment"]["decision"] == "unchanged":
+            if forced:
+                # A force request after the lightweight assessment still
+                # requires the full review; preserve the existing claim.
+                self.store.update(
+                    job["id"], state="queued", result=None, retry_at=0, error=None
+                )
+                self.eligible.add(job["id"])
+                return
+            # Revalidate the prior review after all head/discussion fences. A
+            # dismissed or superseded prior review cannot justify silence.
+            discussion = discussion if previous_digest else self.github.discussion(job)
+            prior = prior_bot_review(discussion, self.github.author, job["head"])
+            if not prior or prior["id"] != metadata.get("context_prior_review_id"):
+                self.store.update(
+                    job["id"],
+                    state="queued",
+                    result=None,
+                    retry_at=0,
+                    error="prior review changed; contextual assessment must be reconsidered",
+                )
+                self.eligible.add(job["id"])
+                return
+            review_url = (
+                prior.get("html_url")
+                or f"https://github.com/{job['repo']}/pull/{job['pr']}#pullrequestreview-{prior['id']}"
+            )
+            self.github.patch_comment(
+                job,
+                "done",
+                f"New discussion was assessed; the [previous review]({review_url}) remains unchanged.",
+            )
+            self.store.update(job["id"], state="done", comment_state="done", error=None)
+            LOG.info(
+                "context unchanged PR=%s head=%s job=%s",
+                job["pr"],
+                job["head"],
+                job["id"],
+            )
+            return
         text = report_text(envelope)
         event = (
             "COMMENT"
@@ -987,6 +1281,12 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
                     "job_id": current[1]
                     if current
                     else (owned["id"] if owned else None),
+                    "job_ids": turn_jobs(*current)
+                    if current
+                    else ([owned["id"]] if owned else []),
+                    "token_usage": current[0].__dict__.get("token_usage")
+                    if current
+                    else None,
                     "semantic_issue": semantic[0]["number"] if semantic else None,
                     "phase": owned["phase"] if owned else None,
                     "last_activity_at": getattr(current[0], "last_activity_at", None)
@@ -1043,6 +1343,9 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
                     + job["data"]["recovery_wait"]["guidance"]
                     if job["retry_at"] > time.time()
                     and job["data"].get("recovery_wait")
+                    else "automatic author commit cooldown"
+                    if job["retry_at"] > time.time()
+                    and job["error"] == "author-review-cooldown"
                     else "retry backoff"
                     if job["retry_at"] > time.time()
                     else status.get("reason", "awaiting successful discovery")
@@ -1053,18 +1356,9 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
                 job["state"] == "publishing"
                 and job["kind"] == "review"
                 and not job["review_attempted"]
-                and (busy or job["id"] not in self.eligible)
+                and busy
             ):
-                job["wait_reason"] = (
-                    "review publication waiting for active task"
-                    if busy
-                    else "review publication awaiting admission: "
-                    + (
-                        status.get("reason", "awaiting successful discovery")
-                        if status.get("head") == job["head"]
-                        else "awaiting successful discovery"
-                    )
-                )
+                job["wait_reason"] = "review publication waiting for active task"
             if (
                 job["state"] == "queued"
                 and job["dispatchable"]
@@ -1082,6 +1376,7 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
                 )
                 or (
                     job["error"]
+                    and job["error"] != "author-review-cooldown"
                     and job["state"] in ("queued", "publishing", "failed", "canceling")
                 )
             )
@@ -1140,6 +1435,7 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
                 "scratch_cleanup": dict(self.artifacts.status),
                 "updated_at": time.time(),
                 "backend_alive": bool(self.backend and not self.backend.dead),
+                "review_batch_size": self.config.batch_size,
                 "sessions": sessions,
                 "pools": {
                     role: {
@@ -1225,6 +1521,15 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
             ):
                 raise ValueError(
                     f"issue-to-pr skill missing: {self.config.issue_skill}"
+                )
+            if (
+                role == "review"
+                and count
+                and self.config.python_sdk_review_slot is not None
+                and count <= self.config.python_sdk_review_slot
+            ):
+                raise ValueError(
+                    "review pool must retain the configured Python SDK slot"
                 )
             defaults = {}
             for index in range(count):
@@ -1362,6 +1667,16 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
                 raise ValueError(
                     f"semantic classifier is pinned to {CLASSIFIER_MODEL}/{CLASSIFIER_EFFORT}"
                 )
+            if (
+                slot["role"] == "review"
+                and slot["pool_index"] == self.config.python_sdk_review_slot
+                and (model, effort)
+                != (PYTHON_SDK_REVIEW_MODEL, PYTHON_SDK_REVIEW_EFFORT)
+            ):
+                raise ValueError(
+                    "Python SDK review slot is pinned to "
+                    f"{PYTHON_SDK_REVIEW_MODEL}/{PYTHON_SDK_REVIEW_EFFORT}"
+                )
             entry = next(
                 (
                     m
@@ -1427,8 +1742,16 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
                     raise RuntimeError(
                         "backend disconnected; no replacement turn started"
                     )
-                current[0].release()
-                self.turns.pop(slot["id"], None)
+                if current[0].__dict__.get("review_jobs"):
+                    self.batches.finish(slot["id"], *current)
+                    if slot["id"] in self.turns:
+                        raise ValueError("batch tool cleanup is unconfirmed")
+                    # Preserve each checkpoint and let unfinished members resume
+                    # independently with the newly selected model.
+                    job = None
+                else:
+                    current[0].release()
+                    self.turns.pop(slot["id"], None)
             if job:
                 pr = self.github.pr(job)
                 if (
@@ -1511,6 +1834,24 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
             if existing_job:
                 key = existing_job["id"]
                 if existing_job["state"] == "done":
+                    prior_result = json.loads(existing_job["result"] or "{}")
+                    if (
+                        prior_result.get("assessment", {}).get("decision")
+                        == "unchanged"
+                    ):
+                        if self.store.review_uncertain(candidate["repo"], pr_number):
+                            raise ValueError(
+                                "prior review writes require reconciliation before forced re-review"
+                            )
+                        candidate["trigger_key"] = f"force:{time.time_ns()}"
+                        key = self.store.key(
+                            candidate["repo"],
+                            pr_number,
+                            candidate["headRefOid"],
+                            candidate["trigger_key"],
+                        )
+                        existing_job = None
+                if existing_job and existing_job["state"] == "done":
                     discussion = self.github.discussion(existing_job)
                     rows = inventory(discussion, self.github.author)
                     fingerprint = digest(rows)
@@ -1568,7 +1909,10 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
                     update = {"metadata": json.dumps(metadata)}
                     if skipped_merge:
                         update.update(state="queued", error=None, retry_at=0)
-                    if existing_job["error"] == "owner-wip":
+                    if existing_job["error"] in (
+                        "owner-wip",
+                        "author-review-cooldown",
+                    ):
                         update.update(error=None, retry_at=0)
                     self.store.update(key, **update)
                     self.eligible.add(key)
@@ -1634,10 +1978,11 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
                 }
             if action == "interrupt":
                 if current:
-                    if current[1]:
-                        self.store.update(
-                            current[1], state="canceling", error="operator interrupted"
-                        )
+                    for key in turn_jobs(*current):
+                        if self.store.job(key)["state"] == "reviewing":
+                            self.store.update(
+                                key, state="canceling", error="operator interrupted"
+                            )
                     current[0].error = "operator interrupted"
                     current[0].stop()
                 return {"interrupted": bool(current)}
@@ -1699,8 +2044,12 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
         try:
             if self.artifacts.due():
                 self.artifacts.poll(
-                    self.store.jobs(("done", "failed", "superseded")),
-                    {key for _, key in self.turns.values() if key},
+                    self.store.terminal_jobs(),
+                    {
+                        key
+                        for turn, anchor in self.turns.values()
+                        for key in turn_jobs(turn, anchor)
+                    },
                 )
         except (OSError, ValueError) as error:
             self.artifacts.status["errors"] = [str(error)]
@@ -1742,7 +2091,10 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
             ).fetchone()[0]
             timeout = 120 if role == "classifier" else self.config.job_timeout_seconds
             if (
-                (job and job["state"] == "canceling")
+                any(
+                    self.store.job(k)["state"] == "canceling"
+                    for k in turn_jobs(turn, key)
+                )
                 or turn.error
                 or size > 64 * 1024 * 1024
                 or time.monotonic() - turn.started > timeout
@@ -1771,22 +2123,17 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
                     job["id"], error=str(error), retry_at=time.time() + 60
                 )
                 LOG.warning("publication blocked job=%s: %s", job["id"], error)
-        for job in self.store.jobs(("failed", "superseded")):
-            if (
-                job["comment_id"]
-                and job["comment_state"] != job["state"]
-                and job["retry_at"] <= time.time()
-            ):
-                try:
-                    self.github.patch_comment(
-                        job,
-                        job["state"],
-                        job["error"] or "Task stopped without a review verdict.",
-                    )
-                    self.store.update(job["id"], comment_state=job["state"])
-                except Exception as error:
-                    self.store.update(job["id"], retry_at=time.time() + 60)
-                    LOG.warning("terminal comment blocked job=%s: %s", job["id"], error)
+        for job in self.store.terminal_comments():
+            try:
+                self.github.patch_comment(
+                    job,
+                    job["state"],
+                    job["error"] or "Task stopped without a review verdict.",
+                )
+                self.store.update(job["id"], comment_state=job["state"])
+            except Exception as error:
+                self.store.update(job["id"], retry_at=time.time() + 60)
+                LOG.warning("terminal comment blocked job=%s: %s", job["id"], error)
         if (
             shutil.disk_usage(self.config.state_dir).free
             < self.config.minimum_free_gib * 1024**3
@@ -1816,7 +2163,7 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
                 job = self.store.claim(slot["id"], self.eligible)
                 if job:
                     try:
-                        self.launch(slot, job)
+                        self.batches.launch(slot, job)
                     except SourceChanged as error:
                         if job["kind"] == "work":
                             self.store.dispose_evidence(job, "superseded")
@@ -1891,7 +2238,7 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
             (
                 (slot, turn)
                 for slot, (turn, key) in self.turns.items()
-                if key == job["id"]
+                if job["id"] in turn_jobs(turn, key)
             ),
             None,
         )

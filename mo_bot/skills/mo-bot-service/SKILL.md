@@ -36,6 +36,20 @@ publication. Repair retains its WIP restriction. Automatic tasks wait with their
 source/assessment retained; label removal allows normal admission again.
 Operator-paused tasks still need explicit resume.
 
+`[review.author_review_delays]` maps case-insensitive GitHub author logins to
+minutes to wait after the PR head commit. The table is reloaded during discovery
+and immediately before dispatch, so adding, changing or removing an entry takes
+effect without restarting the service. Missing exact-head commit evidence blocks
+automatic review until it is available. Explicit force enqueue bypasses this
+delay along with other review admission filters.
+
+`[review.python_sdk]` optionally routes PRs touching configured `path_prefixes`
+to the configured review `slot`. That slot is pinned to `gpt-6.1-sol/xhigh`;
+the service verifies the complete PR file list and rechecks head/base before
+creating a review claim. If GitHub truncates a very large file list, it routes
+conservatively through that slot. Example: `slot = 1` and
+`path_prefixes = ["clients/python/"]`.
+
 Review commentary and assessment reports are written in English, as required by the repository review/worker skills. Existing published assessments are not rewritten solely to change language.
 
 The repository's [mo-bot-review skill](../mo-bot-review/SKILL.md) owns reviewer prompt guidance and the decision/publication contract. The coordinator reads it for every new assigned review and snapshots the prompt for recovery. Edit that skill to change review guidance; do not maintain a parallel prompt in this operator skill. `scripts/install.py` installs both repository skills into agent discovery paths.
@@ -47,7 +61,7 @@ external-review procedure. Discussion bodies are read once through the complete
 index, with raw records available for extra context. Inspect the saved prompt
 and execution history when checking which rules actually ran.
 
-New reviews return only `request_changes` or `approve`, enforced by the generation schema and result validation. Actionable defects and demonstrated unmet required validation contracts map to `REQUEST_CHANGES`; supported approvals map to `APPROVE`. Historical `needs_validation` assessments remain readable and map to `COMMENT`. Own PRs without an authenticated, marked bot review on the current head are admitted without waiting for CI; draft/exclusion/mergeability gates still apply. Reviews on older heads do not suppress a new commit. Own PRs receive `COMMENT` regardless of assessment because GitHub prevents self-approval and self-requested changes. A completed failed check/status admits repair while sibling checks/workflows are running, subject to the existing target fence and evidence deduplication. A completed legacy comment-only job is not replayed. Each new result produces at most one marked formal review plus its existing status comment.
+Full reviews return `request_changes` or `approve`. An automatic same-head discussion follow-up with a verified prior review may return `unchanged` after assessing the new context; the coordinator retains that assessment and updates the status without posting a duplicate formal review. Forced reviews always run the full review. Actionable defects and demonstrated unmet required validation contracts map to `REQUEST_CHANGES`; supported approvals map to `APPROVE`. Historical `needs_validation` assessments remain readable and map to `COMMENT`. Own PRs without an authenticated, marked bot review on the current head are admitted without waiting for CI; draft/exclusion/mergeability gates still apply. Reviews on older heads do not suppress a new commit. Own PRs receive `COMMENT` regardless of assessment because GitHub prevents self-approval and self-requested changes. A completed failed check/status admits repair while sibling checks/workflows are running, subject to the existing target fence and evidence deduplication. A completed legacy comment-only job is not replayed. Each new result produces at most one marked formal review plus its existing status comment.
 
 Automatic discovery skips `merge-only-reviewed` heads when an authenticated,
 marked earlier bot review is followed solely by clean default-branch merges.
@@ -58,6 +72,26 @@ SHA. Explicit force enqueue bypasses this rule, including an unclaimed task
 previously superseded solely for `merge-only-reviewed`.
 
 ## Review status and history
+
+`[review] batch_size=2` lets each local reviewer combine two already-admitted
+ordinary PRs in one native turn. Default is 1. There is no wait to fill a batch;
+forced reviews, discussion follow-ups, retries and SSH turns remain individual.
+`batch_max_patch_bytes` (default 120000 per PR) keeps large patches separate.
+Each job retains its own source/head/evidence and publication fences. A valid
+per-member checkpoint may publish while its sibling continues. Interrupted or
+invalid unfinished members retry individually; completed siblings are retained.
+Session `job_ids` lists all members; `job_id` remains the original anchor for
+older clients. Slot interrupt affects unfinished members; job pause targets the
+named member and checkpoints/requeues its unfinished sibling after tool cleanup.
+Model switching retains completed results and queues unfinished members under
+the new selection. Drain before changing runtime configuration or rolling back.
+
+`token-usage.json` in the native turn directory records usage notifications.
+For a batch, find that shared directory in `job.data.review_batch.directory`;
+count the shared turn once, never once per member. `turn_tokens` is a difference
+from an observed previous thread total; it is null when no baseline is available
+or counters reset. `thread_total` is cumulative and is not this job's token cost.
+Session `token_usage` exposes the same live data. Missing usage is not zero.
 
 The complete assessment appears in the formal review. Its status comment links
 to that review instead of repeating the report. Initial comment-only repair
@@ -92,7 +126,7 @@ To ask a RUNNING session directly, use `mo-botctl progress SLOT`. This steers th
 
 For detail, use `mo-botctl history SLOT` for native conversation and `mo-botctl events` for current output. Distinguish facts already established from planned work, running checks and missing evidence; do not invent progress percentages. History spans multiple PRs because sessions are reused: bind observations to exact current job/head and turn ID.
 
-For completed jobs, report `result.assessment.decision`, summary/findings, actual validation and limitations from the full job detail, plus `comment_id`, `review_id` and `review_event`. `publishing` has a saved result awaiting publication; `done` is published, while failed/superseded are not successful reviews. Expose errors for failed tasks. The summary API lists the latest 200 jobs plus active/affine jobs; disclose that limit instead of claiming an exhaustive history. `queued` is not proof of admission: inspect `dispatchable` and `wait_reason`, and the discovery success timestamp/error. CI/mergeability waits retain the job; an automatic same-head task already decisively reviewed becomes `superseded` with reason `already-reviewed`. A failed/incomplete discovery never implies PR closure. Status operations are read-only and do not authorize enqueue, interruption, model changes or review publication.
+For completed jobs, report `result.assessment.decision`, summary/findings, actual validation and limitations from the full job detail, plus `comment_id`, `review_id` and `review_event`. `publishing` has a saved result awaiting publication; `done` is published, while failed/superseded are not successful reviews. Expose errors for failed tasks. The summary API lists the latest 200 jobs plus active/affine jobs; disclose that limit instead of claiming an exhaustive history. `queued` is not proof of admission: inspect `dispatchable` and `wait_reason`, and the discovery success timestamp/error. Before execution, CI/mergeability waits retain the queued job; an automatic same-head task already decisively reviewed becomes `superseded` with reason `already-reviewed`. A failed/incomplete discovery never implies PR closure. Status operations are read-only and do not authorize enqueue, interruption, model changes or review publication.
 
 ## Requested operations
 
@@ -131,7 +165,7 @@ also admits configured-owner issues assigned to them with `bot-ready`; one
 optional local classifier uses pinned `gpt-6-luna/xhigh` and groups only clear
 same-root-cause matches into a compatible, early task (maximum three issues).
 Uncertain matches and classifier/model failures remain separate issue jobs.
-Automatic PR discovery stays limited to the configured owner. Explicit assignments freeze operator authority and initial guidance in SQLite; workers execute that scope without requiring PR authorship. For another author's PR, the scheduler retains the original source identity and uses the operator's owned upstream fork for delivery, opening a marked repair PR against the original author's source branch. The original upstream PR number remains the task target. Saved reviews awaiting admission do not block repair execution; active review turns and uncertain review writes retain their fences. Inspect role, phase, error and native session in jobs/sessions.
+Automatic PR discovery stays limited to the configured owner. Explicit assignments freeze operator authority and initial guidance in SQLite; workers execute that scope without requiring PR authorship. For another author's PR, the scheduler retains the original source identity and uses the operator's owned upstream fork for delivery, opening a marked repair PR against the original author's source branch. The original upstream PR number remains the task target. Saved unattempted reviews do not block repair execution; active review turns and uncertain review writes retain their fences. Inspect role, phase, error and native session in jobs/sessions.
 `[worker] sessions` controls delivery capacity; its default model is
 gpt-6.1-sol/low. Worker assignments live in repo-owned mo-bot-worker; the bundled
 issue-to-pr workflow owns shared requirements and mandatory gpt-6.1-terra/max design/final
@@ -174,8 +208,11 @@ preserving reviewed commits in private coordinator Git refs; target/write fences
 remain. A GitHub outage must not consume another model review.
 
 Missing final validation continues in final_review with the accepted design retained. Only source/design findings or an explicit replan reopen earlier phases. Retry pacing uses source, frozen input and successful execution receipts rather than the wording of limitations; repeating the same check does not reset a stalled task.
-Review publication awaiting CI/admission exposes its policy in `wait_reason` and
-uses a retry deadline; it retains the saved assessment without another review.
+Completed review publication is independent of CI, mergeability and discovery
+admission. Those filters select new model work; they must not withhold a saved
+assessment. Publication still checks the open head, frozen discussion/issue
+inputs, operator pause, owner WIP and write ownership. Transport retries retain
+the saved assessment without another model turn.
 Waiting for an active task on the same PR uses the existing PR fence: it clears
 obsolete pre-write transport errors once, does not rewrite a minute retry timer,
 and proceeds when the fence clears. Uncertain attempted writes retain their

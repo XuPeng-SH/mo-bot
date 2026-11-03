@@ -6,6 +6,8 @@ from pathlib import Path
 
 
 ACTIVE = ("reviewing", "publishing", "canceling")
+TERMINAL_COMMENT_PENDING = """state IN ('failed','superseded')
+    AND comment_id IS NOT NULL AND comment_id<>0 AND comment_state IS NOT state"""
 
 
 def pr_fence(alias=""):
@@ -178,7 +180,7 @@ class Store:
                 "CREATE UNIQUE INDEX IF NOT EXISTS work_identity ON jobs(repo,target_number,target_type,trigger_key,head) WHERE kind='work'"
             )
             self.db.execute(
-                "CREATE UNIQUE INDEX active_slot ON jobs(slot_id) WHERE state IN ('reviewing','canceling') OR (kind='work' AND state IN ('queued','publishing') AND slot_id IS NOT NULL)"
+                "CREATE UNIQUE INDEX active_slot ON jobs(slot_id,CASE WHEN kind='review' AND json_extract(data,'$.review_batch_anchor') IS NOT NULL THEN 1 ELSE 0 END) WHERE state IN ('reviewing','canceling') OR (kind='work' AND state IN ('queued','publishing') AND slot_id IS NOT NULL)"
             )
             self.db.execute(
                 f"CREATE UNIQUE INDEX active_pr ON jobs(repo,pr) WHERE {pr_fence()}"
@@ -190,6 +192,10 @@ class Store:
                 "CREATE INDEX IF NOT EXISTS jobs_created ON jobs(created DESC)"
             )
             self.db.execute("CREATE INDEX IF NOT EXISTS jobs_state ON jobs(state)")
+            self.db.execute(
+                "CREATE INDEX IF NOT EXISTS terminal_comments_due ON jobs(state,retry_at) WHERE "
+                + TERMINAL_COMMENT_PENDING
+            )
             statements = [
                 "CREATE TABLE IF NOT EXISTS evidence(repo TEXT NOT NULL, number INTEGER NOT NULL, head TEXT NOT NULL, key TEXT NOT NULL, payload TEXT NOT NULL, disposition TEXT, job_id TEXT, PRIMARY KEY(repo,number,head,key))",
                 "CREATE TABLE IF NOT EXISTS effects(key TEXT PRIMARY KEY, job_id TEXT NOT NULL REFERENCES jobs(id), kind TEXT NOT NULL, intent TEXT NOT NULL, attempted INTEGER NOT NULL DEFAULT 0, result TEXT, error TEXT, created REAL NOT NULL)",
@@ -445,6 +451,21 @@ class Store:
             parameters.append(limit)
         return self.db.execute(query, parameters).fetchall()
 
+    def terminal_comments(self, now=None):
+        """Read only status comments that need a terminal-state update now."""
+        return self.db.execute(
+            "SELECT id,repo,pr,head,kind,state,comment_id,error FROM jobs WHERE "
+            + TERMINAL_COMMENT_PENDING
+            + " AND retry_at<=?",
+            (time.time() if now is None else now,),
+        ).fetchall()
+
+    def terminal_jobs(self):
+        """Scratch collection needs lifecycle identities, not review evidence."""
+        return self.db.execute(
+            "SELECT id,state FROM jobs WHERE state IN ('done','failed','superseded')"
+        ).fetchall()
+
     def slots(self, *, include_disabled=False):
         if include_disabled:
             return self.db.execute("SELECT * FROM slots ORDER BY id").fetchall()
@@ -463,6 +484,7 @@ class Store:
                 'ci',json_extract(metadata,'$.ci'),'forced',json_extract(metadata,'$.forced'),
                 'members',json_extract(metadata,'$.members')) AS metadata,
             json_object('manual_reconciliation',json_extract(data,'$.manual_reconciliation'),
+                'review_batch',json_extract(data,'$.review_batch'),
                 'publication_next_at',json_extract(data,'$.publication_next_at'),
                 'publication_failures',json_extract(data,'$.publication_failures'),
                 'publication_started_at',json_extract(data,'$.publication_started_at'),
@@ -577,7 +599,7 @@ class Store:
                 (key, identity),
             )
 
-    def claim(self, slot: int, eligible=None):
+    def claim(self, slot: int, eligible=None, *, companion_of=None):
         with self.db:
             self.db.execute("BEGIN IMMEDIATE")
             slot_row = self.db.execute(
@@ -587,6 +609,20 @@ class Store:
                 return None
             if slot_row["role"] == "classifier":
                 return None
+            if companion_of is not None:
+                active = self.db.execute(
+                    "SELECT id,kind,state,data FROM jobs WHERE slot_id=? AND state IN ('reviewing','canceling')",
+                    (slot,),
+                ).fetchall()
+                if (
+                    slot_row["role"] != "review"
+                    or len(active) != 1
+                    or active[0]["id"] != companion_of
+                    or active[0]["kind"] != "review"
+                    or active[0]["state"] != "reviewing"
+                    or json.loads(active[0]["data"]).get("review_batch_anchor")
+                ):
+                    return None
             reserved = self.db.execute(
                 "SELECT * FROM jobs WHERE slot_id=? AND kind='work' AND state='queued'",
                 (slot,),
@@ -607,10 +643,13 @@ class Store:
             else:
                 if not slot_row["enabled"]:
                     return None
-                if self.db.execute(
-                    "SELECT 1 FROM jobs WHERE slot_id=? AND (state IN ('reviewing','canceling') OR (kind='work' AND state='publishing'))",
-                    (slot,),
-                ).fetchone():
+                if (
+                    companion_of is None
+                    and self.db.execute(
+                        "SELECT 1 FROM jobs WHERE slot_id=? AND (state IN ('reviewing','canceling') OR (kind='work' AND state='publishing'))",
+                        (slot,),
+                    ).fetchone()
+                ):
                     return None
                 kind = "review" if slot_row["role"] == "review" else "work"
                 choices = self.db.execute(
@@ -641,9 +680,14 @@ class Store:
                 )
             if job is None:
                 return None
+            data = json.loads(job["data"])
+            if companion_of is None:
+                data.pop("review_batch_anchor", None)
+            else:
+                data["review_batch_anchor"] = companion_of
             self.db.execute(
-                "UPDATE jobs SET state='reviewing',slot_id=?,updated=? WHERE id=?",
-                (slot, time.time(), job["id"]),
+                "UPDATE jobs SET state='reviewing',slot_id=?,updated=?,data=? WHERE id=?",
+                (slot, time.time(), json.dumps(data), job["id"]),
             )
         return self.job(job["id"])
 

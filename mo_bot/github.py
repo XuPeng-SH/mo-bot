@@ -1,3 +1,4 @@
+import datetime as dt
 import importlib.util
 import json
 import subprocess
@@ -5,7 +6,12 @@ import sys
 import time
 from urllib.parse import urlencode
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from .review_queue import Queue, owner_wip
+from .review_queue import (
+    Queue,
+    author_review_delay_minutes,
+    automatic_review_not_before,
+    owner_wip,
+)
 from .review_equivalence import MergeOnlyReviews
 from .review_context import (
     MARKER,
@@ -184,6 +190,55 @@ def discover(config):
                     admission[str(pr["number"])].update(
                         state="indeterminate", reason="incomplete discussion evidence"
                     )
+    now = dt.datetime.now(dt.timezone.utc)
+    ready_candidates = []
+    commit_github = getattr(queue, "github", None)
+    if not hasattr(commit_github, "api"):
+        commit_github = None
+    for candidate in candidates:
+        number = str(candidate["number"])
+        if not author_review_delay_minutes(candidate, config.author_review_delays):
+            ready_candidates.append(candidate)
+            continue
+        try:
+            # Fetch only for configured authors to keep broad PR discovery cheap.
+            if commit_github is None:
+                commit_github = GitHub(config)
+            remote_commit = commit_github.api(
+                f"repos/{config.repository}/commits/{candidate['headRefOid']}"
+            )
+            commit_details = remote_commit.get("commit") or {}
+            committer = commit_details.get("committer") or {}
+            commit = {
+                "oid": remote_commit.get("sha"),
+                "committed_at": committer.get("date"),
+            }
+            not_before = automatic_review_not_before(
+                candidate, config.author_review_delays, commit
+            )
+            candidate["head_commit_date"] = commit["committed_at"]
+        except (
+            OSError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+            KeyError,
+            AttributeError,
+        ):
+            unknown.append(candidate["number"])
+            admission[number].update(
+                state="indeterminate", reason="author-review-delay-unavailable"
+            )
+            continue
+        if not_before and now < not_before:
+            admission[number].update(
+                state="excluded",
+                reason="author-review-cooldown",
+                eligible_at=not_before.astimezone(dt.timezone.utc).isoformat(),
+            )
+            continue
+        ready_candidates.append(candidate)
+    candidates = ready_candidates
     candidates.sort(key=lambda p: p["updatedAt"])
     assigned_issues, assigned_issue_error = [], None
     try:
@@ -229,7 +284,7 @@ def discover(config):
         "complete": True,
         "candidates": candidates,
         "heads": {str(p["number"]): p["headRefOid"] for p in prs},
-        "indeterminate": unknown,
+        "indeterminate": sorted(set(unknown)),
         "admission": admission,
         "own_prs": [
             p
@@ -302,6 +357,12 @@ class GitHub:
 
     def pr(self, job):
         return self.api(f"repos/{job['repo']}/pulls/{job['pr']}")
+
+    def pull_files(self, job):
+        return self.api(
+            f"repos/{job['repo']}/pulls/{job['pr']}/files?per_page=100",
+            pages=True,
+        )
 
     def comments(self, job):
         return self.api(

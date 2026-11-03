@@ -161,6 +161,47 @@ def new_since(rows, timestamp):
     )
 
 
+def prior_bot_review(discussion, reviewer, head):
+    """Find the latest still-decisive, authenticated review of this exact head."""
+    reviews = discussion.get("reviews")
+    if not isinstance(reviews, list):
+        raise ValueError("incomplete PR reviews")
+    candidates = []
+    for r in reviews:
+        if ((r.get("user") or {}).get("login") or "").casefold() != reviewer.casefold():
+            continue
+        if (
+            r.get("state")
+            not in ("APPROVED", "CHANGES_REQUESTED", "COMMENTED", "DISMISSED")
+            or r.get("commit_id") != head
+        ):
+            continue
+        match = MARKER.search(r.get("body") or "")
+        if not match:
+            continue
+        try:
+            marker = json.loads(match.group(1))
+        except ValueError:
+            continue
+        if (
+            not isinstance(marker, dict)
+            or marker.get("head") != head
+            or marker.get("state") != "review"
+            or not marker.get("service")
+            or not marker.get("job")
+        ):
+            continue
+        if type(r.get("id")) is not int or not r.get("submitted_at"):
+            continue
+        candidates.append(r)
+    latest = (
+        max(candidates, key=lambda r: (r["submitted_at"], r["id"]))
+        if candidates
+        else None
+    )
+    return latest if latest and latest["state"] != "DISMISSED" else None
+
+
 def validate_ledger(rows, ledger):
     """Require traceable handling, not agreement with either party's opinion."""
     known = {r["key"] for r in rows}
