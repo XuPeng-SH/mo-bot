@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tomllib
 
 from .config import Config
 
@@ -46,6 +47,26 @@ def initialize(path, repository, source_dir, reviewer=None, worker_sessions=0):
         return json.dumps(str(value), ensure_ascii=False)
 
     service_id = "mo-bot-" + re.sub(r"[^A-Za-z0-9_.-]", "-", getpass.getuser())[:60]
+    policy = {}
+    if repository.casefold() == "matrixorigin/matrixone":
+        policy = tomllib.loads((PACKAGE / "profiles/matrixone.toml").read_text())[
+            "review"
+        ]
+    delays = dict(policy.get("author_review_delays", {}))
+    if policy and reviewer.casefold() not in {login.casefold() for login in delays}:
+        delays[reviewer] = 10
+    policy_tables = ""
+    if policy.get("python_sdk"):
+        route = policy["python_sdk"]
+        policy_tables += (
+            "\n[review.python_sdk]\n"
+            f"slot = {route['slot']}\n"
+            f"path_prefixes = {json.dumps(route['path_prefixes'])}\n"
+        )
+    if delays:
+        policy_tables += "\n[review.author_review_delays]\n" + "".join(
+            f"{quote(login)} = {minutes}\n" for login, minutes in delays.items()
+        )
     content = f"""[service]
 id = {quote(service_id)}
 state_dir = {quote(state)}
@@ -56,13 +77,14 @@ repository = {quote(repository)}
 reviewer = {quote(reviewer)}
 source_dir = {quote(source_dir)}
 sessions = 2
+batch_size = {policy.get("batch_size", 1)}
 model = "gpt-6-astra"
 reasoning_effort = "xhigh"
-exclude = []
+exclude = {json.dumps(policy.get("exclude", []))}
 minimum_free_gib = 20
 codex = "codex"
 gh = "gh"
-
+{policy_tables}
 [worker]
 sessions = {worker_sessions}
 classifier_sessions = {1 if worker_sessions else 0}

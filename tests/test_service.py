@@ -83,6 +83,80 @@ class TestWorkflow(unittest.TestCase):
         self.store.enqueue(c)
         return self.store.job(self.store.key(c["repo"], pr, head))
 
+    def test_python_sdk_route_survives_restart_and_pins_before_claim(self):
+        self.service.close()
+        self.config = replace(
+            self.config,
+            python_sdk_review_slot=1,
+            python_sdk_path_prefixes=("clients/python/",),
+        )
+        self.service = Service(self.config, github=self.gh, workspace=self.workspace)
+        self.store = self.service.store
+        for i in range(2):
+            self.store.slot_update(i, ready=1, session_id=f"thread-{i}")
+        slots = self.store.slots()
+        self.assertEqual(
+            (slots[1]["model"], slots[1]["effort"]), ("gpt-6.1-sol", "xhigh")
+        )
+        job = self.job()
+        self.gh.pr.return_value["changed_files"] = 1
+        self.gh.pull_files.return_value = [
+            {"filename": "docs/moved.py", "previous_filename": "clients/python/old.py"}
+        ]
+        claimed = self.store.claim(0, {job["id"]})
+        self.assertIsNone(self.service.prepare_review(slots[0], claimed))
+        routed = self.store.job(job["id"])
+        self.assertEqual(
+            (routed["state"], routed["slot_id"], routed["attempts"]), ("queued", 1, 0)
+        )
+        self.gh.ensure_comment.assert_not_called()
+        self.assertIsNone(self.store.claim(0, {job["id"]}))
+        self.assertEqual(self.store.claim(1, {job["id"]})["id"], job["id"])
+        with self.assertRaisesRegex(ValueError, "pinned"):
+            self.service.command("model", {"slot": 1, "model": "gpt-6-astra"})
+        with self.assertRaisesRegex(ValueError, "retain"):
+            self.service.command("resize_pool", {"role": "review", "sessions": 1})
+
+    def test_python_sdk_route_retries_incomplete_file_evidence_and_base_movement(self):
+        self.service.config = replace(
+            self.config,
+            python_sdk_review_slot=1,
+            python_sdk_path_prefixes=("clients/python/",),
+        )
+        job = self.job()
+        pr = dict(self.gh.pr.return_value, changed_files=2)
+        self.gh.pull_files.return_value = []
+        with self.assertRaisesRegex(ValueError, "incomplete"):
+            self.service.python_sdk_review(pr, job, {})
+        self.gh.pull_files.return_value = [{"filename": "README.md"}]
+        self.gh.pr.return_value = pr
+        self.assertTrue(self.service.python_sdk_review(pr, job, {}))
+        self.store.update(job["id"], data="{}")
+        pr["changed_files"] = 1
+        self.gh.pr.return_value = dict(pr, base={"sha": "c" * 40})
+        with self.assertRaisesRegex(RuntimeError, "base advanced"):
+            self.service.python_sdk_review(pr, job, {})
+        self.assertNotIn("review_route", json.loads(self.store.job(job["id"])["data"]))
+        self.gh.ensure_comment.assert_not_called()
+
+    def test_python_sdk_route_cache_tracks_policy_and_general_changes(self):
+        self.service.config = replace(
+            self.config,
+            python_sdk_review_slot=1,
+            python_sdk_path_prefixes=("clients/python/",),
+        )
+        job = self.job()
+        pr = dict(self.gh.pr.return_value, changed_files=1)
+        self.gh.pr.return_value = pr
+        self.gh.pull_files.return_value = [{"filename": "pkg/example.go"}]
+        self.assertFalse(self.service.python_sdk_review(pr, job, {}))
+        data = json.loads(self.store.job(job["id"])["data"])
+        self.service.config = replace(
+            self.service.config, python_sdk_path_prefixes=("pkg/",)
+        )
+        self.assertTrue(self.service.python_sdk_review(pr, job, data))
+        self.assertEqual(self.gh.pull_files.call_count, 2)
+
     def test_drained_service_reclaims_terminal_scratch_without_deleting_evidence(self):
         job = self.job()
         directory = self.service.job_dir(job) / "attempt-1"

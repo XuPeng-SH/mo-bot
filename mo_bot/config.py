@@ -71,13 +71,17 @@ class Config:
             "path_prefixes",
         }:
             raise ValueError("review.python_sdk must be a table")
+        if python_sdk and "slot" not in python_sdk:
+            raise ValueError("review.python_sdk.slot is required")
         if "path_prefixes" in python_sdk and not isinstance(
             python_sdk["path_prefixes"], list
         ):
             raise ValueError("review.python_sdk.path_prefixes must be an array")
         raw_delays = review.get("author_review_delays", {})
         if not isinstance(raw_delays, dict):
-            raise ValueError("review.author_review_delays must be a table of login to minutes")
+            raise ValueError(
+                "review.author_review_delays must be a table of login to minutes"
+            )
         author_review_delays = {}
         for login, minutes in raw_delays.items():
             if (

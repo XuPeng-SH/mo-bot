@@ -68,6 +68,42 @@ review admission. Discovery reports `merge-only-reviewed` and the original
 `reviewed_head`; it does not publish a review claiming validation of the new SHA.
 Explicit `mo-botctl enqueue PR` bypasses this filter too.
 
+## Reproduce the MatrixOne review service on a new host
+
+The default branch contains the service, reviewer rules and the packaged
+[`matrixone` policy](mo_bot/profiles/matrixone.toml). For
+`matrixorigin/matrixone`, `init` applies that policy automatically: two review
+slots, two-PR batching, Python SDK changes routed to `gpt-6.1-sol/xhigh`,
+MatrixAdventurer's 20-minute cooldown and the configured reviewer's 10-minute
+cooldown. Delivery workers are disabled unless explicitly enabled.
+
+```bash
+git clone https://github.com/XuPeng-SH/mo-bot.git
+cd mo-bot
+python3 scripts/install.py
+export PATH="$HOME/.local/bin:$PATH"
+gh auth login
+codex login
+git clone https://github.com/matrixorigin/matrixone.git ../matrixone
+mo-bot init --repository matrixorigin/matrixone --source-dir ../matrixone --reviewer YOUR_LOGIN
+mo-bot doctor
+mo-bot install --systemd --start
+```
+
+Use a Codex account with the configured models available. Paths, credentials,
+proxy environment and user systemd settings are host-specific; configure them
+on the new host. `init` preserves existing configuration; upgrading an existing
+host does not silently replace its policy. Review the packaged policy when
+updating an existing config. Repository-specific engineering guidance is read
+from each assigned PR's frozen checkout.
+
+Queue state, saved assessments, model selections and native conversation history
+are runtime data, not Git content. To replace a running coordinator, drain it,
+wait for `dispatch_control.drained=true`, and stop it before starting the new
+host. SQLite and locks are local: do not run two independent coordinators for
+the same review queue. A fresh host starts new sessions and cannot recover the
+old host's in-flight publication checkpoints from a clone alone.
+
 ## Verification
 
 ```bash

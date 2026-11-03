@@ -197,9 +197,7 @@ def discover(config):
         commit_github = None
     for candidate in candidates:
         number = str(candidate["number"])
-        if not author_review_delay_minutes(
-            candidate, config.author_review_delays
-        ):
+        if not author_review_delay_minutes(candidate, config.author_review_delays):
             ready_candidates.append(candidate)
             continue
         try:

@@ -88,7 +88,11 @@ class TestOwnPRDiscovery(unittest.TestCase):
         queue.classify.return_value = ("excluded", "self-authored", None)
         queue.ci_state.return_value = (ci.startswith("fresh"), ci)
         config = Mock(
-            repository="owner/repo", reviewer="me", exclude=(), stale_ci_days=14
+            author_review_delays={},
+            repository="owner/repo",
+            reviewer="me",
+            exclude=(),
+            stale_ci_days=14,
         )
         with patch("mo_bot.github.load_queue", return_value=queue):
             return discover(config)
@@ -228,7 +232,11 @@ class TestOwnPRDiscovery(unittest.TestCase):
             queue.all_prs.return_value = [{"number": 1, "headRefOid": "a" * 40}]
             queue.classify.return_value = ("excluded", reason, None)
             config = Mock(
-                repository="owner/repo", reviewer="me", exclude=(), stale_ci_days=14
+                author_review_delays={},
+                repository="owner/repo",
+                reviewer="me",
+                exclude=(),
+                stale_ci_days=14,
             )
             with patch("mo_bot.github.load_queue", return_value=queue):
                 self.assertFalse(discover(config)["candidates"])

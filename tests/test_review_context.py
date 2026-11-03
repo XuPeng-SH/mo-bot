@@ -229,7 +229,13 @@ class TestContextDiscovery(unittest.TestCase):
         q = Mock()
         q.all_prs.return_value = [pr]
         q.classify.return_value = ("excluded", "already-reviewed", None)
-        config = Mock(repository="o/r", reviewer="me", exclude=(), stale_ci_days=14)
+        config = Mock(
+            author_review_delays={},
+            repository="o/r",
+            reviewer="me",
+            exclude=(),
+            stale_ci_days=14,
+        )
         gh = Mock()
         gh.discussion.return_value = discussion()
         gh.author = "me"

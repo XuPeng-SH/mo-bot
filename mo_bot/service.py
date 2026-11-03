@@ -574,11 +574,12 @@ class Service:
                     None,
                 )
                 if target is None:
-                    raise RuntimeError("configured Python SDK review slot is unavailable")
-                if (
-                    slot_id != target["id"]
-                    or (slot["model"], slot["effort"])
-                    != (PYTHON_SDK_REVIEW_MODEL, PYTHON_SDK_REVIEW_EFFORT)
+                    raise RuntimeError(
+                        "configured Python SDK review slot is unavailable"
+                    )
+                if slot_id != target["id"] or (slot["model"], slot["effort"]) != (
+                    PYTHON_SDK_REVIEW_MODEL,
+                    PYTHON_SDK_REVIEW_EFFORT,
                 ):
                     self.store.update(
                         job["id"],
@@ -731,24 +732,30 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
             isinstance(cached, dict)
             and cached.get("head") == job["head"]
             and cached.get("base") == base_sha
+            and cached.get("prefixes") == list(self.config.python_sdk_path_prefixes)
             and type(cached.get("python_sdk")) is bool
         ):
             return cached["python_sdk"]
 
         files = self.github.pull_files(job)
         changed_files = pr.get("changed_files")
-        if (
-            type(changed_files) is not int
-            or not isinstance(files, list)
-        ):
-            raise ValueError("incomplete PR file list; refusing to select a review model")
-        truncated = len(files) == 300 and changed_files > len(files)
+        if type(changed_files) is not int or not isinstance(files, list):
+            raise ValueError(
+                "incomplete PR file list; refusing to select a review model"
+            )
+        truncated = 0 < len(files) < changed_files
         if len(files) != changed_files and not truncated:
-            raise ValueError("incomplete PR file list; refusing to select a review model")
+            raise ValueError(
+                "incomplete PR file list; refusing to select a review model"
+            )
         paths = []
         for entry in files:
-            if not isinstance(entry, dict) or not isinstance(entry.get("filename"), str):
-                raise ValueError("malformed PR file list; refusing to select a review model")
+            if not isinstance(entry, dict) or not isinstance(
+                entry.get("filename"), str
+            ):
+                raise ValueError(
+                    "malformed PR file list; refusing to select a review model"
+                )
             paths.append(entry["filename"])
             previous = entry.get("previous_filename")
             if previous is not None:
@@ -761,20 +768,24 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
         if (
             current.get("state") != "open"
             or (current.get("head") or {}).get("sha") != job["head"]
-            or current_base != base_sha
         ):
-            raise SourceChanged("PR head or base changed during model routing")
+            raise SourceChanged("PR head changed during model routing")
+        if current_base != base_sha:
+            raise RuntimeError(
+                "PR base advanced during model routing; retry classification"
+            )
 
-        prefixes = tuple(prefix.casefold() for prefix in self.config.python_sdk_path_prefixes)
+        prefixes = tuple(
+            prefix.casefold() for prefix in self.config.python_sdk_path_prefixes
+        )
         python_sdk = truncated or any(
-            path.casefold().startswith(prefix)
-            for path in paths
-            for prefix in prefixes
+            path.casefold().startswith(prefix) for path in paths for prefix in prefixes
         )
         data["review_route"] = {
             "head": job["head"],
             "base": base_sha,
             "python_sdk": python_sdk,
+            "prefixes": list(self.config.python_sdk_path_prefixes),
         }
         self.store.update(job["id"], data=json.dumps(data))
         return python_sdk
@@ -1510,6 +1521,15 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
             ):
                 raise ValueError(
                     f"issue-to-pr skill missing: {self.config.issue_skill}"
+                )
+            if (
+                role == "review"
+                and count
+                and self.config.python_sdk_review_slot is not None
+                and count <= self.config.python_sdk_review_slot
+            ):
+                raise ValueError(
+                    "review pool must retain the configured Python SDK slot"
                 )
             defaults = {}
             for index in range(count):

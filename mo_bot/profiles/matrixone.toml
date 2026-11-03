@@ -1,0 +1,11 @@
+# Portable MatrixOne review policy. Host paths, credentials and proxy are local.
+[review]
+batch_size = 2
+exclude = [26145]
+
+[review.python_sdk]
+slot = 1
+path_prefixes = ["clients/python/"]
+
+[review.author_review_delays]
+MatrixAdventurer = 20
