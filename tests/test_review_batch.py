@@ -240,6 +240,28 @@ class TestReviewBatch(unittest.TestCase):
         self.assertEqual(paused["state"], "queued")
         self.assertTrue(json.loads(paused["data"])["paused"])
 
+    def test_pause_saved_member_only_pauses_publication_while_sibling_continues(self):
+        jobs, turn = self.launch_pair()
+        self.checkpoint(jobs[0])
+        self.service.finish(0, turn, jobs[0]["id"])
+        saved = self.store.job(jobs[0]["id"])["result"]
+        self.service.command("pause_job", {"job_id": jobs[0]["id"]})
+        paused = self.store.job(jobs[0]["id"])
+        self.assertEqual(paused["state"], "publishing")
+        self.assertEqual(paused["result"], saved)
+        self.service.publish(paused)
+        self.gh.submit_review.assert_not_called()
+        turn.stop.assert_not_called()
+        self.assertEqual(self.store.job(jobs[1]["id"])["state"], "reviewing")
+        self.service.command("resume_job", {"job_id": jobs[0]["id"]})
+        self.service.publish(self.store.job(jobs[0]["id"]))
+        self.assertEqual(self.store.job(jobs[0]["id"])["state"], "done")
+        self.assertEqual(self.store.job(jobs[0]["id"])["attempts"], 1)
+        self.service.backend.start.assert_called_once()
+        self.complete(turn, [assessment(jobs[1])])
+        self.assertEqual(self.store.job(jobs[0]["id"])["result"], saved)
+        self.assertEqual(self.store.job(jobs[1]["id"])["state"], "publishing")
+
     def test_slot_interrupt_cancels_both_unfinished_members(self):
         jobs, turn = self.launch_pair()
         self.service.command("interrupt", {"slot": 0})

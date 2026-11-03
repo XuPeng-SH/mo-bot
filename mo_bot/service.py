@@ -561,22 +561,8 @@ class Service:
         if self.config.python_sdk_review_slot is not None:
             data = json.loads(job["data"])
             route_previous = data.get("review_route")
-            python_sdk = self.python_sdk_review(pr, job, data)
-            if python_sdk:
-                target = next(
-                    (
-                        candidate
-                        for candidate in self.store.slots(include_disabled=True)
-                        if candidate["role"] == "review"
-                        and candidate["pool_index"]
-                        == self.config.python_sdk_review_slot
-                    ),
-                    None,
-                )
-                if target is None:
-                    raise RuntimeError(
-                        "configured Python SDK review slot is unavailable"
-                    )
+            target = self.python_sdk_target(pr, job, data)
+            if target is not None:
                 if slot_id != target["id"] or (slot["model"], slot["effort"]) != (
                     PYTHON_SDK_REVIEW_MODEL,
                     PYTHON_SDK_REVIEW_EFFORT,
@@ -721,6 +707,25 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
             "workspace": workspace,
             "prompt": prompt,
         }
+
+    def python_sdk_target(self, pr, job, data):
+        """Resolve the required slot before reserving or resetting a session."""
+        if self.config.python_sdk_review_slot is None or not self.python_sdk_review(
+            pr, job, data
+        ):
+            return None
+        target = next(
+            (
+                slot
+                for slot in self.store.slots(include_disabled=True)
+                if slot["role"] == "review"
+                and slot["pool_index"] == self.config.python_sdk_review_slot
+            ),
+            None,
+        )
+        if target is None:
+            raise RuntimeError("configured Python SDK review slot is unavailable")
+        return target
 
     def python_sdk_review(self, pr, job, data):
         """Classify a frozen PR head/base before creating its review claim."""
@@ -2238,7 +2243,8 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
             (
                 (slot, turn)
                 for slot, (turn, key) in self.turns.items()
-                if job["id"] in turn_jobs(turn, key)
+                if job["state"] in ("reviewing", "canceling")
+                and job["id"] in turn_jobs(turn, key)
             ),
             None,
         )
@@ -2285,12 +2291,14 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
                 raise ValueError("owner-wip")
             if self.github.find_review(job) is not None:
                 raise ValueError("remote review exists; reconcile before retry")
+            target = self.python_sdk_target(pr, job, data)
             slot = next(
                 (
                     s
                     for s in self.store.slots()
                     if s["role"] == "review"
                     and s["enabled"]
+                    and (target is None or s["id"] == target["id"])
                     and s["id"] not in self.turns
                     and not self.store.db.execute(
                         "SELECT 1 FROM jobs WHERE slot_id=? AND state IN ('queued','reviewing','canceling','publishing')",

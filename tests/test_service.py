@@ -117,6 +117,55 @@ class TestWorkflow(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "retain"):
             self.service.command("resize_pool", {"role": "review", "sessions": 1})
 
+    def test_python_sdk_fresh_retry_resets_and_reserves_the_routed_session(self):
+        self.service.config = replace(
+            self.config,
+            python_sdk_review_slot=1,
+            python_sdk_path_prefixes=("clients/python/",),
+        )
+        self.store.slot_update(1, model="gpt-6.1-sol", effort="xhigh")
+        job = self.job()
+        self.store.update(job["id"], state="failed", attempts=1, comment_id=101)
+        self.gh.pr.return_value["changed_files"] = 1
+        self.gh.pull_files.return_value = [{"filename": "clients/python/client.py"}]
+        self.gh.evidence.return_value = {"discussion_index": [], "reviews": []}
+        self.service.command("retry_job", {"job_id": job["id"], "fresh_session": True})
+        slots = self.store.slots()
+        self.assertEqual(self.store.job(job["id"])["slot_id"], 1)
+        self.assertEqual(slots[0]["session_id"], "thread-0")
+        self.assertIsNone(slots[1]["session_id"])
+        self.store.slot_update(1, ready=1, session_id="fresh-sdk-thread")
+        claimed = self.store.claim(1, {job["id"]})
+        prepared = self.service.prepare_review(self.store.slots()[1], claimed)
+        self.assertIsNotNone(prepared)
+        self.assertEqual(prepared["job"]["state"], "reviewing")
+        data = json.loads(prepared["job"]["data"])
+        self.assertEqual(data["fresh_session_retry"]["slot"], 1)
+        self.gh.pull_files.assert_called_once()
+
+    def test_python_sdk_fresh_retry_refuses_busy_target_without_resetting_other_slots(
+        self,
+    ):
+        self.service.config = replace(
+            self.config,
+            python_sdk_review_slot=1,
+            python_sdk_path_prefixes=("clients/python/",),
+        )
+        job = self.job()
+        self.store.update(job["id"], state="failed", attempts=1)
+        other = self.job(pr=2)
+        self.store.claim(1, {other["id"]})
+        self.gh.pr.return_value["changed_files"] = 1
+        self.gh.pull_files.return_value = [{"filename": "clients/python/client.py"}]
+        with self.assertRaisesRegex(ValueError, "no idle"):
+            self.service.command(
+                "retry_job", {"job_id": job["id"], "fresh_session": True}
+            )
+        self.assertEqual(self.store.job(job["id"])["state"], "failed")
+        self.assertEqual(
+            [s["session_id"] for s in self.store.slots()], ["thread-0", "thread-1"]
+        )
+
     def test_python_sdk_route_retries_incomplete_file_evidence_and_base_movement(self):
         self.service.config = replace(
             self.config,
