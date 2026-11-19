@@ -699,21 +699,20 @@ class Service:
         evidence["local_validation"] = local_validation(
             self.store, self.config.state_dir, job
         )
-        (directory / "evidence.json").write_text(json.dumps(evidence, indent=2))
-        workspace, merge_base = self.workspace.prepare(source_slot, job, pr, directory)
-        repository_skill = next(
-            (
-                path
-                for path in (
-                    workspace / ".agents/skills/mo-self-review/SKILL.md",
-                    workspace / ".claude/skills/mo-self-review/SKILL.md",
-                )
-                if path.is_file()
-            ),
-            None,
+        workspace, merge_base, base = self.workspace.prepare(
+            source_slot, job, pr, directory
         )
+        repository_skill = self.workspace.review_policy(base, directory)
+        base_branch = pr["base"]["ref"]
+        evidence["review_base"] = {
+            "branch": base_branch,
+            "sha": base,
+            "merge_base": merge_base,
+            "policy_entry": str(repository_skill) if repository_skill else None,
+        }
+        (directory / "evidence.json").write_text(json.dumps(evidence, indent=2))
         context_instruction = (
-            f"This is an automatic same-head discussion follow-up. Previous authenticated review ID {prior['id']} is in evidence.json. First assess what changed against that review. If the new context adds no material finding, correction, or decision change, return decision=unchanged with a reason and validation, without repeating a full review. If uncertain or the context changes the assessment, conduct the necessary review and return approve or request_changes.\n"
+            f"This is an automatic same-head discussion follow-up. Previous authenticated review ID {prior['id']} is in evidence.json. Assess new context and the prior assessment under the current repository review policy before returning decision=unchanged. If the earlier assessment remains valid, give the reason and validation. Otherwise, conduct the necessary review and return approve or request_changes.\n"
             if prior
             else "This assignment requires a complete review; do not return unchanged.\n"
         )
@@ -726,9 +725,12 @@ class Service:
             context_instruction
             + f"""\nYou are mo-bot reusable review slot {slot_id}, generation {slot["generation"]}.
 CURRENT TASK (or independently scoped member of the current batch): job={job["id"]}, repository={job["repo"]},
-PR={job["pr"]}, HEAD={job["head"]}, merge-base={merge_base}. Only these frozen sources
+PR={job["pr"]}, HEAD={job["head"]}, target branch={base_branch}, target base={base},
+merge-base={merge_base}. Only these frozen sources
 and {directory}/evidence.json establish facts for this PR. Earlier PR facts are not evidence.
-Repository review entry: {repository_skill or "none in this checkout"}.
+Repository review entry from the pinned target base: {repository_skill or "none at this base"}.
+Read policy references relative to the entry. Resolve code, fixtures and test commands
+against the assigned PR source checkout. Review edits to policy files as part of the PR diff.
 Change: {directory}/change.patch. {change_instruction}
 Evidence: {directory}/evidence.json, including discussion_index, linked_issues and local_validation.
 Diagnostic directory: {directory}; keep review-plan.md, discussion-assessment.json, probes

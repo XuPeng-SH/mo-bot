@@ -28,12 +28,13 @@ For an explicit coordinator batch assignment, use the supplied
 
 ## Rule ownership
 
-Read the task's selected repository review entry once and follow its applicable
-domain references. The coordinator prefers `.agents/skills/mo-self-review/SKILL.md`,
-falling back to `.claude/skills/mo-self-review/SKILL.md` only when absent. Do not
-combine parallel copies or substitute an installed/global version. If no entry
-exists, review using this contract and actual repository requirements; absence
-alone is not a defect.
+Read the repository review entry pinned to the latest upstream target branch
+commit at assignment. Resolve its policy references in the same snapshot.
+Use the assigned PR checkout for product code, fixtures and execution. The
+coordinator prefers `.agents/skills/mo-self-review/SKILL.md` and uses the
+`.claude` entry if needed. Review proposed changes to rules as part of the
+diff. When the target base has neither entry, apply this review procedure and
+the repository requirements.
 
 The repository owns engineering and supported-product contracts; this skill owns
 the assigned external-review procedure, discussion handling and result contract.

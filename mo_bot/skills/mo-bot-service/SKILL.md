@@ -54,12 +54,13 @@ Review commentary and assessment reports are written in English, as required by 
 
 The repository's [mo-bot-review skill](../mo-bot-review/SKILL.md) owns reviewer prompt guidance and the decision/publication contract. The coordinator reads it for every new assigned review and snapshots the prompt for recovery. Edit that skill to change review guidance; do not maintain a parallel prompt in this operator skill. `scripts/install.py` installs both repository skills into agent discovery paths.
 
-Each task selects its checkout's `.agents/skills/mo-self-review/SKILL.md`, or
-the `.claude` entry only when the former is absent, and records that path in the
-prompt. The repository owns engineering/domain rules; mo-bot-review owns the
-external-review procedure. Discussion bodies are read once through the complete
-index, with raw records available for extra context. Inspect the saved prompt
-and execution history when checking which rules actually ran.
+Each review fetches the exact upstream target branch and freezes its tip along
+with the PR HEAD. The target commit supplies the repository review entry and its
+references. The PR HEAD supplies source and tests, and the diff starts at the
+merge-base of the two commits. The saved prompt and `evidence.json.review_base`
+identify the selected policy. The repository owns engineering rules.
+mo-bot-review owns the external-review procedure. Inspect the saved prompt and
+execution history when checking which rules ran.
 
 Full reviews return `request_changes` or `approve`. An automatic same-head discussion follow-up with a verified prior review may return `unchanged` after assessing the new context; the coordinator retains that assessment and updates the status without posting a duplicate formal review. Forced reviews always run the full review. Actionable defects and demonstrated unmet required validation contracts map to `REQUEST_CHANGES`; supported approvals map to `APPROVE`. Historical `needs_validation` assessments remain readable and map to `COMMENT`. Own PRs without an authenticated, marked bot review on the current head are admitted without waiting for CI; draft/exclusion/mergeability gates still apply. Reviews on older heads do not suppress a new commit. Own PRs receive `COMMENT` regardless of assessment because GitHub prevents self-approval and self-requested changes. A completed failed check/status admits repair while sibling checks/workflows are running, subject to the existing target fence and evidence deduplication. A completed legacy comment-only job is not replayed. Each new result produces at most one marked formal review plus its existing status comment.
 
