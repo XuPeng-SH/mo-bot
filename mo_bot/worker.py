@@ -1457,8 +1457,10 @@ class Worker:
                     raise ValueError(
                         "ambiguous worker claim; manual reconciliation required"
                     )
-                self.store.update(job["id"], claim_attempted=1)
-                comment = self.gh.ensure_comment(job)
+                comment = self.gh.create_comment(
+                    job,
+                    before_post=lambda: self.store.update(job["id"], claim_attempted=1),
+                )
             owned = self.gh.owned_marker(comment, job)
             if not owned:
                 raise ValueError("worker claim ownership mismatch")

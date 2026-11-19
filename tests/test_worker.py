@@ -188,7 +188,8 @@ class FakeGitHub:
     def find_comment(self, job):
         return self.claim
 
-    def ensure_comment(self, job):
+    def create_comment(self, job, *, before_post):
+        before_post()
         self.claim = {"id": 44}
         return self.claim
 
@@ -310,6 +311,33 @@ class TestWorker(unittest.TestCase):
         )
         self.w.consume(job, self.slot, value, model, effort)
         return self.s.store.job(job["id"])
+
+    def test_comment_preflight_failure_can_retry_without_creating_a_write_fence(self):
+        job = self.job()
+        with patch.object(self.gh, "find_comment", side_effect=RuntimeError("GET timeout")):
+            with self.assertRaisesRegex(RuntimeError, "GET timeout"):
+                self.w.launch(self.slot, job)
+        self.assertEqual(self.s.store.job(job["id"])["claim_attempted"], 0)
+        self.assertIsNone(self.gh.claim)
+        self.w.launch(self.slot, self.s.store.job(job["id"]))
+        resumed = self.s.store.job(job["id"])
+        self.assertEqual(resumed["claim_attempted"], 1)
+        self.assertEqual(resumed["comment_id"], 44)
+
+    def test_uncertain_worker_comment_post_is_never_blindly_repeated(self):
+        job = self.job()
+
+        def lost_response(job, *, before_post):
+            before_post()
+            raise RuntimeError("POST timeout")
+
+        with patch.object(self.gh, "create_comment", side_effect=lost_response) as post:
+            with self.assertRaisesRegex(RuntimeError, "POST timeout"):
+                self.w.launch(self.slot, job)
+            self.assertEqual(self.s.store.job(job["id"])["claim_attempted"], 1)
+            with self.assertRaisesRegex(ValueError, "ambiguous worker claim"):
+                self.w.launch(self.slot, self.s.store.job(job["id"]))
+            post.assert_called_once()
 
     def test_owner_wip_admission_and_publication_are_blocked_without_writes(self):
         job = self.job()

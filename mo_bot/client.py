@@ -42,6 +42,16 @@ def _main():
         )
     p = commands.add_parser("reconcile")
     p.add_argument("job_id")
+    p = commands.add_parser(
+        "resolve-review-claim",
+        help="requeue a legacy failed review only when evidence proves its comment POST was not sent",
+    )
+    p.add_argument("job_id")
+    p.add_argument("--head", required=True, help="full frozen commit SHA")
+    p.add_argument(
+        "--reason", required=True, help="evidence proving the POST was not sent"
+    )
+    p.add_argument("--post-not-sent", action="store_true", required=True)
     for name in ["pause", "resume", "retry", "cleanup", "rerun"]:
         p = commands.add_parser(name)
         p.add_argument("job_id")
@@ -138,6 +148,13 @@ def _main():
     elif args.command == "reconcile":
         endpoint = f"/api/jobs/{args.job_id}/reconcile"
         body = {}
+    elif args.command == "resolve-review-claim":
+        endpoint = f"/api/jobs/{args.job_id}/resolve-review-claim"
+        body = {
+            "head": args.head,
+            "reason": args.reason,
+            "post_not_sent": args.post_not_sent,
+        }
     elif args.command in ("repair", "issue"):
         endpoint = "/api/jobs"
         body = {

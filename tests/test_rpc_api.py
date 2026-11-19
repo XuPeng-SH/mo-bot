@@ -355,6 +355,22 @@ class TestHTTP(unittest.TestCase):
                         "text": "Continue validation",
                     },
                 )
+                recovery = {
+                    "head": "a" * 40,
+                    "post_not_sent": True,
+                    "reason": "logs prove GET failed before POST",
+                    "job_id": "wrong",
+                }
+                c.request(
+                    "POST", "/api/jobs/job-A/resolve-review-claim",
+                    json.dumps(recovery), headers,
+                )
+                r = c.getresponse()
+                self.assertEqual(r.status, 200)
+                self.assertEqual(
+                    json.loads(r.read()),
+                    {**recovery, "action": "resolve_review_claim", "job_id": "job-A"},
+                )
                 c.request("GET", "/api/pools", headers=headers)
                 r = c.getresponse()
                 self.assertEqual(r.status, 200)

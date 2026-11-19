@@ -134,6 +134,15 @@ class API:
                         return
                     if (
                         len(parts) == 4
+                        and parts[:2] == ["api", "jobs"]
+                        and parts[3] == "resolve-review-claim"
+                    ):
+                        self.dispatch(
+                            "resolve_review_claim", {**body, "job_id": parts[2]}
+                        )
+                        return
+                    if (
+                        len(parts) == 4
                         and parts[:2] == ["api", "sessions"]
                         and parts[3] in ("messages", "interrupt", "model")
                     ):
@@ -160,7 +169,11 @@ class API:
                         {
                             "error": "scheduler timeout",
                             "canceled_before_execution": canceled,
-                            "reconcile": "GET /api/status before retrying; task admission is idempotent",
+                            "reconcile": (
+                                "GET /api/jobs/JOB_ID before retrying; claim resolution may have completed"
+                                if action == "resolve_review_claim"
+                                else "GET /api/status before retrying; task admission is idempotent"
+                            ),
                         },
                     )
                 except ValueError as error:
