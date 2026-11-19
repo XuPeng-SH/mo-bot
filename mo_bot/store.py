@@ -259,7 +259,7 @@ class Store:
             is not None
         )
 
-    def enqueue(self, candidate: dict) -> bool:
+    def enqueue(self, candidate: dict, *, replaces_review=None) -> bool:
         kind = candidate.get("kind", "review")
         target_type = candidate.get("target_type", "pr")
         trigger = candidate.get("trigger_key", "")
@@ -282,6 +282,24 @@ class Store:
             # Repeated snapshots, including a previously failed task, never re-enqueue it.
             if self.db.execute("SELECT 1 FROM jobs WHERE id=?", (key,)).fetchone():
                 return False
+            if replaces_review:
+                # Retire the unpublished round in the successor's transaction.
+                previous_id, reason = replaces_review
+                updated = self.db.execute(
+                    """UPDATE jobs SET state='superseded',error=?,updated=?,slot_id=NULL,retry_at=0
+                    WHERE id=? AND repo=? AND pr=? AND head=? AND kind='review'
+                    AND state='publishing' AND review_attempted=0 AND review_id IS NULL""",
+                    (
+                        reason,
+                        now,
+                        previous_id,
+                        candidate["repo"],
+                        candidate["number"],
+                        candidate["headRefOid"],
+                    ),
+                )
+                if updated.rowcount != 1:
+                    return False
             members = candidate.get("members", [])
             if target_type == "issue":
                 if not members:

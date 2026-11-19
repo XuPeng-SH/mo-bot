@@ -402,6 +402,9 @@ class TestReviewBatch(unittest.TestCase):
         write(canonical, "main rules")
         write(legacy, "lower-priority copy")
         write(reference, "main reference")
+        link = ".agents/skills/mo-dev/local-link"
+        (repo / link).symlink_to("/does-not-exist")
+        git("add", link)
         git("commit", "-m", "latest main rules")
         main = git("rev-parse", "HEAD")
         git("switch", "release/v4.2.1-hotfix")
@@ -432,10 +435,11 @@ class TestReviewBatch(unittest.TestCase):
                 self.assertEqual(entry.read_text(), rules)
                 self.assertEqual((source / canonical).read_text(), "PR-authored rules")
                 self.assertTrue(workspace.clean(0, head))
-                patch = (directory / "change.patch").read_text()
-                self.assertIn("+PR-authored rules", patch)
-                self.assertEqual("shared.txt" in patch, branch != "main")
+                delta = (directory / "change.patch").read_text()
+                self.assertIn("+PR-authored rules", delta)
+                self.assertEqual("shared.txt" in delta, branch != "main")
                 if branch == "main":
+                    self.assertFalse((directory / "review-policy" / link).is_symlink())
                     self.assertEqual(
                         (directory / "review-policy" / reference).read_text(),
                         "main reference",

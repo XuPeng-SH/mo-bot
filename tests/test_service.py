@@ -1301,6 +1301,9 @@ class TestWorkflow(unittest.TestCase):
 
     def test_uncertain_post_reconciles_remote_review_after_eligibility_changes(self):
         job = self.job()
+        self.gh.evidence.return_value = {}
+        self.store.update(job["id"], comment_id=99)
+        self.service.prepare_review(self.store.slots()[0], self.store.job(job["id"]))
         self.service.save_result(job, self.store.slots()[0], assessment(job))
         self.service.eligible.add(job["id"])
         self.gh.submit_review.side_effect = RuntimeError("response lost")
@@ -1311,12 +1314,91 @@ class TestWorkflow(unittest.TestCase):
         self.service = Service(self.config, github=self.gh, workspace=self.workspace)
         self.store = self.service.store
         self.gh.find_review.return_value = {"id": 101}
+        self.gh.pr.return_value["base"]["ref"] = "4.2-dev"
         self.service.eligible.clear()
         self.service.publish(self.store.job(job["id"]))
         self.assertEqual(self.store.job(job["id"])["state"], "done")
         self.assertEqual(self.store.job(job["id"])["review_id"], 101)
         self.gh.submit_review.assert_called_once()
         self.gh.validate_review.assert_called_once()
+        self.assertEqual(len(self.store.jobs()), 1)
+
+    def test_retarget_replaces_unpublished_context_review_with_full_review(self):
+        c = {**candidate(), "context_review": True, "forced": False}
+        prior = {
+            "id": 98,
+            "state": "APPROVED",
+            "commit_id": c["headRefOid"],
+            "submitted_at": "2026-11-19T00:00:00Z",
+            "user": {"login": "me"},
+            "body": marker("test-bot", {"id": "prior", "head": c["headRefOid"]}, "review"),
+        }
+        self.gh.evidence.return_value = {"reviews": [prior]}
+        self.store.enqueue(c)
+        original_id = self.store.key(c["repo"], c["number"], c["headRefOid"])
+        slot = self.store.slots()[0]
+        self.store.update(original_id, comment_id=99)
+        original = self.service.prepare_review(slot, self.store.job(original_id))["job"]
+        self.service.save_result(
+            original, slot, {**assessment(original), "decision": "unchanged"}
+        )
+        saved = self.store.job(original_id)
+        self.gh.pr.return_value["base"] = {"ref": "4.2-dev", "sha": "d" * 40}
+
+        self.service.publish(saved)
+
+        self.gh.submit_review.assert_not_called()
+        old = self.store.job(original_id)
+        self.assertEqual(old["state"], "superseded")
+        self.assertEqual(old["result"], saved["result"])
+        self.assertIn("from `main` to `4.2-dev`", old["error"])
+        (new,) = self.store.jobs(("queued",))
+        self.assertEqual(new["head"], saved["head"])
+
+        follow_up = {**c, "trigger_key": "discussion:current"}
+        for reason, candidates in (
+            ("already-reviewed", []),
+            ("discussion-updated", [follow_up]),
+        ):
+            self.service.scan({
+                "heads": {"1": c["headRefOid"]},
+                "candidates": candidates,
+                "admission": {"1": {"head": c["headRefOid"], "reason": reason}},
+            })
+            self.assertIn(new["id"], self.service.eligible)
+            self.assertEqual(len(self.store.jobs()), 2)
+
+        job = self.store.claim(slot["id"], self.service.eligible)
+        self.assertEqual(job["id"], new["id"])
+        self.store.update(job["id"], comment_id=100)
+        prepared = self.service.prepare_review(slot, self.store.job(job["id"]))
+        self.assertIn("target branch=4.2-dev", prepared["prompt"])
+        self.assertIn("requires a complete review", prepared["prompt"])
+        self.service.save_result(prepared["job"], slot, assessment(prepared["job"]))
+        self.service.publish(self.store.job(job["id"]))
+        self.gh.submit_review.assert_called_once()
+        self.assertEqual(self.gh.submit_review.call_args.args[0]["id"], new["id"])
+
+    def test_publication_checks_legacy_target_branch_but_allows_advancing_tip(self):
+        self.gh.evidence.return_value = {}
+        slot = self.store.slots()[0]
+        for number, target in ((1, "4.2-dev"), (2, "main")):
+            with self.subTest(target=target):
+                self.gh.pr.return_value["base"] = {"ref": "main", "sha": "b" * 40}
+                job = self.job(pr=number)
+                self.store.update(job["id"], comment_id=99)
+                prepared = self.service.prepare_review(slot, self.store.job(job["id"]))
+                metadata = json.loads(prepared["job"]["metadata"])
+                metadata.pop("review_base_branch")
+                self.store.update(job["id"], metadata=json.dumps(metadata))
+                self.service.save_result(self.store.job(job["id"]), slot, assessment(job))
+                self.gh.pr.return_value["base"] = {"ref": target, "sha": "d" * 40}
+                self.service.publish(self.store.job(job["id"]))
+                self.assertEqual(
+                    self.store.job(job["id"])["state"],
+                    "done" if target == "main" else "superseded",
+                )
+        self.gh.submit_review.assert_called_once()
 
     def test_changed_head_before_publication_does_not_submit_review(self):
         job = self.job()

@@ -367,9 +367,10 @@ class Service:
         heads = snapshot["heads"]
         for job in self.store.jobs(("queued", "reviewing", "publishing")):
             status = admission.get(str(job["pr"]), {})
-            forced_review = job["kind"] == "review" and json.loads(job["metadata"]).get(
-                "forced"
+            metadata = (
+                json.loads(job["metadata"]) if job["kind"] == "review" else {}
             )
+            forced_review = metadata.get("forced")
             if status.get("reason") == "owner-wip" and not forced_review:
                 self.eligible.discard(job["id"])
                 for turn, key in self.turns.values():
@@ -379,16 +380,18 @@ class Service:
                 continue
             if job["kind"] == "work":
                 continue  # Worker validates immutable identities per phase/effect.
-            forced = json.loads(job["metadata"]).get("forced")
-            status = admission.get(str(job["pr"]), {})
             reason = None
             if heads.get(str(job["pr"])) != job["head"]:
                 reason = "PR closed or head changed"
             elif (
-                not forced
+                not forced_review
                 and status.get("head") == job["head"]
                 and status.get("reason")
                 in ("already-reviewed", "merge-only-reviewed", "explicitly-excluded")
+                and not (
+                    status["reason"] == "already-reviewed"
+                    and metadata.get("target_recheck")
+                )
                 and not job["review_attempted"]
             ):
                 reason = status["reason"]
@@ -401,12 +404,22 @@ class Service:
                 )
         pending_contexts = {}
         active_reviews = {}
+        target_rechecks = {}
         for pending in self.store.jobs(("queued", "reviewing", "publishing")):
             if pending["kind"] == "review":
                 identity = (pending["repo"], pending["pr"], pending["head"])
                 active_reviews.setdefault(identity, []).append(pending["id"])
-                if json.loads(pending["metadata"]).get("context_review"):
+                metadata = json.loads(pending["metadata"])
+                if metadata.get("context_review"):
                     pending_contexts.setdefault(identity, []).append(pending["id"])
+                if metadata.get("target_recheck"):
+                    target_rechecks.setdefault(identity, []).append(pending["id"])
+                    status = admission.get(str(pending["pr"]), {})
+                    if (
+                        status.get("head") == pending["head"]
+                        and status.get("reason") == "already-reviewed"
+                    ):
+                        self.eligible.add(pending["id"])
         latest_reviews = {}
         for previous in self.store.jobs():
             if previous["kind"] == "review":
@@ -414,6 +427,11 @@ class Service:
                 latest_reviews.setdefault(identity, previous)
         for candidate in snapshot["candidates"]:
             identity = (candidate["repo"], candidate["number"], candidate["headRefOid"])
+            if identity in target_rechecks:
+                # A same-head discussion follow-up must not replace the full
+                # review needed for the new target.
+                self.eligible.update(target_rechecks[identity])
+                continue
             pending_context = pending_contexts.get(identity, [])
             if pending_context and not candidate.get("trigger_key"):
                 # A generic discovery candidate must not supersede a queued
@@ -694,8 +712,6 @@ class Service:
         if isinstance(evidence.get("linked_issue_digest"), str):
             metadata["linked_issue_digest"] = evidence["linked_issue_digest"]
             metadata["linked_issue_complete"] = evidence["linked_issues"]["complete"]
-        self.store.update(job["id"], metadata=json.dumps(metadata))
-        job = self.store.job(job["id"])
         evidence["local_validation"] = local_validation(
             self.store, self.config.state_dir, job
         )
@@ -711,6 +727,8 @@ class Service:
             "policy_entry": str(repository_skill) if repository_skill else None,
         }
         (directory / "evidence.json").write_text(json.dumps(evidence, indent=2))
+        metadata["review_base_branch"] = base_branch
+        self.store.update(job["id"], metadata=json.dumps(metadata))
         context_instruction = (
             f"This is an automatic same-head discussion follow-up. Previous authenticated review ID {prior['id']} is in evidence.json. Assess new context and the prior assessment under the current repository review policy before returning decision=unchanged. If the earlier assessment remains valid, give the reason and validation. Otherwise, conduct the necessary review and return approve or request_changes.\n"
             if prior
@@ -1258,6 +1276,27 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
                 turn.release()
                 self.turns.pop(slot_id, None)
 
+    def replace_unpublished_review(self, job, metadata, trigger, reason):
+        candidate = {
+            **metadata,
+            "repo": job["repo"],
+            "number": job["pr"],
+            "headRefOid": job["head"],
+            "trigger_key": f"{trigger}:after:{job['id']}",
+        }
+        if self.store.enqueue(candidate, replaces_review=(job["id"], reason)):
+            self.eligible.add(
+                self.store.key(
+                    job["repo"], job["pr"], job["head"], candidate["trigger_key"]
+                )
+            )
+        elif self.store.job(job["id"])["state"] == "publishing":
+            self.store.update(
+                job["id"],
+                error="new review waits for prior publication reconciliation",
+                retry_at=time.time() + 60,
+            )
+
     def publish(self, job):
         if json.loads(job["data"]).get("paused"):
             return
@@ -1291,6 +1330,26 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
         # CI failure, merge conflicts or a discovery refresh must not withhold
         # an assessment. Live head/context checks and write fences still apply.
         metadata = json.loads(job["metadata"])
+        if not job["review_attempted"]:
+            base_branch = metadata.get("review_base_branch")
+            if not base_branch and job["attempts"]:
+                # Jobs prepared by the previous release recorded the target in
+                # their original attempt manifest, including on model fallback.
+                manifest = (
+                    self.job_dir(job) / f"attempt-{job['attempts']}" / "evidence.json"
+                )
+                if manifest.is_file():
+                    previous_base = json.loads(manifest.read_text()).get("review_base", {})
+                    base_branch = previous_base.get("branch")
+            if base_branch and base_branch != pr["base"]["ref"]:
+                self.replace_unpublished_review(
+                    job,
+                    {**metadata, "context_review": False, "target_recheck": True},
+                    "target-changed",
+                    f"Target branch changed from `{base_branch}` to `{pr['base']['ref']}` "
+                    "before publication. A full review of the new target is queued.",
+                )
+                return
         previous_digest = metadata.get("discussion_digest")
         previous_issue_digest = metadata.get("linked_issue_digest")
         if (previous_digest or previous_issue_digest) and not job["review_attempted"]:
@@ -1332,18 +1391,6 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
                 reason = (
                     "linked issue or PR description" if issue_changed else "discussion"
                 )
-                self.github.patch_comment(
-                    job,
-                    "superseded",
-                    f"Review {reason} changed before publication; a fresh contextual review is queued.",
-                )
-                self.store.update(
-                    job["id"],
-                    state="superseded",
-                    comment_state="superseded",
-                    error=f"{reason} changed before publication",
-                    slot_id=None,
-                )
                 trigger = (
                     f"review-context:{current_digest or ''}:{current_issue_digest}"
                     if issue_changed
@@ -1351,20 +1398,17 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
                 )
                 # A later input can return to an earlier digest. The predecessor
                 # distinguishes that new round without replaying an old job.
-                trigger += f":after:{job['id']}"
-                candidate = {
-                    **metadata,
-                    "discussion_digest": current_digest,
-                    "linked_issue_digest": current_issue_digest,
-                    "context_review": True,
-                    "trigger_key": trigger,
-                }
-                self.store.enqueue(candidate)
-                key = self.store.key(
-                    job["repo"], job["pr"], job["head"], candidate["trigger_key"]
+                self.replace_unpublished_review(
+                    job,
+                    {
+                        **metadata,
+                        "discussion_digest": current_digest,
+                        "linked_issue_digest": current_issue_digest,
+                        "context_review": not metadata.get("target_recheck"),
+                    },
+                    trigger,
+                    f"{reason} changed before publication",
                 )
-                if self.store.job(key):
-                    self.eligible.add(key)
                 return
         envelope = json.loads(job["result"])
         if envelope["assessment"]["decision"] == "unchanged":
