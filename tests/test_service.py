@@ -1,5 +1,6 @@
 import json
 import sqlite3
+import subprocess
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -7,7 +8,7 @@ import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
-from mo_bot.config import Config
+from mo_bot.config import Config, ModelFallback
 from mo_bot.service import Service
 from mo_bot.store import Store
 from mo_bot.github import GitHub, marker
@@ -62,13 +63,14 @@ class TestWorkflow(unittest.TestCase):
         self.gh.pr.return_value = {
             "state": "open",
             "head": {"sha": "a" * 40},
-            "base": {"sha": "b" * 40},
+            "base": {"ref": "main", "sha": "b" * 40},
             "user": {"login": "other"},
         }
         self.workspace = Mock()
         self.workspace.clean.return_value = True
         self.workspace.ensure.return_value = self.root
-        self.workspace.prepare.return_value = (self.root, "b" * 40)
+        self.workspace.prepare.return_value = (self.root, "b" * 40, "c" * 40)
+        self.workspace.review_policy.return_value = None
         self.service = Service(self.config, github=self.gh, workspace=self.workspace)
         self.store = self.service.store
         for i in range(2):
@@ -109,7 +111,7 @@ class TestWorkflow(unittest.TestCase):
         self.assertEqual(
             (routed["state"], routed["slot_id"], routed["attempts"]), ("queued", 1, 0)
         )
-        self.gh.ensure_comment.assert_not_called()
+        self.gh.create_comment.assert_not_called()
         self.assertIsNone(self.store.claim(0, {job["id"]}))
         self.assertEqual(self.store.claim(1, {job["id"]})["id"], job["id"])
         with self.assertRaisesRegex(ValueError, "pinned"):
@@ -186,7 +188,7 @@ class TestWorkflow(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "base advanced"):
             self.service.python_sdk_review(pr, job, {})
         self.assertNotIn("review_route", json.loads(self.store.job(job["id"])["data"]))
-        self.gh.ensure_comment.assert_not_called()
+        self.gh.create_comment.assert_not_called()
 
     def test_python_sdk_route_cache_tracks_policy_and_general_changes(self):
         self.service.config = replace(
@@ -338,7 +340,7 @@ class TestWorkflow(unittest.TestCase):
         self.gh.pr.return_value["labels"] = [{"name": "do-not-merge/wip"}]
         self.service.launch(self.store.slots()[0], job)
         self.assertEqual(self.store.job(job["id"])["state"], "queued")
-        self.gh.ensure_comment.assert_not_called()
+        self.gh.create_comment.assert_not_called()
         self.workspace.prepare.assert_not_called()
         self.service.save_result(
             job, self.store.slots()[0], assessment(job), "fake", "xhigh"
@@ -350,6 +352,23 @@ class TestWorkflow(unittest.TestCase):
         self.gh.pr.return_value["labels"] = []
         self.service.publish(self.store.job(job["id"]))
         self.assertEqual(self.store.job(job["id"])["state"], "done")
+
+    def test_finished_turn_is_retained_when_result_processing_unexpectedly_fails(self):
+        job = self.job()
+        self.store.update(job["id"], state="reviewing", slot_id=0)
+        turn = Mock(completed=True, model="fake", effort="xhigh")
+        turn.result.return_value = {"assessment": {}}
+        self.service.turns[0] = (turn, job["id"])
+        with patch.object(
+            self.service.workspace,
+            "clean",
+            side_effect=subprocess.TimeoutExpired("git", 120),
+        ):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                self.service.finish(0, turn, job["id"])
+        self.assertIn(0, self.service.turns)
+        turn.release.assert_not_called()
+        self.assertEqual(self.store.job(job["id"])["state"], "reviewing")
 
     def test_owner_wip_interrupt_is_a_resumable_wait_for_automatic_review(self):
         job = self.job()
@@ -408,6 +427,67 @@ class TestWorkflow(unittest.TestCase):
         self.assertEqual(
             [j["state"] for j in self.store.jobs()], ["queued", "superseded"]
         )
+
+    def test_scan_recovers_unpublished_superseded_round_once(self):
+        c = {**candidate(), "forced": False}
+        self.store.enqueue(c)
+        first = self.store.job(self.store.key(c["repo"], c["number"], c["headRefOid"]))
+        reason = "linked issue or PR description changed before publication"
+        self.store.update(
+            first["id"],
+            state="superseded",
+            error=reason,
+            claim_attempted=1,
+            comment_id=10,
+        )
+        second_candidate = {
+            **c,
+            "trigger_key": "review-context:old",
+            "context_review": True,
+        }
+        self.store.enqueue(second_candidate)
+        second = self.store.job(
+            self.store.key(
+                c["repo"], c["number"], c["headRefOid"], "review-context:old"
+            )
+        )
+        self.store.update(
+            second["id"],
+            state="superseded",
+            error=reason,
+            claim_attempted=1,
+            comment_id=11,
+        )
+        snap = {"heads": {"1": c["headRefOid"]}, "candidates": [c], "indeterminate": []}
+
+        self.service.scan(snap)
+        recovered = [j for j in self.store.jobs() if j["state"] == "queued"]
+        self.assertEqual(len(recovered), 1)
+        self.assertEqual(recovered[0]["trigger_key"], f"recovery:{second['id']}")
+        self.assertIn(recovered[0]["id"], self.service.eligible)
+        self.service.scan(snap)
+        self.assertEqual(len(self.store.jobs()), 3)
+        self.assertIn(recovered[0]["id"], self.service.eligible)
+
+    def test_scan_does_not_recover_other_terminal_or_uncertain_review(self):
+        c = {**candidate(), "forced": False}
+        self.store.enqueue(c)
+        job = self.store.job(self.store.key(c["repo"], c["number"], c["headRefOid"]))
+        snap = {"heads": {"1": c["headRefOid"]}, "candidates": [c], "indeterminate": []}
+        for reason, attempted, claimed in (
+            ("already-reviewed", 0, 0),
+            ("discussion changed before publication", 1, 0),
+            ("discussion changed before publication", 0, 1),
+        ):
+            self.store.update(
+                job["id"],
+                state="superseded",
+                error=reason,
+                review_attempted=attempted,
+                claim_attempted=claimed,
+            )
+            self.service.scan(snap)
+            self.assertEqual(len(self.store.jobs()), 1)
 
     def test_sqlite_cross_connection_dedup_and_active_fences(self):
         self.job()
@@ -483,11 +563,14 @@ class TestWorkflow(unittest.TestCase):
         self.gh.pr.return_value = self.gh.api.return_value
         self.service.backend = Mock()
         self.gh.owned_marker.return_value = {"state": "reviewing"}
-        self.gh.ensure_comment.return_value = {"id": 99}
+        self.gh.create_comment.side_effect = lambda job, before_post: (
+            before_post(),
+            {"id": 99},
+        )[1]
         self.gh.evidence.return_value = {}
         self.service.launch(self.store.slots()[0], job)
         self.workspace.prepare.assert_called_once()
-        self.gh.ensure_comment.assert_called_once()
+        self.gh.create_comment.assert_called_once()
         self.service.save_result(
             job, self.store.slots()[0], assessment(job), "fake", "xhigh"
         )
@@ -559,8 +642,201 @@ class TestWorkflow(unittest.TestCase):
         self.store.update(j["id"], claim_attempted=1)
         j = self.store.claim(0)
         self.service.launch(self.store.slots()[0], j)
-        self.gh.ensure_comment.assert_not_called()
+        self.gh.create_comment.assert_not_called()
         self.assertEqual(self.store.job(j["id"])["state"], "failed")
+
+    def test_preflight_failure_does_not_fence_and_a_later_attempt_can_start(self):
+        job = self.job()
+        claimed = self.store.claim(0)
+        self.gh.find_comment.side_effect = RuntimeError("TLS timeout on GET")
+        with self.assertRaisesRegex(RuntimeError, "TLS timeout"):
+            self.service.launch(self.store.slots()[0], claimed)
+        self.assertEqual(self.store.job(job["id"])["claim_attempted"], 0)
+        self.gh.create_comment.assert_not_called()
+
+        self.store.update(job["id"], state="queued", slot_id=None)
+        self.gh.find_comment.side_effect = None
+        self.gh.create_comment.side_effect = lambda job, before_post: (
+            before_post(),
+            {"id": 99},
+        )[1]
+        self.gh.owned_marker.return_value = {"state": "reviewing"}
+        self.gh.evidence.return_value = {}
+        self.service.backend = Mock()
+        self.service.launch(self.store.slots()[0], self.store.claim(0))
+        self.assertEqual(self.store.job(job["id"])["comment_id"], 99)
+        self.assertEqual(self.store.job(job["id"])["attempts"], 1)
+        self.gh.create_comment.assert_called_once()
+
+    def test_uncertain_initial_post_remains_fenced_and_status_requests_manual_action(
+        self,
+    ):
+        job = self.job()
+
+        def uncertain(job, before_post):
+            before_post()
+            raise RuntimeError("POST response lost")
+
+        self.gh.create_comment.side_effect = uncertain
+        with self.assertRaisesRegex(RuntimeError, "POST response lost"):
+            self.service.launch(self.store.slots()[0], self.store.claim(0))
+        self.assertEqual(self.store.job(job["id"])["claim_attempted"], 1)
+        self.store.update(job["id"], state="queued", slot_id=None)
+        self.service.launch(self.store.slots()[0], self.store.claim(0))
+        self.assertEqual(self.store.job(job["id"])["state"], "failed")
+        self.assertEqual(self.gh.create_comment.call_count, 1)
+        self.service.refresh_status()
+        alert = next(
+            a for a in self.service.status["alerts"] if a["job_id"] == job["id"]
+        )
+        self.assertTrue(alert["manual_required"])
+        self.assertIsNone(alert["next_retry_at"])
+        self.assertEqual(self.service.status["unresolved_claim_count"], 1)
+
+    def test_old_unresolved_claim_stays_visible_beyond_recent_job_limit(self):
+        job = self.job()
+        self.store.update(
+            job["id"],
+            state="failed",
+            claim_attempted=1,
+            error="ambiguous comment creation; remote marker absent; manual reconciliation required",
+        )
+        newer = self.job(pr=2)
+        visible = {row["id"] for row in self.store.summaries(limit=1)}
+        self.assertEqual(visible, {job["id"], newer["id"]})
+        self.assertEqual(self.store.unresolved_claim_count(), 1)
+
+    def test_lost_post_response_recovers_owned_marker_without_a_second_post(self):
+        job = self.job()
+
+        def uncertain(job, before_post):
+            before_post()
+            raise RuntimeError("response lost after write")
+
+        self.gh.create_comment.side_effect = uncertain
+        with self.assertRaisesRegex(RuntimeError, "response lost"):
+            self.service.launch(self.store.slots()[0], self.store.claim(0))
+        self.store.update(job["id"], state="queued", slot_id=None)
+        self.gh.find_comment.return_value = {"id": 99}
+        self.gh.owned_marker.return_value = {"state": "reviewing"}
+        self.gh.evidence.return_value = {}
+        self.service.backend = Mock()
+        self.service.launch(self.store.slots()[0], self.store.claim(0))
+        recovered = self.store.job(job["id"])
+        self.assertEqual(recovered["comment_id"], 99)
+        self.assertEqual(recovered["attempts"], 1)
+        self.assertEqual(self.gh.create_comment.call_count, 1)
+
+    def test_claim_fence_survives_restart_and_blocks_a_second_post(self):
+        job = self.job()
+
+        def uncertain(job, before_post):
+            before_post()
+            raise RuntimeError("response lost")
+
+        self.gh.create_comment.side_effect = uncertain
+        with self.assertRaisesRegex(RuntimeError, "response lost"):
+            self.service.launch(self.store.slots()[0], self.store.claim(0))
+        self.store.update(job["id"], state="queued", slot_id=None)
+        self.service.close()
+        self.service = Service(self.config, github=self.gh, workspace=self.workspace)
+        self.store = self.service.store
+        self.service.launch(self.store.slots()[0], self.store.claim(0))
+        self.assertEqual(self.store.job(job["id"])["state"], "failed")
+        self.assertEqual(self.gh.create_comment.call_count, 1)
+
+    def test_legacy_initial_claim_can_be_resolved_only_with_explicit_evidence(self):
+        job = self.job()
+        self.store.update(
+            job["id"],
+            state="failed",
+            claim_attempted=1,
+            error="ambiguous comment creation; remote marker absent; manual reconciliation required",
+        )
+        args = {
+            "job_id": job["id"],
+            "head": job["head"],
+            "post_not_sent": True,
+            "reason": "service log proves GET failed before POST",
+        }
+        result = self.service.command("resolve_review_claim", args)
+        self.assertEqual(result["state"], "queued")
+        self.assertEqual(result["claim_attempted"], 0)
+        self.assertEqual(
+            result["data"]["claim_resolutions"][0]["reason"], args["reason"]
+        )
+        self.assertEqual(len(self.store.jobs()), 1)
+        self.gh.create_comment.assert_not_called()
+        self.gh.submit_review.assert_not_called()
+
+    def test_legacy_claim_resolution_rejects_unproven_or_changed_targets(self):
+        job = self.job()
+        self.store.update(
+            job["id"],
+            state="failed",
+            claim_attempted=1,
+            error="ambiguous comment creation; remote marker absent; manual reconciliation required",
+        )
+        args = {
+            "job_id": job["id"],
+            "head": job["head"],
+            "post_not_sent": True,
+            "reason": "GET failed before the POST was issued",
+        }
+        for change in (
+            {"head": "b" * 40},
+            {"post_not_sent": False},
+            {"reason": "short"},
+        ):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                self.service.command("resolve_review_claim", {**args, **change})
+        self.gh.find_comment.return_value = {"id": 5}
+        with self.assertRaisesRegex(ValueError, "remote claim exists"):
+            self.service.command("resolve_review_claim", args)
+        self.gh.find_comment.return_value = None
+        self.gh.find_review.return_value = {"id": 6}
+        with self.assertRaisesRegex(ValueError, "remote review exists"):
+            self.service.command("resolve_review_claim", args)
+        self.gh.find_review.return_value = None
+        self.gh.pr.return_value["head"]["sha"] = "b" * 40
+        with self.assertRaisesRegex(RuntimeError, "PR changed"):
+            self.service.command("resolve_review_claim", args)
+        self.gh.pr.return_value["head"]["sha"] = job["head"]
+        self.store.update(job["id"], attempts=1)
+        with self.assertRaisesRegex(ValueError, "effects or activity"):
+            self.service.command("resolve_review_claim", args)
+        self.assertEqual(self.store.job(job["id"])["claim_attempted"], 1)
+        self.assertEqual(self.store.job(job["id"])["state"], "failed")
+
+    def test_legacy_resolution_uses_fresh_policy_for_automatic_reviews(self):
+        job = self.job()
+        metadata = json.loads(job["metadata"])
+        metadata["forced"] = False
+        self.store.update(
+            job["id"],
+            state="failed",
+            claim_attempted=1,
+            metadata=json.dumps(metadata),
+            error="ambiguous comment creation; remote marker absent; manual reconciliation required",
+        )
+        self.service.command(
+            "resolve_review_claim",
+            {
+                "job_id": job["id"],
+                "head": job["head"],
+                "post_not_sent": True,
+                "reason": "log identifies the failed GET before POST",
+            },
+        )
+        self.assertNotIn(job["id"], self.service.eligible)
+        self.service.scan(
+            {
+                "heads": {"1": job["head"]},
+                "candidates": [{**candidate(), "forced": False}],
+                "admission": {},
+            }
+        )
+        self.assertIn(job["id"], self.service.eligible)
 
     def test_publication_checkpoint_survives_retry_without_model(self):
         j = self.job()
@@ -680,10 +956,171 @@ class TestWorkflow(unittest.TestCase):
         self.assertIn(job["head"], self.service.backend.start.call_args.args[3])
         self.assertEqual(len(self.store.jobs()), 1)
         self.assertEqual(self.store.job(job["id"])["comment_id"], 99)
-        self.gh.ensure_comment.assert_not_called()
+        self.gh.create_comment.assert_not_called()
         self.assertEqual(self.store.slots()[0]["session_id"], "thread-0")
         with self.assertRaises(ValueError):
             self.service.command("model", {"slot": 0, "model": "invalid"})
+
+    def _begin_model_fallback(self):
+        self.service.config = replace(
+            self.config,
+            model_fallbacks=(
+                ModelFallback(r"cyberPolicy", "gpt-6-luna", "max", restore_seconds=5),
+            ),
+        )
+        self.service.models = [
+            {
+                "model": "gpt-6-astra",
+                "supportedReasoningEfforts": [{"reasoningEffort": "xhigh"}],
+            },
+            {
+                "model": "gpt-6-luna",
+                "supportedReasoningEfforts": [{"reasoningEffort": "max"}],
+            },
+        ]
+        self.service.backend = Mock(dead=False)
+        starts = []
+
+        def start_turn(slot, directory, workspace, prompt, schema):
+            directory.mkdir(parents=True, exist_ok=True)
+            (directory / "prompt.txt").write_text(prompt)
+            turn = Mock(
+                model=slot["model"],
+                effort=slot["effort"],
+                turn_id=f"turn-{len(starts) + 1}",
+                directory=directory,
+                session_id=slot["session_id"],
+                completed=False,
+                error=None,
+                final=None,
+                schema=schema,
+            )
+            turn.completion.wait.return_value = True
+            starts.append(turn)
+            return turn
+
+        self.service.backend.start.side_effect = start_turn
+        job = self.store.claim(0) if self.job() else None
+        message = '{"message":"upstream rejected by cyberPolicy"}'
+        old_dir = self.root / f"old-error-{time.time_ns()}"
+        old_dir.mkdir()
+        (old_dir / "prompt.txt").write_text("Frozen review scope " + job["head"])
+        old = Mock(
+            completed=True,
+            error=message,
+            final=None,
+            schema=None,
+            directory=old_dir,
+        )
+        old.result.side_effect = RuntimeError(message)
+        self.service.turns[0] = (old, job["id"])
+        self.service.finish(0, old, job["id"])
+        return job, old, self.service.turns[0][0]
+
+    def test_matching_turn_error_switches_and_restores_on_deadline(self):
+        job, old, fallback = self._begin_model_fallback()
+        self.assertEqual(fallback.model, "gpt-6-luna")
+        self.assertEqual(fallback.effort, "max")
+        current = self.store.job(job["id"])
+        self.assertEqual(current["state"], "reviewing")
+        self.assertEqual(current["attempts"], job["attempts"])
+        self.assertIsNone(current["error"])
+        slot = self.store.slots()[0]
+        self.assertEqual(slot["model"], "gpt-6-astra")
+        self.assertEqual(slot["effort"], "xhigh")
+        old.release.assert_called_once()
+        recovery = self.service.model_recoveries[0]
+        self.assertLessEqual(recovery["due"] - time.monotonic(), 5)
+
+        self.service.process_model_recoveries()
+        fallback.stop.assert_not_called()
+        self.assertEqual(self.service.backend.start.call_count, 1)
+
+        recovery["due"] = 0
+        self.service.process_model_recoveries()
+        fallback.stop.assert_called_once()
+        fallback.completion.wait.assert_called_once_with(10)
+        self.assertEqual(self.service.backend.start.call_count, 2)
+        restored = self.service.turns[0][0]
+        self.assertEqual(restored.model, "gpt-6-astra")
+        self.assertEqual(restored.effort, "xhigh")
+        self.assertNotIn(0, self.service.model_recoveries)
+        self.assertEqual(self.store.job(job["id"])["state"], "reviewing")
+
+    def test_fallback_restore_does_not_interrupt_replaced_turn(self):
+        job, _, _ = self._begin_model_fallback()
+        replacement = Mock(turn_id="operator-turn", completed=False)
+        self.service.turns[0] = (replacement, job["id"])
+        self.service.model_recoveries[0]["due"] = 0
+
+        self.service.process_model_recoveries()
+
+        replacement.stop.assert_not_called()
+        self.assertEqual(self.service.backend.start.call_count, 1)
+        self.assertNotIn(0, self.service.model_recoveries)
+
+    def test_second_cyber_policy_in_same_attempt_does_not_loop_fallback(self):
+        job, _, fallback = self._begin_model_fallback()
+        message = '{"message":"upstream rejected by cyberPolicy"}'
+        fallback.completed = True
+        fallback.error = message
+        fallback.final = None
+        fallback.result.side_effect = RuntimeError(message)
+
+        self.service.finish(0, fallback, job["id"])
+
+        queued = self.store.job(job["id"])
+        self.assertEqual(queued["state"], "queued")
+        self.assertGreaterEqual(queued["retry_at"], time.time() + 50)
+        self.assertEqual(self.service.backend.start.call_count, 1)
+        self.assertNotIn(0, self.service.model_recoveries)
+
+    def test_nonmatching_turn_error_keeps_normal_retry_and_model(self):
+        self.service.config = replace(
+            self.config,
+            model_fallbacks=(ModelFallback(r"cyberPolicy", "gpt-6-luna"),),
+        )
+        job = self.store.claim(0) if self.job() else None
+        message = '{"message":"ordinary transport failure"}'
+        old = Mock(completed=True, error=message, final=None, schema=None)
+        old.result.side_effect = RuntimeError(message)
+        self.service.turns[0] = (old, job["id"])
+
+        self.service.finish(0, old, job["id"])
+
+        queued = self.store.job(job["id"])
+        self.assertEqual(queued["state"], "queued")
+        self.assertGreaterEqual(queued["retry_at"], time.time() + 50)
+        self.assertNotIn(0, self.service.model_recoveries)
+        self.assertEqual(self.store.slots()[0]["model"], "gpt-6-astra")
+
+    def test_fallback_lookup_failure_requeues_completed_review(self):
+        self.service.config = replace(
+            self.config,
+            model_fallbacks=(ModelFallback(r"cyberPolicy", "gpt-6-luna"),),
+        )
+        self.service.models = [
+            {
+                "model": "gpt-6-luna",
+                "supportedReasoningEfforts": [{"reasoningEffort": "xhigh"}],
+            }
+        ]
+        self.service.backend = Mock(dead=False)
+        self.gh.pr.side_effect = RuntimeError("GitHub unavailable")
+        job = self.store.claim(0) if self.job() else None
+        message = '{"message":"upstream rejected by cyberPolicy"}'
+        old = Mock(completed=True, error=message, final=None, schema=None)
+        old.result.side_effect = RuntimeError(message)
+        self.service.turns[0] = (old, job["id"])
+
+        self.service.finish(0, old, job["id"])
+
+        queued = self.store.job(job["id"])
+        self.assertEqual(queued["state"], "queued")
+        self.assertGreaterEqual(queued["retry_at"], time.time() + 50)
+        self.assertNotIn(0, self.service.turns)
+        self.service.backend.start.assert_not_called()
+        old.release.assert_called_once()
 
     def test_failed_native_interruption_fences_model_switch(self):
         self.service.models = [
@@ -756,36 +1193,26 @@ class TestWorkflow(unittest.TestCase):
         self.assertEqual(manifest["local_validation"][0]["candidate_head"], job["head"])
         self.assertIn("local_validation", prompt)
 
-    def test_review_selects_one_repository_skill_from_the_assigned_checkout(self):
+    def test_review_prompt_records_fetched_target_and_selected_policy(self):
         self.service.backend = Mock(dead=False)
         self.gh.evidence.return_value = {}
-        canonical = self.root / ".agents/skills/mo-self-review/SKILL.md"
-        legacy = self.root / ".claude/skills/mo-self-review/SKILL.md"
-        for number, (paths, selected) in enumerate(
-            (
-                ([canonical, legacy], canonical),
-                ([canonical], canonical),
-                ([legacy], legacy),
-                ([], "none in this checkout"),
+        job = self.job()
+        self.store.update(job["id"], comment_id=99)
+        directory = self.root / "jobs" / job["id"] / "attempt-1"
+        entry = directory / "review-policy/.agents/skills/mo-self-review/SKILL.md"
+        self.workspace.review_policy.return_value = entry
+        self.service.launch(self.store.slots()[0], self.store.job(job["id"]))
+        self.workspace.review_policy.assert_called_once_with("c" * 40, directory)
+        self.assertIn(str(entry), self.service.backend.start.call_args.args[3])
+        self.assertEqual(
+            json.loads((directory / "evidence.json").read_text())["review_base"],
+            dict(
+                branch="main",
+                sha="c" * 40,
+                merge_base="b" * 40,
+                policy_entry=str(entry),
             ),
-            1,
-        ):
-            with self.subTest(selected=str(selected), available=len(paths)):
-                for path in (canonical, legacy):
-                    path.unlink(missing_ok=True)
-                for path in paths:
-                    path.parent.mkdir(parents=True, exist_ok=True)
-                    path.write_text("Repository-specific review rules")
-                job = self.job(pr=number)
-                self.store.update(job["id"], comment_id=99)
-                self.service.launch(self.store.slots()[0], self.store.job(job["id"]))
-                prompt = self.service.backend.start.call_args.args[3]
-                entries = [
-                    line
-                    for line in prompt.splitlines()
-                    if line.startswith("Repository review entry:")
-                ]
-                self.assertEqual(entries, [f"Repository review entry: {selected}."])
+        )
 
     def test_new_review_loads_edited_skill_without_restart(self):
         skill = self.root / "SKILL.md"
@@ -959,6 +1386,9 @@ class TestWorkflow(unittest.TestCase):
 
     def test_uncertain_post_reconciles_remote_review_after_eligibility_changes(self):
         job = self.job()
+        self.gh.evidence.return_value = {}
+        self.store.update(job["id"], comment_id=99)
+        self.service.prepare_review(self.store.slots()[0], self.store.job(job["id"]))
         self.service.save_result(job, self.store.slots()[0], assessment(job))
         self.service.eligible.add(job["id"])
         self.gh.submit_review.side_effect = RuntimeError("response lost")
@@ -969,12 +1399,97 @@ class TestWorkflow(unittest.TestCase):
         self.service = Service(self.config, github=self.gh, workspace=self.workspace)
         self.store = self.service.store
         self.gh.find_review.return_value = {"id": 101}
+        self.gh.pr.return_value["base"]["ref"] = "4.2-dev"
         self.service.eligible.clear()
         self.service.publish(self.store.job(job["id"]))
         self.assertEqual(self.store.job(job["id"])["state"], "done")
         self.assertEqual(self.store.job(job["id"])["review_id"], 101)
         self.gh.submit_review.assert_called_once()
         self.gh.validate_review.assert_called_once()
+        self.assertEqual(len(self.store.jobs()), 1)
+
+    def test_retarget_replaces_unpublished_context_review_with_full_review(self):
+        c = {**candidate(), "context_review": True, "forced": False}
+        prior = {
+            "id": 98,
+            "state": "APPROVED",
+            "commit_id": c["headRefOid"],
+            "submitted_at": "2026-11-19T00:00:00Z",
+            "user": {"login": "me"},
+            "body": marker(
+                "test-bot", {"id": "prior", "head": c["headRefOid"]}, "review"
+            ),
+        }
+        self.gh.evidence.return_value = {"reviews": [prior]}
+        self.store.enqueue(c)
+        original_id = self.store.key(c["repo"], c["number"], c["headRefOid"])
+        slot = self.store.slots()[0]
+        self.store.update(original_id, comment_id=99)
+        original = self.service.prepare_review(slot, self.store.job(original_id))["job"]
+        self.service.save_result(
+            original, slot, {**assessment(original), "decision": "unchanged"}
+        )
+        saved = self.store.job(original_id)
+        self.gh.pr.return_value["base"] = {"ref": "4.2-dev", "sha": "d" * 40}
+
+        self.service.publish(saved)
+
+        self.gh.submit_review.assert_not_called()
+        old = self.store.job(original_id)
+        self.assertEqual(old["state"], "superseded")
+        self.assertEqual(old["result"], saved["result"])
+        self.assertIn("from `main` to `4.2-dev`", old["error"])
+        (new,) = self.store.jobs(("queued",))
+        self.assertEqual(new["head"], saved["head"])
+
+        follow_up = {**c, "trigger_key": "discussion:current"}
+        for reason, candidates in (
+            ("already-reviewed", []),
+            ("discussion-updated", [follow_up]),
+        ):
+            self.service.scan(
+                {
+                    "heads": {"1": c["headRefOid"]},
+                    "candidates": candidates,
+                    "admission": {"1": {"head": c["headRefOid"], "reason": reason}},
+                }
+            )
+            self.assertIn(new["id"], self.service.eligible)
+            self.assertEqual(len(self.store.jobs()), 2)
+
+        job = self.store.claim(slot["id"], self.service.eligible)
+        self.assertEqual(job["id"], new["id"])
+        self.store.update(job["id"], comment_id=100)
+        prepared = self.service.prepare_review(slot, self.store.job(job["id"]))
+        self.assertIn("target branch=4.2-dev", prepared["prompt"])
+        self.assertIn("requires a complete review", prepared["prompt"])
+        self.service.save_result(prepared["job"], slot, assessment(prepared["job"]))
+        self.service.publish(self.store.job(job["id"]))
+        self.gh.submit_review.assert_called_once()
+        self.assertEqual(self.gh.submit_review.call_args.args[0]["id"], new["id"])
+
+    def test_publication_checks_legacy_target_branch_but_allows_advancing_tip(self):
+        self.gh.evidence.return_value = {}
+        slot = self.store.slots()[0]
+        for number, target in ((1, "4.2-dev"), (2, "main")):
+            with self.subTest(target=target):
+                self.gh.pr.return_value["base"] = {"ref": "main", "sha": "b" * 40}
+                job = self.job(pr=number)
+                self.store.update(job["id"], comment_id=99)
+                prepared = self.service.prepare_review(slot, self.store.job(job["id"]))
+                metadata = json.loads(prepared["job"]["metadata"])
+                metadata.pop("review_base_branch")
+                self.store.update(job["id"], metadata=json.dumps(metadata))
+                self.service.save_result(
+                    self.store.job(job["id"]), slot, assessment(job)
+                )
+                self.gh.pr.return_value["base"] = {"ref": target, "sha": "d" * 40}
+                self.service.publish(self.store.job(job["id"]))
+                self.assertEqual(
+                    self.store.job(job["id"])["state"],
+                    "done" if target == "main" else "superseded",
+                )
+        self.gh.submit_review.assert_called_once()
 
     def test_changed_head_before_publication_does_not_submit_review(self):
         job = self.job()
@@ -1418,7 +1933,7 @@ class TestWorkflow(unittest.TestCase):
             return {
                 "state": "open",
                 "head": {"sha": job["head"]},
-                "base": {"sha": "b" * 40},
+                "base": {"ref": "main", "sha": "b" * 40},
             }
 
         self.gh.pr.side_effect = pr

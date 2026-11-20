@@ -1,18 +1,19 @@
 """Owned stdio app-server. Codex owns conversation history; SQLite owns jobs."""
 
-from collections import deque
-from concurrent.futures import Future
 import json
 import os
-from pathlib import Path
 import select
 import shlex
+import shutil
 import subprocess
 import threading
 import time
+from collections import deque
+from concurrent.futures import Future
+from pathlib import Path
 
-from .codex import broken_session, process_identity, stop_owned
 from .artifacts import scratch_env
+from .codex import broken_session, process_identity, stop_owned
 from .validation import prepare as prepare_validation
 
 
@@ -49,7 +50,9 @@ class Events:
 
 
 class Backend:
-    def __init__(self, config, events, *, command=None, experimental=False):
+    def __init__(
+        self, config, events, *, command=None, experimental=False, owner_state_dir=None
+    ):
         self.config, self.events = config, events
         self.pending = {}
         self.lock = threading.RLock()
@@ -72,14 +75,80 @@ class Backend:
             temp = config.state_dir / "backend-tmp"
             temp.mkdir(exist_ok=True)
             env.update(TMPDIR=str(temp), GOTMPDIR=str(temp), GOWORK="off")
+            args = list(command or [config.codex, "app-server", "--stdio"])
+            # Arbitrary injected commands may depend on relative arguments.
+            # Relocate them only when their caller supplies the owner root.
+            relocate_custom = owner_state_dir is not None
+            owner_state_dir = Path(owner_state_dir or config.state_dir).resolve()
+            cwd = None
+            try:
+                in_state_dir = os.path.samefile(".", owner_state_dir)
+            except OSError:
+                in_state_dir = False
+            if in_state_dir and (not command or relocate_custom):
+                # A persistent app-server must not inherit the state directory
+                # as its cwd and thereby protect every scratch tree forever.
+                # Resolve the executable and relative PATH entries first so
+                # changing its cwd does not change command lookup.
+                executable = shutil.which(args[0], path=env.get("PATH"))
+                if executable is None:
+                    raise FileNotFoundError(
+                        f"backend executable unavailable: {args[0]}"
+                    )
+                args[0] = str(Path(executable).resolve())
+                original_cwd = os.getcwd()
+
+                def anchored(part):
+                    # Do not normalize away '..': a preceding path component
+                    # may be a symlink and change the actual parent directory.
+                    return (
+                        part
+                        if os.path.isabs(part)
+                        else os.path.join(original_cwd, part)
+                    )
+
+                if "PATH" in env:
+                    env["PATH"] = os.pathsep.join(
+                        anchored(part) for part in env["PATH"].split(os.pathsep)
+                    )
+                for name in (
+                    "HOME",
+                    "CODEX_HOME",
+                    "XDG_CONFIG_HOME",
+                    "XDG_CACHE_HOME",
+                    "XDG_DATA_HOME",
+                    "XDG_STATE_HOME",
+                ):
+                    if env.get(name) and not os.path.isabs(env[name]):
+                        env[name] = anchored(env[name])
+                if env.get("PYTHONPATH"):
+                    env["PYTHONPATH"] = os.pathsep.join(
+                        anchored(part) for part in env["PYTHONPATH"].split(os.pathsep)
+                    )
+                if env.get("LD_LIBRARY_PATH"):
+                    # The dynamic linker expands $ORIGIN to the executable's
+                    # directory, independently of the working directory.
+                    env["LD_LIBRARY_PATH"] = os.pathsep.join(
+                        part
+                        if part in ("$ORIGIN", "${ORIGIN}")
+                        or part.startswith(("$ORIGIN/", "${ORIGIN}/"))
+                        else anchored(part)
+                        for part in env["LD_LIBRARY_PATH"].split(os.pathsep)
+                    )
+                cwd = owner_state_dir.parent
+                if cwd == owner_state_dir:
+                    cwd = Path("/tmp")
+                if "PWD" in env:
+                    env["PWD"] = str(cwd)
             self.process = subprocess.Popen(
-                command or [config.codex, "app-server", "--stdio"],
+                args,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=self.stderr,
                 text=True,
                 bufsize=1,
                 env=env,
+                cwd=cwd,
                 start_new_session=True,
             )
             self.owner = process_identity(self.process.pid)

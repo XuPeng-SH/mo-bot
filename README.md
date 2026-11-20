@@ -55,6 +55,19 @@ mo-botctl job JOB_ID
 mo-botctl progress SLOT
 ```
 
+An initial status-comment write is fenced immediately before its POST; read-only
+GitHub failures leave the task retryable. If an older failed review is fenced
+because a comment POST may have been sent, inspect the authenticated exact-job
+comment and review markers and the original logs. An absent marker alone does
+not prove that a POST was never sent. Only if independent evidence establishes
+that no POST was sent, an operator may run
+`mo-botctl resolve-review-claim JOB_ID --head FULL_SHA --post-not-sent --reason 'evidence…'`.
+This records the reason, checks the open PR/head and remote markers, and requeues
+the same job under normal admission policy. A subsequent dispatch can post a
+status comment and a review. True ambiguous writes remain fenced. Status exposes
+the total `unresolved_claim_count` and retains the oldest 200 such jobs in the
+compact snapshot, in addition to recent and active jobs.
+
 The service retains its marked PR status comment and submits a commit-pinned formal review. New results accept only `request_changes` → `REQUEST_CHANGES` or `approve` → `APPROVE`; saved historical `needs_validation` assessments remain readable and map to `COMMENT`. PRs authored by the configured reviewer or authenticated account receive `COMMENT` for every assessment. Own PRs without an authenticated, marked bot review on the current head are admitted without waiting for CI, while draft/exclusion/mergeability gates still apply. Completed assessments publish independently of CI, mergeability and discovery admission, while live head/discussion checks and publication fences remain enforced. A review POST is fenced durably; uncertain responses are reconciled by authenticated markers, never blindly repeated. Existing completed jobs are not republished. Reviews run against detached frozen checkouts; only diagnostic directories are writable by the model. It is a trusted local automation using the owner's identities, not a multi-tenant security boundary.
 
 User systemd deployments need their outbound proxy environment explicitly configured when required. `KillMode=control-group` prevents orphaned model/tool work on restart. To survive the last logout, user lingering must be enabled by the machine administrator (`loginctl enable-linger USER`); the current machine denied this operation for xupeng.
@@ -115,7 +128,7 @@ ruff format --check mo_bot tests
 
 Tests exercise SQLite uniqueness/fences, remote marker recovery, ambiguous writes, saved publication checkpoints, head changes, result validation, native JSON-RPC turn reuse/replacement/disconnection, live message steering, model persistence and HTTP authentication. Fake GitHub tests never write to real PRs. Real native session/restart probes are separate operational validation.
 
-Each new review reads the maintained [mo-bot-review skill](.agents/skills/mo-bot-review/SKILL.md) at launch: design/ownership, systemic closure, all comment concerns, senior QA, unhappy paths, performance and implementation/test/documentation deltas; subagents are prohibited.
+Each new review reads the maintained [mo-bot-review skill](.agents/skills/mo-bot-review/SKILL.md) at launch. It checks the actual baseline and existing reusable capabilities before judging new mechanisms, then covers design/ownership, all discussion concerns, unhappy paths, performance and implementation/test/documentation deltas. Substantial net additions and broad changes receive deeper necessity and reuse review; line count alone is not a defect. Findings must establish a concrete failure, material structural cost or unmet required contract, with a focused correction that preserves necessary behavior. Subagents are prohibited.
 
 Review guidance edits take effect for the next assigned review without restarting the service. Already-started/model-switched turns retain their frozen prompt. The installed Codex skill links to the same repository source. Software changes require restarting the service; use idle slots when possible.
 

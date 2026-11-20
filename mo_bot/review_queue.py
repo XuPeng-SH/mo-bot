@@ -184,6 +184,9 @@ def ci_state(pr: dict[str, Any], stale_days: int) -> tuple[bool, str]:
     if not contexts:
         return False, "missing"
 
+    required = [context for context in contexts if context.get("isRequired") is True]
+    if required:
+        contexts = required
     substantive_times: list[dt.datetime] = []
     for context in latest_ci_contexts(contexts):
         if context["__typename"] == "CheckRun":
@@ -276,6 +279,7 @@ class Queue:
                         "name": default.get("name"),
                         "oid": (default.get("target") or {}).get("oid"),
                     }
+            self._load_required_checks(owner, repo, page["nodes"])
             result.extend(page["nodes"])
             if not page["pageInfo"]["hasNextPage"]:
                 return result
@@ -284,6 +288,51 @@ class Queue:
                 raise RuntimeError("GitHub PR discovery pagination did not advance")
             seen.add(cursor)
         raise RuntimeError("GitHub PR discovery pagination limit reached")
+
+    def _load_required_checks(self, owner, repo, prs):
+        # isRequired requires the PR number, so fetch each page in one aliased
+        # query. Never use partially paginated or mismatched-head evidence.
+        prs = [pr for pr in prs if pr.get("headRefOid")]
+        if not prs:
+            return
+        fields = []
+        for pr in prs:
+            number = int(pr["number"])
+            fields.append(f"""p{number}: pullRequest(number: {number}) {{
+              headRefOid statusCheckRollup {{ contexts(first: 100) {{
+                pageInfo {{ hasNextPage }}
+                nodes {{ __typename
+                  ... on CheckRun {{ name status conclusion startedAt completedAt isRequired(pullRequestNumber: {number}) }}
+                  ... on StatusContext {{ context state updatedAt isRequired(pullRequestNumber: {number}) }}
+                }}
+              }} }}
+            }}""")
+        query = (
+            "query($owner:String!, $repo:String!) { repository(owner:$owner,name:$repo) {"
+            + " ".join(fields)
+            + "} }"
+        )
+        payload = self.github.api(
+            "graphql",
+            method="POST",
+            body={"query": query, "variables": {"owner": owner, "repo": repo}},
+        )
+        if payload.get("errors"):
+            raise RuntimeError(
+                "GitHub required-check discovery returned GraphQL errors"
+            )
+        repository = payload["data"]["repository"]
+        for pr in prs:
+            detail = repository.get(f"p{int(pr['number'])}")
+            if not detail or detail.get("headRefOid") != pr.get("headRefOid"):
+                pr["statusCheckRollup"] = None
+                continue
+            rollup = detail.get("statusCheckRollup") or {}
+            contexts = rollup.get("contexts") or {}
+            if (contexts.get("pageInfo") or {}).get("hasNextPage"):
+                pr["statusCheckRollup"] = None
+                continue
+            pr["statusCheckRollup"] = rollup
 
     def stabilize_mergeability(self, prs, owner, repo, retries, retry_delay):
         stabilize_mergeability(

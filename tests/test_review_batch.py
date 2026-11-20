@@ -23,7 +23,7 @@ class TestReviewBatch(unittest.TestCase):
         self.gh.pr.side_effect = lambda job: {
             "state": "open",
             "head": {"sha": job["head"]},
-            "base": {"sha": "f" * 40},
+            "base": {"ref": "main", "sha": "f" * 40},
             "user": {"login": "other"},
         }
         self.workspace.prepare.side_effect = self.prepare
@@ -38,7 +38,7 @@ class TestReviewBatch(unittest.TestCase):
         (directory / "change.patch").write_text(
             "+change\n" * self.sizes.get(job["pr"], 1)
         )
-        return source, pr["base"]["sha"]
+        return source, pr["base"]["sha"], pr["base"]["sha"]
 
     def native(self, slot, directory, workspace, prompt, schema):
         directory.mkdir(parents=True, exist_ok=True)
@@ -351,6 +351,106 @@ class TestReviewBatch(unittest.TestCase):
         self.assertFalse(workspace.clean("0/batch", head=second))
         self.assertTrue(workspace.clean(0, head=first))
         self.assertFalse(workspace.clean("missing", head=first))
+
+    def test_review_policy_uses_target_tip_and_ignores_pr_skill_changes(self):
+        from dataclasses import replace
+        import subprocess
+        from mo_bot.codex import Workspace
+
+        repo = self.root / "policy-repo"
+        repo.mkdir()
+
+        def git(*args):
+            return subprocess.check_output(
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    *args,
+                ],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            ).strip()
+
+        def write(path, contents):
+            p = repo / path
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(contents)
+            git("add", path)
+
+        canonical = ".agents/skills/mo-self-review/SKILL.md"
+        legacy = ".claude/skills/mo-self-review/SKILL.md"
+        reference = ".agents/skills/mo-dev/references/upgrade-compatibility.md"
+        git("init", "-b", "main")
+        git("commit", "--allow-empty", "-m", "old base")
+        stale = git("rev-parse", "HEAD")
+        git("branch", "release/v4.2.1-hotfix", stale)
+        write("shared.txt", "present on both branches at the actual merge-base")
+        git("commit", "-m", "shared change")
+        shared = git("rev-parse", "HEAD")
+        git("switch", "-c", "candidate")
+        write(canonical, "PR-authored rules")
+        git("commit", "-m", "PR edits rules")
+        head = git("rev-parse", "HEAD")
+        git("update-ref", "refs/pull/1/head", head)
+
+        git("switch", "main")
+        write(canonical, "main rules")
+        write(legacy, "lower-priority copy")
+        write(reference, "main reference")
+        link = ".agents/skills/mo-dev/local-link"
+        (repo / link).symlink_to("/does-not-exist")
+        git("add", link)
+        git("commit", "-m", "latest main rules")
+        main = git("rev-parse", "HEAD")
+        git("switch", "release/v4.2.1-hotfix")
+        write(legacy, "hotfix rules")
+        git("commit", "-m", "latest hotfix rules")
+        hotfix = git("rev-parse", "HEAD")
+        git(
+            "config",
+            f"url.{repo.as_uri()}.insteadOf",
+            f"https://github.com/{self.config.repository}.git",
+        )
+        workspace = Workspace(replace(self.config, source_dir=repo))
+        job = {"repo": self.config.repository, "pr": 1, "head": head}
+        self.assertIsNone(workspace.review_policy(stale, self.root))
+
+        for branch, tip, ancestor, rules in (
+            ("main", main, shared, "main rules"),
+            ("release/v4.2.1-hotfix", hotfix, stale, "hotfix rules"),
+        ):
+            with self.subTest(branch=branch):
+                directory = self.root / rules
+                directory.mkdir()
+                source, merge_base, base = workspace.prepare(
+                    0, job, {"base": {"sha": stale, "ref": branch}}, directory
+                )
+                self.assertEqual((merge_base, base), (ancestor, tip))
+                entry = workspace.review_policy(base, directory)
+                self.assertEqual(entry.read_text(), rules)
+                self.assertEqual((source / canonical).read_text(), "PR-authored rules")
+                self.assertTrue(workspace.clean(0, head))
+                delta = (directory / "change.patch").read_text()
+                self.assertIn("+PR-authored rules", delta)
+                self.assertEqual("shared.txt" in delta, branch != "main")
+                if branch == "main":
+                    self.assertFalse((directory / "review-policy" / link).is_symlink())
+                    self.assertEqual(
+                        (directory / "review-policy" / reference).read_text(),
+                        "main reference",
+                    )
+
+        directory = self.root / "missing target"
+        directory.mkdir()
+        with self.assertRaisesRegex(RuntimeError, "couldn't find remote ref"):
+            workspace.prepare(
+                0, job, {"base": {"sha": stale, "ref": "deleted"}}, directory
+            )
 
     def test_head_change_cannot_publish_old_member_but_other_result_is_saved(self):
         jobs, turn = self.launch_pair()

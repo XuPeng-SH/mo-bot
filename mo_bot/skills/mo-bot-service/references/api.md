@@ -12,8 +12,8 @@ Default address: `http://127.0.0.1:8989`. Every request requires `Authorization:
 
 | Request | Result |
 |---|---|
-| `GET /api/status` | Timestamped scheduler snapshot, backend health, session model/turn/job, recent jobs, counts, discovery/backoff timing |
-| `GET /api/jobs` | Compact latest 200 durable jobs plus active/affine jobs, states/errors/result summaries, admission/backoff and head SHA |
+| `GET /api/status` | Timestamped scheduler snapshot, backend health, session model/turn/job, recent jobs, counts including `unresolved_claim_count`, discovery/backoff timing |
+| `GET /api/jobs` | Compact latest 200 durable jobs plus active/affine jobs and up to 200 oldest unresolved claim fences, states/errors/result summaries, admission/backoff and head SHA |
 | `GET /api/jobs/JOB_ID` | Full metadata, frozen evidence, worker data and saved assessment on demand |
 | `GET /api/sessions` | Pool slots including disabled history, thread ID, generation, selected `model`/`effort`, running `active_model`/`active_effort` |
 | `GET /api/pools` | Enabled capacity and draining slot count per role |
@@ -24,6 +24,7 @@ Default address: `http://127.0.0.1:8989`. Every request requires `Authorization:
 | `POST /api/service/drain` / `resume` with `{"reason":"…"}` | Persisted dispatch/publication pause; active turns finish into checkpoints |
 | `POST /api/jobs/JOB_ID/pause` / `resume` / `retry` with `{}` | Checkpoint pause/resume or reconcile saved publication; worker resume/retry accept optional `{"hint":"…"}` for the next model turn |
 | `POST /api/jobs/JOB_ID/retry` with `{"fresh_session":true}` | Retry a stopped failed unpublished review on the unchanged open head; rotate an idle review thread and reserve it for the same job/comment. Refuses publication uncertainty or existing reviews. CLI: `retry JOB_ID --fresh-session` |
+| `POST /api/jobs/JOB_ID/resolve-review-claim` with `{"head":"FULL_SHA","post_not_sent":true,"reason":"evidence"}` | Explicitly resolve a legacy failed initial claim only when evidence proves no comment POST was sent. Rechecks current head and authenticated markers, records the evidence, and requeues under normal admission. Absence of a marker alone is insufficient. CLI: `resolve-review-claim JOB_ID --head FULL_SHA --post-not-sent --reason 'evidence'` |
 | `POST /api/jobs/JOB_ID/cleanup` with `{}` | Cancel stopped task, free resources, retain evidence; uncertain effects are refused |
 | `POST /api/jobs/JOB_ID/rerun` with `{"run_id":123}` | Frozen approved current-head Actions rerun, with cause issues and outbox/budget guards |
 | `POST /api/jobs/JOB_ID/guide` with `{"text":"…"}` | Durable worker task guidance through shared Luna xhigh harness; inspect `data.harness_request` / `harness_result` for eventual action, question or fallback |

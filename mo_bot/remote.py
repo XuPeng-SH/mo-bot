@@ -2,18 +2,18 @@
 
 import base64
 import hashlib
-from dataclasses import replace
 import json
-from pathlib import Path
 import shlex
 import subprocess
 import threading
 import time
 import uuid
+from dataclasses import replace
+from pathlib import Path
 
-from .rpc import Backend
-from .codex import stop_owned
 from .artifacts import scratch_env
+from .codex import stop_owned
+from .rpc import Backend
 
 
 class CleanupPending(RuntimeError):
@@ -129,6 +129,7 @@ class HostTools:
                     replace(self.remote.host_config, state_dir=state),
                     self.remote.events,
                     experimental=True,
+                    owner_state_dir=self.remote.host_config.state_dir,
                 )
             process = "mo-bot-" + uuid.uuid4().hex
             self.active = process
@@ -227,6 +228,7 @@ class RemoteBackend(Backend):
             replace(config, state_dir=state),
             events,
             command=ssh_command(config, node),
+            owner_state_dir=config.state_dir,
             experimental=True,
         )
         self.heartbeat = threading.Thread(

@@ -1,10 +1,13 @@
 import os
 import json
+import io
 import re
 import hashlib
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+import shutil
 import signal
 import subprocess
+import tarfile
 import time
 
 
@@ -117,16 +120,20 @@ class Workspace:
     def __init__(self, config):
         self.config = config
 
-    def git(self, *args, cwd=None):
-        result = subprocess.run(
-            ["git", "-C", str(cwd or self.config.source_dir), *args],
-            text=True,
-            capture_output=True,
-            timeout=120,
-        )
+    def git(self, *args, cwd=None, binary=False):
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(cwd or self.config.source_dir), *args],
+                text=not binary,
+                capture_output=True,
+                timeout=120,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise RuntimeError(f"git {args[0]} timed out") from error
         if result.returncode:
-            raise RuntimeError(result.stderr.strip()[:2000])
-        return result.stdout.strip()
+            stderr = result.stderr.decode(errors="replace") if binary else result.stderr
+            raise RuntimeError(stderr.strip()[:2000])
+        return result.stdout if binary else result.stdout.strip()
 
     def path(self, slot):
         return self.config.state_dir / "slots" / str(slot) / "source"
@@ -157,14 +164,21 @@ class Workspace:
     def prepare(self, slot, job, pr, directory):
         remote = "https://github.com/" + job["repo"] + ".git"
         ref = f"refs/mo-bot/{self.config.service_id}/pr/{job['pr']}"
-        self.git("fetch", "--no-tags", remote, f"+refs/pull/{job['pr']}/head:{ref}")
+        base_branch = pr["base"]["ref"]
+        base_source = f"refs/heads/{base_branch}"
+        self.git("check-ref-format", base_source)
+        base_ref = f"refs/mo-bot/{self.config.service_id}/review-base/{job['pr']}"
+        self.git(
+            "fetch",
+            "--atomic",
+            "--no-tags",
+            remote,
+            f"+refs/pull/{job['pr']}/head:{ref}",
+            f"+{base_source}:{base_ref}",
+        )
         if self.git("rev-parse", ref) != job["head"]:
             raise SourceChanged("PR head changed during fetch")
-        base = pr["base"]["sha"]
-        try:
-            self.git("cat-file", "-e", base + "^{commit}")
-        except RuntimeError:
-            self.git("fetch", "--no-tags", remote, base)
+        base = self.git("rev-parse", base_ref)
         path = self.ensure(slot, job["head"])
         merge_base = self.git("merge-base", job["head"], base, cwd=path)
         (directory / "change.patch").write_text(
@@ -173,7 +187,56 @@ class Workspace:
         (directory / "change-stat.txt").write_text(
             self.git("diff", "--stat", merge_base, job["head"], cwd=path)
         )
-        return path, merge_base
+        return path, merge_base, base
+
+    def review_policy(self, base, directory):
+        roots = (".agents/skills", ".claude/skills")
+        entry = next(
+            (
+                f"{root}/mo-self-review/SKILL.md"
+                for root in roots
+                if self.git(
+                    "ls-tree", base, "--", f"{root}/mo-self-review/SKILL.md"
+                ).startswith(("100644 blob ", "100755 blob "))
+            ),
+            None,
+        )
+        if entry is None:
+            return None
+        paths = self.git(
+            "ls-tree", "-d", "--name-only", base, "--", *roots
+        ).splitlines()
+        archive = self.git("archive", "--format=tar", base, *paths, binary=True)
+        snapshot = directory / "review-policy"
+        snapshot.mkdir()
+        try:
+            with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as tree:
+                for member in tree:
+                    # Policy snapshots contain documents and their references.
+                    # Copy regular files without restoring links or tar metadata.
+                    if not member.isfile():
+                        continue
+                    relative = PurePosixPath(member.name)
+                    if (
+                        ".." in relative.parts
+                        or "/".join(relative.parts[:2]) not in paths
+                    ):
+                        raise ValueError(f"unexpected policy path {member.name!r}")
+                    target = snapshot / relative
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    with (
+                        tree.extractfile(member) as source,
+                        target.open("xb") as output,
+                    ):
+                        shutil.copyfileobj(source, output)
+        except (tarfile.TarError, ValueError) as error:
+            raise RuntimeError(
+                f"cannot extract review policy at {base}: {error}"
+            ) from error
+        skill = snapshot / entry
+        if not skill.is_file():
+            raise RuntimeError(f"review policy entry missing from archive at {base}")
+        return skill
 
     def quarantine(self, slot):
         path = self.path(slot)

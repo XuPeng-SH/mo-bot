@@ -1,13 +1,17 @@
 """Reclaim disposable task scratch without deleting source or review evidence."""
 
-from concurrent.futures import ThreadPoolExecutor
+import errno
 import logging
 import os
-from pathlib import Path
+import select
+import stat
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
+from .proc_inspection import referenced_jobs
 
 LOG = logging.getLogger("mo-bot")
 TERMINAL = {"done", "failed", "superseded"}
@@ -33,77 +37,241 @@ def scratch_env(state_dir, directory):
     }
 
 
-def referenced_jobs(root, ids, proc=Path("/proc")):
-    """Protect detached local tools and container bind mounts as well as turns."""
-    if not ids:
-        return set()
-    needles = {str(root / key): key for key in ids}
-    used = set()
-    for process in proc.glob("[0-9]*"):
-        texts = []
-        mounts = ""
-        for name in ("cwd", "exe"):
-            try:
-                texts.append(os.readlink(process / name))
-            except OSError:
-                pass
-        for fd in (process / "fd").glob("*"):
-            try:
-                texts.append(os.readlink(fd))
-            except OSError:
-                pass
-        for name in ("cmdline", "environ", "maps", "mountinfo"):
-            try:
-                text = (process / name).read_bytes().decode(errors="replace")
-                if name == "mountinfo":
-                    mounts = text
-                    text = text.replace(r"\040", " ").replace(r"\011", "\t")
-                texts.append(text)
-            except OSError:
-                # Other users' private memory/fds are not task ownership proof;
-                # visible records still apply. Exiting/zombie processes may also
-                # return ESRCH/EINVAL for maps/mountinfo during this snapshot.
-                pass
-        for text in texts:
-            for path, key in needles.items():
-                if path in text:
-                    used.add(key)
-        # A container may bind the entire jobs tree, rather than one task.
-        for line in mounts.splitlines():
-            fields = line.split()
-            if len(fields) > 5 and fields[3] != "/":
-                mount_root = Path(
-                    fields[3].replace(r"\040", " ").replace(r"\011", "\t")
-                )
-                if mount_root == root or mount_root in root.parents:
-                    used.update(ids)
-    return used
+def _mount_id(fd):
+    # Unlike st_dev, the kernel mount ID also distinguishes bind mounts on
+    # the same filesystem. The descriptor remains anchored across renames.
+    for line in Path(f"/proc/self/fdinfo/{fd}").read_text().splitlines():
+        key, _, value = line.partition(":")
+        if key == "mnt_id" and value.strip().isdecimal():
+            return int(value.strip())
+    raise OSError(f"cannot determine mount ID for fd {fd}")
 
 
 def remove_scratch(path, stopping):
-    # Go module directories are read-only. Make only directories in the
-    # detached scratch tree writable; never follow a symlink into user data.
-    def fail(error):
-        raise error
+    """Remove a detached tree with bounded fds and without crossing mounts."""
+    path = Path(path)
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 
-    for current, dirs, files in os.walk(
-        path, topdown=False, followlinks=False, onerror=fail
-    ):
-        if stopping.is_set():
-            return False
-        os.chmod(current, 0o700)
-        for name in files:
+    def open_checked(parent_fd, name, expected_mount, identity=None):
+        fd = os.open(name, flags, dir_fd=parent_fd)
+        try:
+            if _mount_id(fd) != expected_mount:
+                raise OSError(errno.EXDEV, "scratch cleanup refuses a mountpoint", name)
+            info = os.fstat(fd)
+            actual = (info.st_dev, info.st_ino)
+            if identity is not None and actual != identity:
+                raise OSError(errno.ESTALE, "scratch directory changed", name)
+            return fd, actual
+        except BaseException:
+            os.close(fd)
+            raise
+
+    # Mount changes in this process's namespace invalidate the cached parent
+    # chain, even if a bind mount exposes the same inode at the same pathname.
+    mount_fd = os.open("/proc/thread-self/mounts", os.O_RDONLY | os.O_CLOEXEC)
+    state_fd = None
+    try:
+        mount_poll = select.poll()
+        mount_poll.register(mount_fd, select.POLLPRI)
+        state_fd = os.open(path.parent.parent, flags)
+        expected_mount = _mount_id(state_fd)
+        state_info = os.fstat(state_fd)
+        state_identity = (state_info.st_dev, state_info.st_ino)
+        trash_fd = os.open(path.parent.name, flags, dir_fd=state_fd)
+        try:
+            if _mount_id(trash_fd) != expected_mount:
+                raise OSError(
+                    errno.EXDEV,
+                    "scratch cleanup refuses a mounted trash root",
+                    str(path.parent),
+                )
             if stopping.is_set():
                 return False
-            (Path(current) / name).unlink()
-        for name in dirs:
-            child = Path(current) / name
-            if child.is_symlink():
-                child.unlink()
-            else:
-                child.rmdir()
-    path.rmdir()
-    return True
+            current, identity = open_checked(trash_fd, path.name, expected_mount)
+            try:
+                trash_info = os.fstat(trash_fd)
+                trash_identity = (trash_info.st_dev, trash_info.st_ino)
+                trash_path = os.readlink(f"/proc/self/fd/{trash_fd}")
+                current_path = os.path.join(trash_path, path.name)
+                stack = [
+                    {
+                        "name": path.name,
+                        "identity": identity,
+                        "pending": [],
+                    }
+                ]
+
+                def checked_parent(frame):
+                    parent = os.open("..", flags, dir_fd=current)
+                    try:
+                        info = os.fstat(parent)
+                        expected_parent = (
+                            stack[-2]["identity"] if len(stack) > 1 else trash_identity
+                        )
+                        if (
+                            _mount_id(parent) != expected_mount
+                            or (info.st_dev, info.st_ino) != expected_parent
+                        ):
+                            raise OSError(
+                                errno.ESTALE, "scratch directory changed", current_path
+                            )
+                        probe, _ = open_checked(
+                            parent, frame["name"], expected_mount, frame["identity"]
+                        )
+                        os.close(probe)
+                        return parent
+                    except BaseException:
+                        os.close(parent)
+                        raise
+
+                def check_visible_chain():
+                    # Reopen the state and trash roots as well: either can be
+                    # overmounted after their original descriptors were opened.
+                    # The state path may also have been moved and reached via
+                    # a new symlink in an intermediate component. Inode and
+                    # mount identity alone cannot distinguish that case.
+                    if os.readlink(f"/proc/self/fd/{trash_fd}") != trash_path:
+                        raise OSError(
+                            errno.ESTALE, "scratch directory changed", trash_path
+                        )
+                    ancestor = os.open(path.parent.parent, flags)
+                    try:
+                        info = os.fstat(ancestor)
+                        if (
+                            _mount_id(ancestor) != expected_mount
+                            or (info.st_dev, info.st_ino) != state_identity
+                        ):
+                            raise OSError(
+                                errno.ESTALE, "scratch directory changed", str(path)
+                            )
+                        child, _ = open_checked(
+                            ancestor, path.parent.name, expected_mount, trash_identity
+                        )
+                        os.close(ancestor)
+                        ancestor = child
+                        for part in stack:
+                            if stopping.is_set():
+                                return False
+                            child, _ = open_checked(
+                                ancestor,
+                                part["name"],
+                                expected_mount,
+                                part["identity"],
+                            )
+                            os.close(ancestor)
+                            ancestor = child
+                        return True
+                    finally:
+                        os.close(ancestor)
+
+                def check_mount_events():
+                    # Acknowledge before rewalking so another change during
+                    # the walk is observed on the next poll. A mount storm is
+                    # deferred instead of blocking shutdown indefinitely.
+                    for _ in range(3):
+                        events = mount_poll.poll(0)
+                        if not events:
+                            return True
+                        if any(
+                            mask & (select.POLLHUP | select.POLLNVAL)
+                            for _, mask in events
+                        ):
+                            raise OSError("cannot monitor scratch mount changes")
+                        os.lseek(mount_fd, 0, os.SEEK_SET)
+                        if not os.read(mount_fd, 1):
+                            raise OSError("cannot monitor scratch mount changes")
+                        if not check_visible_chain():
+                            return False
+                    if mount_poll.poll(0):
+                        raise OSError(errno.EAGAIN, "scratch mounts keep changing")
+                    return True
+
+                def check_current_path():
+                    try:
+                        actual = os.readlink(f"/proc/self/fd/{current}")
+                    except OSError as error:
+                        if error.errno != errno.ENAMETOOLONG:
+                            raise
+                        # procfs cannot render paths longer than PATH_MAX even
+                        # though openat can traverse them.
+                        if not check_visible_chain():
+                            return False
+                        return check_mount_events()
+                    if actual != current_path:
+                        raise OSError(
+                            errno.ESTALE, "scratch directory changed", current_path
+                        )
+                    return check_mount_events()
+
+                while stack:
+                    if stopping.is_set():
+                        return False
+                    frame = stack[-1]
+                    if not check_current_path():
+                        return False
+                    # Verify the current parent and its visible mount before any
+                    # changes. Handles bind mounts created after the last scan.
+                    parent = checked_parent(frame)
+                    os.close(parent)
+                    if not check_mount_events():
+                        return False
+                    os.fchmod(current, 0o700)
+                    if not frame["pending"]:
+                        with os.scandir(current) as entries:
+                            for entry in entries:
+                                if stopping.is_set():
+                                    return False
+                                info = entry.stat(follow_symlinks=False)
+                                if stat.S_ISDIR(info.st_mode):
+                                    frame["pending"].append(
+                                        (entry.name, (info.st_dev, info.st_ino))
+                                    )
+                                    if len(frame["pending"]) >= 64:
+                                        break
+                                else:
+                                    if not check_mount_events():
+                                        return False
+                                    os.unlink(entry.name, dir_fd=current)
+                    if frame["pending"]:
+                        name, expected = frame["pending"].pop()
+                        child, child_id = open_checked(
+                            current, name, expected_mount, expected
+                        )
+                        child_path = os.path.join(current_path, name)
+                        os.close(current)
+                        current = child
+                        current_path = child_path
+                        stack.append(
+                            {
+                                "name": name,
+                                "identity": child_id,
+                                "pending": [],
+                            }
+                        )
+                        continue
+                    if stopping.is_set():
+                        return False
+                    if not check_mount_events():
+                        return False
+                    parent = checked_parent(frame)
+                    try:
+                        os.rmdir(frame["name"], dir_fd=parent)
+                    except BaseException:
+                        os.close(parent)
+                        raise
+                    os.close(current)
+                    current = parent
+                    stack.pop()
+                    current_path = os.path.dirname(current_path)
+                return True
+            finally:
+                os.close(current)
+        finally:
+            os.close(trash_fd)
+    finally:
+        if state_fd is not None:
+            os.close(state_fd)
+        os.close(mount_fd)
 
 
 class Artifacts:
@@ -167,25 +335,58 @@ class Artifacts:
             disposable = [p for p in paths if not p.is_symlink() and p.is_dir()]
             if disposable:
                 candidates[key] = disposable
-        protected = referenced_jobs(self.root, set(candidates))
-        for key, paths in candidates.items():
-            if key in protected:
-                continue
-            for path in paths:
-                try:
-                    # Detach synchronously under the coordinator's ownership.
-                    # A retry may now create fresh scratch at the original path.
-                    path.rename(self.trash / uuid.uuid4().hex)
-                except OSError as error:
-                    errors.append(f"{path}: {error}")
-        self.status["errors"] = errors[:10]
-        if any(self.trash.iterdir()):
-            self.status["running"] = True
-            self.future = self.executor.submit(self._delete, errors)
+        try:
+            protected = referenced_jobs(self.root, set(candidates))
+        except OSError as error:
+            errors.append(f"scratch cleanup deferred: {error}")
+            LOG.warning("%s", errors[0])
+            protected = None
+        if protected is not None:
+            for key, paths in candidates.items():
+                if key in protected:
+                    continue
+                for path in paths:
+                    try:
+                        # Detach synchronously under the coordinator's ownership.
+                        # A retry may now create fresh scratch at the original path.
+                        path.rename(self.trash / uuid.uuid4().hex)
+                    except OSError as error:
+                        errors.append(f"{path}: {error}")
 
-    def _delete(self, errors):
+        # Detached trees can still be held by processes missed by an older
+        # scanner or opened after detachment. Check their current paths before
+        # deletion; a failed jobs scan does not imply that this scan will fail.
+        trash = {
+            p.name for p in self.trash.iterdir() if not p.is_symlink() and p.is_dir()
+        }
+        self.status["errors"] = errors[:10]
+        if trash:
+            self.status["running"] = True
+            self.future = self.executor.submit(self._delete, errors, trash)
+
+    def _delete(self, errors, names):
         removed = 0
-        for path in self.trash.iterdir():
+        if self.stopping.is_set():
+            return {"removed": removed, "errors": errors[:10]}
+        try:
+            protected = referenced_jobs(self.trash, names)
+        except OSError as error:
+            errors.append(f"scratch trash cleanup deferred: {error}")
+            LOG.warning("%s", errors[-1])
+            return {"removed": removed, "errors": errors[:10]}
+        for name in names - protected:
+            if self.stopping.is_set():
+                break
+            try:
+                # A previous tree can take a long time to delete. Renew the
+                # reference check immediately before handling this tree.
+                if name in referenced_jobs(self.trash, {name}):
+                    continue
+            except OSError as error:
+                errors.append(f"scratch trash cleanup deferred: {error}")
+                LOG.warning("%s", errors[-1])
+                break
+            path = self.trash / name
             if path.is_symlink() or not path.is_dir():
                 continue
             try:

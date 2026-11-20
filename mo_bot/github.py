@@ -394,13 +394,13 @@ class GitHub:
             )
         return found[0] if found else None
 
-    def ensure_comment(self, job):
-        existing = self.find_comment(job)
-        if existing:
-            return existing
+    def create_comment(self, job, *, before_post):
+        """Create an already-reconciled claim, fencing only at the write boundary."""
         body = self.render(job, "reviewing", "Review in progress.")
-        # An uncertain write is never retried by this call. The coordinator
-        # reconciles its marker before any later attempt to start the model.
+        # The caller has already read authenticated markers. Persist the fence
+        # after all read-only preparation and immediately before the POST. A
+        # crash or uncertain POST remains fenced until explicit reconciliation.
+        before_post()
         return self.api(
             f"repos/{job['repo']}/issues/{dict(job).get('target_number') or job['pr']}/comments",
             method="POST",

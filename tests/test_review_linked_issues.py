@@ -377,6 +377,30 @@ class TestLinkedIssuePublication(unittest.TestCase):
         self.assertEqual(new["state"], "queued")
         self.assertIn(new["id"], self.service.eligible)
 
+    def test_changed_issue_can_return_to_an_earlier_snapshot(self):
+        from tests.test_service import assessment
+
+        job = self.assessed_job(self.issue_context("A"))
+        for previous, current in (("A", "B"), ("B", "C"), ("C", "B")):
+            metadata = json.loads(job["metadata"])
+            metadata["linked_issue_digest"] = linked_issue_digest(
+                self.gh.pr.return_value, self.issue_context(previous), self.gh.author
+            )
+            metadata["linked_issue_complete"] = True
+            self.store.update(job["id"], metadata=json.dumps(metadata))
+            self.gh.linked_issues.return_value = self.issue_context(current)
+            self.service.publish(self.store.job(job["id"]))
+            self.assertEqual(self.store.job(job["id"])["state"], "superseded")
+            queued = [item for item in self.store.jobs() if item["state"] == "queued"]
+            self.assertEqual(len(queued), 1)
+            job = queued[0]
+            self.service.save_result(
+                job, self.store.slots()[0], assessment(job), "fake", "xhigh"
+            )
+            job = self.store.job(job["id"])
+        self.gh.submit_review.assert_not_called()
+        self.assertEqual(len(self.store.jobs()), 4)
+
     def test_unchanged_issue_allows_publication(self):
         context = self.issue_context()
         job = self.assessed_job(context)

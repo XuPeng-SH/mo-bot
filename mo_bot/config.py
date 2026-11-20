@@ -12,6 +12,17 @@ PYTHON_SDK_REVIEW_MODEL = "gpt-6.1-sol"
 PYTHON_SDK_REVIEW_EFFORT = "xhigh"
 
 
+@dataclass(frozen=True)
+class ModelFallback:
+    pattern: str
+    model: str
+    reasoning_effort: str | None = None
+    restore_seconds: int = 5
+
+    def matches(self, message):
+        return re.search(self.pattern, message, re.IGNORECASE) is not None
+
+
 def accepted_delivery_gate(model, effort):
     """Recognize current gates and completed gates retained from before the change."""
     return (model, effort) in {
@@ -34,6 +45,7 @@ class Config:
     poll_seconds: int = 60
     model: str = "gpt-6-astra"
     reasoning_effort: str = "xhigh"
+    model_fallbacks: tuple[ModelFallback, ...] = ()
     python_sdk_review_slot: int | None = None
     python_sdk_path_prefixes: tuple[str, ...] = ()
     author_review_delays: dict[str, int] = field(default_factory=dict)
@@ -65,6 +77,41 @@ class Config:
         data = tomllib.loads(path.read_text())
         service, review = data["service"], data["review"]
         worker = data.get("worker", {})
+        raw_fallbacks = data.get("model_fallback", [])
+        if not isinstance(raw_fallbacks, list):
+            raise ValueError("model_fallback must be an array of tables")
+        model_fallbacks = []
+        for item in raw_fallbacks:
+            if not isinstance(item, dict) or set(item) - {
+                "pattern",
+                "model",
+                "reasoning_effort",
+                "restore_seconds",
+            }:
+                raise ValueError("invalid model_fallback entry")
+            pattern = item.get("pattern")
+            model = item.get("model")
+            effort = item.get("reasoning_effort")
+            seconds = item.get("restore_seconds", 5)
+            if (
+                not isinstance(pattern, str)
+                or not pattern.strip()
+                or not isinstance(model, str)
+                or not model.strip()
+                or effort is not None
+                and (not isinstance(effort, str) or not effort.strip())
+                or type(seconds) is not int
+                or not 1 <= seconds <= 15
+            ):
+                raise ValueError(
+                    "model_fallback requires pattern/model, optional reasoning_effort, "
+                    "and restore_seconds in 1..15"
+                )
+            try:
+                re.compile(pattern)
+            except re.error as error:
+                raise ValueError(f"invalid model_fallback pattern: {error}") from error
+            model_fallbacks.append(ModelFallback(pattern, model, effort, seconds))
         python_sdk = review.get("python_sdk", {})
         if not isinstance(python_sdk, dict) or set(python_sdk) - {
             "slot",
@@ -123,6 +170,7 @@ class Config:
                 }
             },
             author_review_delays=author_review_delays,
+            model_fallbacks=tuple(model_fallbacks),
             python_sdk_review_slot=python_sdk.get("slot"),
             python_sdk_path_prefixes=tuple(
                 python_sdk.get("path_prefixes", ["clients/python/"])

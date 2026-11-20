@@ -259,7 +259,7 @@ class Store:
             is not None
         )
 
-    def enqueue(self, candidate: dict) -> bool:
+    def enqueue(self, candidate: dict, *, replaces_review=None) -> bool:
         kind = candidate.get("kind", "review")
         target_type = candidate.get("target_type", "pr")
         trigger = candidate.get("trigger_key", "")
@@ -282,6 +282,24 @@ class Store:
             # Repeated snapshots, including a previously failed task, never re-enqueue it.
             if self.db.execute("SELECT 1 FROM jobs WHERE id=?", (key,)).fetchone():
                 return False
+            if replaces_review:
+                # Retire the unpublished round in the successor's transaction.
+                previous_id, reason = replaces_review
+                updated = self.db.execute(
+                    """UPDATE jobs SET state='superseded',error=?,updated=?,slot_id=NULL,retry_at=0
+                    WHERE id=? AND repo=? AND pr=? AND head=? AND kind='review'
+                    AND state='publishing' AND review_attempted=0 AND review_id IS NULL""",
+                    (
+                        reason,
+                        now,
+                        previous_id,
+                        candidate["repo"],
+                        candidate["number"],
+                        candidate["headRefOid"],
+                    ),
+                )
+                if updated.rowcount != 1:
+                    return False
             members = candidate.get("members", [])
             if target_type == "issue":
                 if not members:
@@ -475,10 +493,11 @@ class Store:
 
     def summaries(self, limit=200):
         # Do not hydrate immutable CI/comment evidence on every status tick.
-        # Keep recent jobs plus every active/affine job visible.
+        # Keep recent jobs, active/affine jobs, and the oldest bounded set of
+        # unresolved claim fences visible even after newer jobs are completed.
         return self.db.execute(
             """SELECT id,repo,pr,target_number,target_type,head,kind,phase,state,
-            created,updated,slot_id,attempts,error,retry_at,comment_id,comment_state,
+            created,updated,slot_id,attempts,error,retry_at,claim_attempted,comment_id,comment_state,
             review_id,review_event,review_attempted,
             json_object('title',json_extract(metadata,'$.title'),
                 'ci',json_extract(metadata,'$.ci'),'forced',json_extract(metadata,'$.forced'),
@@ -504,9 +523,18 @@ class Store:
             FROM jobs WHERE id IN(SELECT id FROM jobs ORDER BY created DESC LIMIT ?)
                 OR state IN ('reviewing','publishing','canceling')
                 OR (kind='work' AND state='queued' AND slot_id IS NOT NULL)
+                OR id IN (SELECT id FROM jobs WHERE state='failed'
+                    AND claim_attempted=1 AND comment_id IS NULL
+                    ORDER BY updated ASC LIMIT ?)
             ORDER BY created DESC""",
-            (limit,),
+            (limit, limit),
         ).fetchall()
+
+    def unresolved_claim_count(self):
+        return self.db.execute(
+            "SELECT COUNT(*) FROM jobs WHERE state='failed' "
+            "AND claim_attempted=1 AND comment_id IS NULL"
+        ).fetchone()[0]
 
     def update(self, key: str, **fields):
         allowed = {

@@ -49,9 +49,9 @@ class TestInstallation(unittest.TestCase):
         with patch("pathlib.Path.home", return_value=self.root):
             initialize(self.config, "owner/repo", self.source, "me", 1)
         self.assertEqual(self.config.stat().st_mode & 0o777, 0o600)
-        self.assertNotIn("/home/xupeng", self.config.read_text())
         with patch("mo_bot.config.shutil.which", return_value="/fake/executable"):
             config = Config.load(self.config)
+        self.assertEqual(config.state_dir, self.root / ".local/state/mo-bot")
         self.assertIsNone(config.queue_script)
         self.assertIsNone(config.issue_skill)
         self.assertEqual(config.source_dir, self.source)
@@ -72,7 +72,8 @@ class TestInstallation(unittest.TestCase):
             config.author_review_delays, {"matrixadventurer": 20, "xupeng-sh": 10}
         )
         self.assertEqual(config.worker_sessions, 0)
-        self.assertNotIn("/home/xupeng", self.config.read_text())
+        self.assertEqual(config.state_dir, self.root / ".local/state/mo-bot")
+        self.assertEqual(config.source_dir, self.source)
 
     def test_reinstall_and_uninstall_preserve_config_and_state(self):
         self.config.write_text("user config")

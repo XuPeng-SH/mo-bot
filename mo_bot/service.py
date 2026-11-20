@@ -141,6 +141,7 @@ class Service:
     ):
         self.config = config
         self.config_path = config_path
+        self.model_recoveries = {}
         config.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.lock = (config.state_dir / "service.lock").open("a+")
         try:
@@ -366,9 +367,8 @@ class Service:
         heads = snapshot["heads"]
         for job in self.store.jobs(("queued", "reviewing", "publishing")):
             status = admission.get(str(job["pr"]), {})
-            forced_review = job["kind"] == "review" and json.loads(job["metadata"]).get(
-                "forced"
-            )
+            metadata = json.loads(job["metadata"]) if job["kind"] == "review" else {}
+            forced_review = metadata.get("forced")
             if status.get("reason") == "owner-wip" and not forced_review:
                 self.eligible.discard(job["id"])
                 for turn, key in self.turns.values():
@@ -378,16 +378,18 @@ class Service:
                 continue
             if job["kind"] == "work":
                 continue  # Worker validates immutable identities per phase/effect.
-            forced = json.loads(job["metadata"]).get("forced")
-            status = admission.get(str(job["pr"]), {})
             reason = None
             if heads.get(str(job["pr"])) != job["head"]:
                 reason = "PR closed or head changed"
             elif (
-                not forced
+                not forced_review
                 and status.get("head") == job["head"]
                 and status.get("reason")
                 in ("already-reviewed", "merge-only-reviewed", "explicitly-excluded")
+                and not (
+                    status["reason"] == "already-reviewed"
+                    and metadata.get("target_recheck")
+                )
                 and not job["review_attempted"]
             ):
                 reason = status["reason"]
@@ -399,19 +401,43 @@ class Service:
                     slot_id=job["slot_id"] if job["state"] == "reviewing" else None,
                 )
         pending_contexts = {}
+        active_reviews = {}
+        target_rechecks = {}
         for pending in self.store.jobs(("queued", "reviewing", "publishing")):
-            if pending["kind"] == "review" and json.loads(pending["metadata"]).get(
-                "context_review"
-            ):
+            if pending["kind"] == "review":
                 identity = (pending["repo"], pending["pr"], pending["head"])
-                pending_contexts.setdefault(identity, []).append(pending["id"])
+                active_reviews.setdefault(identity, []).append(pending["id"])
+                metadata = json.loads(pending["metadata"])
+                if metadata.get("context_review"):
+                    pending_contexts.setdefault(identity, []).append(pending["id"])
+                if metadata.get("target_recheck"):
+                    target_rechecks.setdefault(identity, []).append(pending["id"])
+                    status = admission.get(str(pending["pr"]), {})
+                    if (
+                        status.get("head") == pending["head"]
+                        and status.get("reason") == "already-reviewed"
+                    ):
+                        self.eligible.add(pending["id"])
+        latest_reviews = {}
+        for previous in self.store.jobs():
+            if previous["kind"] == "review":
+                identity = (previous["repo"], previous["pr"], previous["head"])
+                latest_reviews.setdefault(identity, previous)
         for candidate in snapshot["candidates"]:
             identity = (candidate["repo"], candidate["number"], candidate["headRefOid"])
+            if identity in target_rechecks:
+                # A same-head discussion follow-up must not replace the full
+                # review needed for the new target.
+                self.eligible.update(target_rechecks[identity])
+                continue
             pending_context = pending_contexts.get(identity, [])
             if pending_context and not candidate.get("trigger_key"):
                 # A generic discovery candidate must not supersede a queued
                 # contextual round merely because its durable key differs.
                 self.eligible.update(pending_context)
+                continue
+            if not candidate.get("trigger_key") and identity in active_reviews:
+                self.eligible.update(active_reviews[identity])
                 continue
             key = self.store.key(
                 candidate["repo"],
@@ -419,6 +445,35 @@ class Service:
                 candidate["headRefOid"],
                 candidate.get("trigger_key", ""),
             )
+            previous = latest_reviews.get(identity)
+            existing = self.store.job(key)
+            if (
+                existing
+                and existing["state"] == "superseded"
+                and identity not in active_reviews
+                and previous
+                and previous["state"] == "superseded"
+                and not previous["review_attempted"]
+                and previous["error"]
+                in (
+                    "linked issue or PR description changed before publication",
+                    "discussion changed before publication",
+                )
+            ):
+                # An invalidated unpublished round can occupy this candidate's
+                # stable key forever, including after a crash between retiring
+                # it and enqueueing its successor. Keep its history and start
+                # one new round tied to the latest invalidated predecessor.
+                candidate = {
+                    **candidate,
+                    "trigger_key": f"recovery:{previous['id']}",
+                }
+                key = self.store.key(
+                    candidate["repo"],
+                    candidate["number"],
+                    candidate["headRefOid"],
+                    candidate["trigger_key"],
+                )
             if not self.store.job(key):
                 if self.store.enqueue(candidate):
                     LOG.info(
@@ -612,8 +667,10 @@ class Service:
                         error="ambiguous comment creation; remote marker absent; manual reconciliation required",
                     )
                     return
-                self.store.update(job["id"], claim_attempted=1)
-                comment = self.github.ensure_comment(job)
+                comment = self.github.create_comment(
+                    job,
+                    before_post=lambda: self.store.update(job["id"], claim_attempted=1),
+                )
                 job = self.store.job(job["id"])
             marker = self.github.owned_marker(comment, job)
             if not marker:
@@ -656,26 +713,25 @@ class Service:
         if isinstance(evidence.get("linked_issue_digest"), str):
             metadata["linked_issue_digest"] = evidence["linked_issue_digest"]
             metadata["linked_issue_complete"] = evidence["linked_issues"]["complete"]
-        self.store.update(job["id"], metadata=json.dumps(metadata))
-        job = self.store.job(job["id"])
         evidence["local_validation"] = local_validation(
             self.store, self.config.state_dir, job
         )
-        (directory / "evidence.json").write_text(json.dumps(evidence, indent=2))
-        workspace, merge_base = self.workspace.prepare(source_slot, job, pr, directory)
-        repository_skill = next(
-            (
-                path
-                for path in (
-                    workspace / ".agents/skills/mo-self-review/SKILL.md",
-                    workspace / ".claude/skills/mo-self-review/SKILL.md",
-                )
-                if path.is_file()
-            ),
-            None,
+        workspace, merge_base, base = self.workspace.prepare(
+            source_slot, job, pr, directory
         )
+        repository_skill = self.workspace.review_policy(base, directory)
+        base_branch = pr["base"]["ref"]
+        evidence["review_base"] = {
+            "branch": base_branch,
+            "sha": base,
+            "merge_base": merge_base,
+            "policy_entry": str(repository_skill) if repository_skill else None,
+        }
+        (directory / "evidence.json").write_text(json.dumps(evidence, indent=2))
+        metadata["review_base_branch"] = base_branch
+        self.store.update(job["id"], metadata=json.dumps(metadata))
         context_instruction = (
-            f"This is an automatic same-head discussion follow-up. Previous authenticated review ID {prior['id']} is in evidence.json. First assess what changed against that review. If the new context adds no material finding, correction, or decision change, return decision=unchanged with a reason and validation, without repeating a full review. If uncertain or the context changes the assessment, conduct the necessary review and return approve or request_changes.\n"
+            f"This is an automatic same-head discussion follow-up. Previous authenticated review ID {prior['id']} is in evidence.json. Assess new context and the prior assessment under the current repository review policy before returning decision=unchanged. If the earlier assessment remains valid, give the reason and validation. Otherwise, conduct the necessary review and return approve or request_changes.\n"
             if prior
             else "This assignment requires a complete review; do not return unchanged.\n"
         )
@@ -688,9 +744,12 @@ class Service:
             context_instruction
             + f"""\nYou are mo-bot reusable review slot {slot_id}, generation {slot["generation"]}.
 CURRENT TASK (or independently scoped member of the current batch): job={job["id"]}, repository={job["repo"]},
-PR={job["pr"]}, HEAD={job["head"]}, merge-base={merge_base}. Only these frozen sources
+PR={job["pr"]}, HEAD={job["head"]}, target branch={base_branch}, target base={base},
+merge-base={merge_base}. Only these frozen sources
 and {directory}/evidence.json establish facts for this PR. Earlier PR facts are not evidence.
-Repository review entry: {repository_skill or "none in this checkout"}.
+Repository review entry from the pinned target base: {repository_skill or "none at this base"}.
+Read policy references relative to the entry. Resolve code, fixtures and test commands
+against the assigned PR source checkout. Review edits to policy files as part of the PR diff.
 Change: {directory}/change.patch. {change_instruction}
 Evidence: {directory}/evidence.json, including discussion_index, linked_issues and local_validation.
 Diagnostic directory: {directory}; keep review-plan.md, discussion-assessment.json, probes
@@ -817,6 +876,190 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
             job["id"],
         )
 
+    def model_fallback_for(self, slot, job, turn, message):
+        if (
+            not turn.completed
+            or turn.error != message
+            or job["kind"] != "review"
+            or slot["role"] != "review"
+            or turn.__dict__.get("review_jobs")
+            or slot["pool_index"] == self.config.python_sdk_review_slot
+        ):
+            return None
+        data = json.loads(job["data"])
+        if data.get("model_fallback_attempt") == job["attempts"]:
+            return None
+        return next(
+            (rule for rule in self.config.model_fallbacks if rule.matches(message)),
+            None,
+        )
+
+    def start_model_fallback(self, slot, job, turn, fallback):
+        slot_id = slot["id"]
+        model = fallback.model
+        effort = fallback.reasoning_effort or slot["effort"]
+        entry = next(
+            (
+                item
+                for item in self.models_for(slot)
+                if item.get("model", item.get("id")) == model
+            ),
+            None,
+        )
+        supported = (
+            [
+                item["reasoningEffort"]
+                for item in entry.get("supportedReasoningEfforts", [])
+            ]
+            if entry
+            else []
+        )
+        if (
+            not self.native_available(slot)
+            or not slot["session_id"]
+            or job["state"] != "reviewing"
+            or effort not in supported
+        ):
+            LOG.warning(
+                "model fallback unavailable slot=%s job=%s model=%s effort=%s",
+                slot_id,
+                job["id"],
+                model,
+                effort,
+            )
+            return False
+        try:
+            pr = self.github.pr(job)
+            is_current = pr["state"] == "open" and pr["head"]["sha"] == job["head"]
+        except (OSError, ValueError, RuntimeError, KeyError, TypeError) as error:
+            # A failed read must not trap a completed turn in the scheduler.
+            # Continue through the normal bounded review retry path.
+            LOG.warning("model fallback PR lookup failed job=%s: %s", job["id"], error)
+            return False
+        if not is_current:
+            return False
+        data = json.loads(job["data"])
+        data["model_fallback_attempt"] = job["attempts"]
+        directory = self.job_dir(job) / f"model-fallback-{time.time_ns()}"
+        prompt = (turn.directory / "prompt.txt").read_text() + (
+            "\nThe coordinator changed model after the previous turn failed. "
+            "Continue the SAME job. Recover previous evidence from "
+            f"{turn.directory}; do not repeat completed checks unnecessarily."
+        )
+        self.store.update(
+            job["id"],
+            turn_dir=str(directory),
+            data=json.dumps(data),
+            error=None,
+        )
+        try:
+            turn.release()
+            self.turns.pop(slot_id, None)
+            selected = dict(slot, model=model, effort=effort)
+            replacement = self.backend.start(
+                selected,
+                directory,
+                self.workspace.ensure(slot_id),
+                prompt,
+                SCHEMA,
+            )
+        except Exception:
+            self.turns[slot_id] = (turn, job["id"])
+            self.store.update(job["id"], turn_dir=str(turn.directory), error=turn.error)
+            raise
+        self.turns[slot_id] = (replacement, job["id"])
+        self.model_recoveries[slot_id] = {
+            "job_id": job["id"],
+            "turn_id": replacement.turn_id,
+            "model": model,
+            "effort": effort,
+            "original_model": slot["model"],
+            "original_effort": slot["effort"],
+            "due": time.monotonic() + fallback.restore_seconds,
+        }
+        LOG.warning(
+            "model fallback started slot=%s job=%s model=%s effort=%s restore_seconds=%s",
+            slot_id,
+            job["id"],
+            model,
+            effort,
+            fallback.restore_seconds,
+        )
+        return True
+
+    def process_model_recoveries(self):
+        now = time.monotonic()
+        for slot_id, recovery in list(self.model_recoveries.items()):
+            if self.model_recoveries.get(slot_id) is not recovery:
+                continue
+            if now < recovery["due"]:
+                continue
+            current = self.turns.get(slot_id)
+            slot = next(
+                (
+                    item
+                    for item in self.store.slots(include_disabled=True)
+                    if item["id"] == slot_id
+                ),
+                None,
+            )
+            if (
+                slot is None
+                or (slot["model"], slot["effort"])
+                != (recovery["original_model"], recovery["original_effort"])
+                or current
+                and (
+                    current[1] != recovery["job_id"]
+                    or current[0].turn_id != recovery["turn_id"]
+                )
+            ):
+                self.model_recoveries.pop(slot_id, None)
+                continue
+            if current is None:
+                self.model_recoveries.pop(slot_id, None)
+                LOG.info(
+                    "model fallback finished; original model retained slot=%s model=%s",
+                    slot_id,
+                    recovery["original_model"],
+                )
+                continue
+            try:
+                if current[0].completed:
+                    self.finish(slot_id, *current)
+                    if self.model_recoveries.get(slot_id) is not recovery:
+                        continue
+                    current = self.turns.get(slot_id)
+                    if current is None:
+                        self.model_recoveries.pop(slot_id, None)
+                        continue
+                self.command(
+                    "model",
+                    {
+                        "slot": slot_id,
+                        "model": recovery["original_model"],
+                        "reasoning_effort": recovery["original_effort"],
+                    },
+                    _model_recovery=True,
+                )
+            except (OSError, ValueError, RuntimeError, KeyError) as error:
+                recovery["due"] = now + 1
+                LOG.error(
+                    "model fallback restore failed slot=%s job=%s error=%s",
+                    slot_id,
+                    recovery["job_id"],
+                    error,
+                )
+                continue
+            if self.model_recoveries.get(slot_id) is recovery:
+                self.model_recoveries.pop(slot_id, None)
+            LOG.warning(
+                "model fallback restored slot=%s job=%s model=%s effort=%s",
+                slot_id,
+                recovery["job_id"],
+                recovery["original_model"],
+                recovery["original_effort"],
+            )
+
     def launch(self, slot, job=None):
         if job:
             if job["kind"] == "work":
@@ -902,6 +1145,7 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
         )
         job = self.store.job(key) if key else None
         cleanup_pending = False
+        fallback_started = False
         try:
             if (
                 job
@@ -962,6 +1206,13 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
             # PR/slot lease and retry cleanup, without consuming recovery budget.
         except (OSError, ValueError, RuntimeError, KeyError) as error:
             message = str(error)
+            fallback = (
+                self.model_fallback_for(slot, job, turn, message) if job else None
+            )
+            if fallback:
+                fallback_started = self.start_model_fallback(slot, job, turn, fallback)
+                if fallback_started:
+                    return
             if not turn.completed:
                 turn.stop()
             if (
@@ -1010,14 +1261,45 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
             if not job and slot["role"] != "classifier":
                 self.cooldown = time.monotonic() + 60
             if job and self.store.job(key)["state"] == "queued":
+                self.model_recoveries.pop(slot_id, None)
                 self.store.update(
                     key, retry_at=max(self.store.job(key)["retry_at"], time.time() + 60)
                 )
+            elif job:
+                self.model_recoveries.pop(slot_id, None)
             LOG.error("turn failed slot=%s job=%s error=%s", slot_id, key, message)
         finally:
-            if turn.completed and not cleanup_pending:
+            # Keep the completed turn and its slot fence if processing raised an
+            # unexpected exception; the next tick can retry the same result.
+            if (
+                turn.completed
+                and not cleanup_pending
+                and not fallback_started
+                and sys.exc_info()[0] is None
+            ):
                 turn.release()
                 self.turns.pop(slot_id, None)
+
+    def replace_unpublished_review(self, job, metadata, trigger, reason):
+        candidate = {
+            **metadata,
+            "repo": job["repo"],
+            "number": job["pr"],
+            "headRefOid": job["head"],
+            "trigger_key": f"{trigger}:after:{job['id']}",
+        }
+        if self.store.enqueue(candidate, replaces_review=(job["id"], reason)):
+            self.eligible.add(
+                self.store.key(
+                    job["repo"], job["pr"], job["head"], candidate["trigger_key"]
+                )
+            )
+        elif self.store.job(job["id"])["state"] == "publishing":
+            self.store.update(
+                job["id"],
+                error="new review waits for prior publication reconciliation",
+                retry_at=time.time() + 60,
+            )
 
     def publish(self, job):
         if json.loads(job["data"]).get("paused"):
@@ -1052,6 +1334,28 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
         # CI failure, merge conflicts or a discovery refresh must not withhold
         # an assessment. Live head/context checks and write fences still apply.
         metadata = json.loads(job["metadata"])
+        if not job["review_attempted"]:
+            base_branch = metadata.get("review_base_branch")
+            if not base_branch and job["attempts"]:
+                # Jobs prepared by the previous release recorded the target in
+                # their original attempt manifest, including on model fallback.
+                manifest = (
+                    self.job_dir(job) / f"attempt-{job['attempts']}" / "evidence.json"
+                )
+                if manifest.is_file():
+                    previous_base = json.loads(manifest.read_text()).get(
+                        "review_base", {}
+                    )
+                    base_branch = previous_base.get("branch")
+            if base_branch and base_branch != pr["base"]["ref"]:
+                self.replace_unpublished_review(
+                    job,
+                    {**metadata, "context_review": False, "target_recheck": True},
+                    "target-changed",
+                    f"Target branch changed from `{base_branch}` to `{pr['base']['ref']}` "
+                    "before publication. A full review of the new target is queued.",
+                )
+                return
         previous_digest = metadata.get("discussion_digest")
         previous_issue_digest = metadata.get("linked_issue_digest")
         if (previous_digest or previous_issue_digest) and not job["review_attempted"]:
@@ -1093,36 +1397,24 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
                 reason = (
                     "linked issue or PR description" if issue_changed else "discussion"
                 )
-                self.github.patch_comment(
-                    job,
-                    "superseded",
-                    f"Review {reason} changed before publication; a fresh contextual review is queued.",
-                )
-                self.store.update(
-                    job["id"],
-                    state="superseded",
-                    comment_state="superseded",
-                    error=f"{reason} changed before publication",
-                    slot_id=None,
-                )
                 trigger = (
                     f"review-context:{current_digest or ''}:{current_issue_digest}"
                     if issue_changed
                     else "discussion:" + current_digest
                 )
-                candidate = {
-                    **metadata,
-                    "discussion_digest": current_digest,
-                    "linked_issue_digest": current_issue_digest,
-                    "context_review": True,
-                    "trigger_key": trigger,
-                }
-                self.store.enqueue(candidate)
-                key = self.store.key(
-                    job["repo"], job["pr"], job["head"], candidate["trigger_key"]
+                # A later input can return to an earlier digest. The predecessor
+                # distinguishes that new round without replaying an old job.
+                self.replace_unpublished_review(
+                    job,
+                    {
+                        **metadata,
+                        "discussion_digest": current_digest,
+                        "linked_issue_digest": current_issue_digest,
+                        "context_review": not metadata.get("target_recheck"),
+                    },
+                    trigger,
+                    f"{reason} changed before publication",
                 )
-                if self.store.job(key):
-                    self.eligible.add(key)
                 return
         envelope = json.loads(job["result"])
         if envelope["assessment"]["decision"] == "unchanged":
@@ -1385,12 +1677,20 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
                     and job["state"] in ("queued", "publishing", "failed", "canceling")
                 )
             )
-            job["next_retry_at"] = (
-                job["data"].get("publication_next_at")
-                if job["state"] == "publishing" and job["kind"] == "work"
-                else job["retry_at"]
+            job["manual_required"] = bool(
+                job["data"].get("manual_reconciliation")
+                or (
+                    job["state"] == "failed"
+                    and job["claim_attempted"]
+                    and job["comment_id"] is None
+                )
             )
-            job["manual_required"] = bool(job["data"].get("manual_reconciliation"))
+            if job["manual_required"]:
+                job["next_retry_at"] = None
+            elif job["state"] == "publishing" and job["kind"] == "work":
+                job["next_retry_at"] = job["data"].get("publication_next_at")
+            else:
+                job["next_retry_at"] = job["retry_at"]
         alerts = [
             {
                 "kind": "job_waiting"
@@ -1440,6 +1740,7 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
                 "scratch_cleanup": dict(self.artifacts.status),
                 "updated_at": time.time(),
                 "backend_alive": bool(self.backend and not self.backend.dead),
+                "unresolved_claim_count": self.store.unresolved_claim_count(),
                 "review_batch_size": self.config.batch_size,
                 "sessions": sessions,
                 "pools": {
@@ -1506,7 +1807,7 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
             except Exception as error:
                 future.set_exception(error)
 
-    def command(self, action, args):
+    def command(self, action, args, *, _model_recovery=False):
         if action == "resize_pool":
             role, count = args.get("role"), args.get("sessions")
             if (
@@ -1645,6 +1946,8 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
             if not job or job["kind"] != "work" or job["state"] != "publishing":
                 raise ValueError("reconcile requires a publishing worker job")
             return self.worker.reconcile(job)
+        if action == "resolve_review_claim":
+            return self.resolve_review_claim(args)
         if action == "work":
             return self.worker.enqueue(
                 args.get("target_type", "pr"),
@@ -1652,7 +1955,7 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
                 args.get("hint"),
             )
         if action == "model":
-            if self.dispatch_control["paused"]:
+            if self.dispatch_control["paused"] and not _model_recovery:
                 raise ValueError(
                     "service is draining; resume dispatch before starting a model-switch turn"
                 )
@@ -1797,6 +2100,17 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
                     )
                     raise
             else:
+                if _model_recovery:
+                    self.refresh_status()
+                    return {
+                        "slot": slot["id"],
+                        "session_id": slot["session_id"],
+                        "model": model,
+                        "reasoning_effort": effort,
+                        "effective": "model_restored",
+                        "turn_id": None,
+                        "continued_job": None,
+                    }
                 self.launch(selected)
             turn = self.turns[slot["id"]][0]
             self.refresh_status()
@@ -2109,6 +2423,7 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
                 )
                 turn.stop()
             self.finish(slot_id, turn, key)
+        self.process_model_recoveries()
         if self.dispatch_control["paused"] or self.stopping:
             return
         if time.monotonic() >= self.next_scan:
@@ -2222,6 +2537,90 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
             if isinstance(self.backend, Nodes)
             else self.models
         )
+
+    def resolve_review_claim(self, args):
+        """Requeue a legacy review only when an operator knows no POST was sent.
+
+        A missing remote marker alone is not proof: a POST may have succeeded
+        and its comment may have been deleted or be temporarily invisible.
+        """
+        job = self.store.job(args.get("job_id"))
+        reason = args.get("reason")
+        if not isinstance(reason, str) or not 10 <= len(reason.strip()) <= 500:
+            raise ValueError("evidence reason must be 10..500 characters")
+        if args.get("post_not_sent") is not True:
+            raise ValueError(
+                "explicit confirmation that the POST was not sent is required"
+            )
+        if not job or job["kind"] != "review" or job["state"] != "failed":
+            raise ValueError("claim resolution requires a failed review")
+        if args.get("head") != job["head"]:
+            raise ValueError("confirm the exact frozen head")
+        if (
+            job["error"]
+            != "ambiguous comment creation; remote marker absent; manual reconciliation required"
+            or not job["claim_attempted"]
+            or job["comment_id"] is not None
+            or job["attempts"] != 0
+            or job["result"] is not None
+            or job["review_attempted"]
+            or job["review_id"] is not None
+            or job["review_event"] is not None
+            or job["slot_id"] is not None
+            or any(
+                job["id"] in turn_jobs(turn, key) for turn, key in self.turns.values()
+            )
+        ):
+            raise ValueError(
+                "job has effects or activity outside initial claim recovery"
+            )
+        data = json.loads(job["data"])
+        if data.get("paused") or data.get("manual_reconciliation"):
+            raise ValueError("job has another operator or publication fence")
+        pr = self.github.pr(job)
+        if pr["state"] != "open" or pr["head"]["sha"] != job["head"]:
+            raise SourceChanged("PR changed; cannot resume old review")
+        if self.github.find_comment(job) is not None:
+            raise ValueError(
+                "matching remote claim exists; do not clear the write fence"
+            )
+        if self.github.find_review(job) is not None:
+            raise ValueError(
+                "matching remote review exists; do not clear the write fence"
+            )
+        history = data.setdefault("claim_resolutions", [])
+        if not isinstance(history, list):
+            raise ValueError("invalid claim resolution history")
+        history.append(
+            {
+                "at": time.time(),
+                "head": job["head"],
+                "post_not_sent": True,
+                "reason": reason.strip(),
+            }
+        )
+        self.store.update(
+            job["id"],
+            state="queued",
+            slot_id=None,
+            claim_attempted=0,
+            error=None,
+            retry_at=0,
+            data=json.dumps(data),
+        )
+        # Re-run normal eligibility, rather than force-admitting a stale policy
+        # decision. Explicitly forced jobs retain their original force semantics.
+        self.eligible.discard(job["id"])
+        if json.loads(job["metadata"]).get("forced"):
+            self.eligible.add(job["id"])
+        self.next_scan = 0.0
+        LOG.warning(
+            "review claim resolved job=%s head=%s reason=%s",
+            job["id"],
+            job["head"],
+            reason.strip(),
+        )
+        return self.command("job", {"job_id": job["id"]})
 
     def control_job(self, action, args):
         job = self.store.job(args.get("job_id"))
@@ -2625,6 +3024,7 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
         if self.lock.closed:
             return
         self.stopping = True
+        self.model_recoveries.clear()
         while not self.commands.empty():
             _, _, future = self.commands.get_nowait()
             if not future.done():

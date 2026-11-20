@@ -22,6 +22,30 @@ class TestFormalReviews(unittest.TestCase):
             "body": "Assessment\n" + marker("stable", self.job, "review"),
         }
 
+    def test_comment_fence_is_written_immediately_before_post(self):
+        calls = []
+        self.gh.api.side_effect = lambda *args, **kwargs: (
+            calls.append((args, kwargs)) or {"id": 42}
+        )
+
+        def fence():
+            self.assertEqual(calls, [])
+            calls.append("fenced")
+
+        self.gh.create_comment(self.job, before_post=fence)
+        self.assertEqual(calls[0], "fenced")
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1][1]["method"], "POST")
+        self.assertEqual(calls[1][0][0], "repos/owner/repo/issues/1/comments")
+
+    def test_comment_fence_failure_never_sends_post(self):
+        def fence():
+            raise RuntimeError("database unavailable")
+
+        with self.assertRaisesRegex(RuntimeError, "database unavailable"):
+            self.gh.create_comment(self.job, before_post=fence)
+        self.gh.api.assert_not_called()
+
     def test_submit_pins_commit_and_uses_formal_review_endpoint(self):
         for event, state in (
             ("APPROVE", "APPROVED"),

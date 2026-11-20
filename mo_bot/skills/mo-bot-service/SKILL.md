@@ -54,12 +54,13 @@ Review commentary and assessment reports are written in English, as required by 
 
 The repository's [mo-bot-review skill](../mo-bot-review/SKILL.md) owns reviewer prompt guidance and the decision/publication contract. The coordinator reads it for every new assigned review and snapshots the prompt for recovery. Edit that skill to change review guidance; do not maintain a parallel prompt in this operator skill. `scripts/install.py` installs both repository skills into agent discovery paths.
 
-Each task selects its checkout's `.agents/skills/mo-self-review/SKILL.md`, or
-the `.claude` entry only when the former is absent, and records that path in the
-prompt. The repository owns engineering/domain rules; mo-bot-review owns the
-external-review procedure. Discussion bodies are read once through the complete
-index, with raw records available for extra context. Inspect the saved prompt
-and execution history when checking which rules actually ran.
+Each review fetches the exact upstream target branch and freezes its tip along
+with the PR HEAD. The target commit supplies the repository review entry and its
+references. The PR HEAD supplies source and tests, and the diff starts at the
+merge-base of the two commits. The saved prompt and `evidence.json.review_base`
+identify the selected policy. The repository owns engineering rules.
+mo-bot-review owns the external-review procedure. Inspect the saved prompt and
+execution history when checking which rules ran.
 
 Full reviews return `request_changes` or `approve`. An automatic same-head discussion follow-up with a verified prior review may return `unchanged` after assessing the new context; the coordinator retains that assessment and updates the status without posting a duplicate formal review. Forced reviews always run the full review. Actionable defects and demonstrated unmet required validation contracts map to `REQUEST_CHANGES`; supported approvals map to `APPROVE`. Historical `needs_validation` assessments remain readable and map to `COMMENT`. Own PRs without an authenticated, marked bot review on the current head are admitted without waiting for CI; draft/exclusion/mergeability gates still apply. Reviews on older heads do not suppress a new commit. Own PRs receive `COMMENT` regardless of assessment because GitHub prevents self-approval and self-requested changes. A completed failed check/status admits repair while sibling checks/workflows are running, subject to the existing target fence and evidence deduplication. A completed legacy comment-only job is not replayed. Each new result produces at most one marked formal review plus its existing status comment.
 
@@ -141,6 +142,8 @@ For completed jobs, report `result.assessment.decision`, summary/findings, actua
 SQLite is the workflow authority; Codex owns native thread history. Healthy IDs are resumed; missing/corrupt threads are replaced in their existing slot, retaining job/comment identity and bounded attempts. Do not delete the database, change service ID or remove GitHub markers to force recovery: this can destroy duplicate protection. Do not launch two deployments with the same service identity and separate databases.
 
 A failed/ambiguous initial comment POST is deliberately fenced. Inspect the job error and authenticated-author marker on the PR before proposing manual reconciliation; do not blindly retry writes or force another review. `publishing` means a saved assessment awaits formal review/status-comment publication; GitHub outages must not trigger a fresh model review. An old head is superseded, never treated as a review of the current commit. Formal review POSTs are fenced before submission. After an uncertain response, reconcile the authenticated exact-head review marker; an absent, duplicated, dismissed or mismatched marker requires manual reconciliation, never a blind second POST. Inspect both review and comment identities before proposing recovery.
+
+For a legacy failed review claim, `resolve-review-claim JOB_ID --head FULL_SHA --post-not-sent --reason 'evidence'` requeues the same task only if independent evidence proves the POST was never sent. Absence of a marker is not proof: a previously created comment may have been deleted or temporarily hidden. The command validates the current head and authenticated remote markers, records the explanation, and returns the job to normal admission; it can lead to GitHub comments and a review. Use it only when the operator has requested that recovery. The command cannot resolve truly ambiguous POSTs or worker claims.
 
 Use `updated_at`, queue counts and backend/session state to distinguish stale status, eligibility wait, model failure and actual execution. SSE is bounded and emits gaps: reload the paginated native history when events are missing. Do not describe green CI or an idle session as proof of a successful review. Report exact job/head, session/model, validation evidence and limits.
 
