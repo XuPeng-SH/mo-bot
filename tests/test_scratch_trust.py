@@ -154,7 +154,9 @@ class TestScratchTrust(unittest.TestCase):
             inspection._scan(self.root, {"a"}, self.proc, trusted=self.trusted)
 
     def test_policy_requires_valid_owner_permissions_boot_and_complete_entries(self):
-        self.assertEqual(inspection._load_trust(self.root, os.getuid(), self.proc), set())
+        self.assertEqual(
+            inspection._load_trust(self.root, os.getuid(), self.proc), set()
+        )
         path = self._write(self._policy([self.entry]))
         self.assertEqual(
             inspection._load_trust(self.root, os.getuid(), self.proc), self.trusted
@@ -240,7 +242,9 @@ class TestScratchTrust(unittest.TestCase):
         self.assertEqual(set(result), {"root", "referenced", "boot_id", "blocked"})
         for invalid in (False, 1, "yes"):
             with self.assertRaises(ValueError):
-                inspection._validate_request({**request, "diagnose": invalid}, os.getuid())
+                inspection._validate_request(
+                    {**request, "diagnose": invalid}, os.getuid()
+                )
 
     def test_operator_selection_rechecks_exact_entries_and_replaces_policy(self):
         item = {**self.entry, "eligible": True}
@@ -250,7 +254,9 @@ class TestScratchTrust(unittest.TestCase):
             patch.object(scratch_control, "diagnose", return_value=report),
             patch.object(scratch_control, "_write_policy") as write,
         ):
-            self.assertEqual(scratch_control.set_trust(self.state, [item["entry_id"]]), [self.entry])
+            self.assertEqual(
+                scratch_control.set_trust(self.state, [item["entry_id"]]), [self.entry]
+            )
             write.assert_called_once_with(self.state, self.boot_id, [self.entry])
             with self.assertRaisesRegex(ValueError, "changed"):
                 scratch_control.set_trust(self.state, ["f" * 64])

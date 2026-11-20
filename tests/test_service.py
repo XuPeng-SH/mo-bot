@@ -359,7 +359,11 @@ class TestWorkflow(unittest.TestCase):
         turn = Mock(completed=True, model="fake", effort="xhigh")
         turn.result.return_value = {"assessment": {}}
         self.service.turns[0] = (turn, job["id"])
-        with patch.object(self.service.workspace, "clean", side_effect=subprocess.TimeoutExpired("git", 120)):
+        with patch.object(
+            self.service.workspace,
+            "clean",
+            side_effect=subprocess.TimeoutExpired("git", 120),
+        ):
             with self.assertRaises(subprocess.TimeoutExpired):
                 self.service.finish(0, turn, job["id"])
         self.assertIn(0, self.service.turns)
@@ -427,22 +431,32 @@ class TestWorkflow(unittest.TestCase):
     def test_scan_recovers_unpublished_superseded_round_once(self):
         c = {**candidate(), "forced": False}
         self.store.enqueue(c)
-        first = self.store.job(
-            self.store.key(c["repo"], c["number"], c["headRefOid"])
-        )
+        first = self.store.job(self.store.key(c["repo"], c["number"], c["headRefOid"]))
         reason = "linked issue or PR description changed before publication"
         self.store.update(
-            first["id"], state="superseded", error=reason, claim_attempted=1, comment_id=10
+            first["id"],
+            state="superseded",
+            error=reason,
+            claim_attempted=1,
+            comment_id=10,
         )
         second_candidate = {
-            **c, "trigger_key": "review-context:old", "context_review": True
+            **c,
+            "trigger_key": "review-context:old",
+            "context_review": True,
         }
         self.store.enqueue(second_candidate)
         second = self.store.job(
-            self.store.key(c["repo"], c["number"], c["headRefOid"], "review-context:old")
+            self.store.key(
+                c["repo"], c["number"], c["headRefOid"], "review-context:old"
+            )
         )
         self.store.update(
-            second["id"], state="superseded", error=reason, claim_attempted=1, comment_id=11
+            second["id"],
+            state="superseded",
+            error=reason,
+            claim_attempted=1,
+            comment_id=11,
         )
         snap = {"heads": {"1": c["headRefOid"]}, "candidates": [c], "indeterminate": []}
 
@@ -458,9 +472,7 @@ class TestWorkflow(unittest.TestCase):
     def test_scan_does_not_recover_other_terminal_or_uncertain_review(self):
         c = {**candidate(), "forced": False}
         self.store.enqueue(c)
-        job = self.store.job(
-            self.store.key(c["repo"], c["number"], c["headRefOid"])
-        )
+        job = self.store.job(self.store.key(c["repo"], c["number"], c["headRefOid"]))
         snap = {"heads": {"1": c["headRefOid"]}, "candidates": [c], "indeterminate": []}
         for reason, attempted, claimed in (
             ("already-reviewed", 0, 0),
@@ -468,8 +480,11 @@ class TestWorkflow(unittest.TestCase):
             ("discussion changed before publication", 0, 1),
         ):
             self.store.update(
-                job["id"], state="superseded", error=reason,
-                review_attempted=attempted, claim_attempted=claimed,
+                job["id"],
+                state="superseded",
+                error=reason,
+                review_attempted=attempted,
+                claim_attempted=claimed,
             )
             self.service.scan(snap)
             self.assertEqual(len(self.store.jobs()), 1)
@@ -548,7 +563,10 @@ class TestWorkflow(unittest.TestCase):
         self.gh.pr.return_value = self.gh.api.return_value
         self.service.backend = Mock()
         self.gh.owned_marker.return_value = {"state": "reviewing"}
-        self.gh.create_comment.side_effect = lambda job, before_post: (before_post(), {"id": 99})[1]
+        self.gh.create_comment.side_effect = lambda job, before_post: (
+            before_post(),
+            {"id": 99},
+        )[1]
         self.gh.evidence.return_value = {}
         self.service.launch(self.store.slots()[0], job)
         self.workspace.prepare.assert_called_once()
@@ -638,7 +656,10 @@ class TestWorkflow(unittest.TestCase):
 
         self.store.update(job["id"], state="queued", slot_id=None)
         self.gh.find_comment.side_effect = None
-        self.gh.create_comment.side_effect = lambda job, before_post: (before_post(), {"id": 99})[1]
+        self.gh.create_comment.side_effect = lambda job, before_post: (
+            before_post(),
+            {"id": 99},
+        )[1]
         self.gh.owned_marker.return_value = {"state": "reviewing"}
         self.gh.evidence.return_value = {}
         self.service.backend = Mock()
@@ -647,7 +668,9 @@ class TestWorkflow(unittest.TestCase):
         self.assertEqual(self.store.job(job["id"])["attempts"], 1)
         self.gh.create_comment.assert_called_once()
 
-    def test_uncertain_initial_post_remains_fenced_and_status_requests_manual_action(self):
+    def test_uncertain_initial_post_remains_fenced_and_status_requests_manual_action(
+        self,
+    ):
         job = self.job()
 
         def uncertain(job, before_post):
@@ -663,7 +686,9 @@ class TestWorkflow(unittest.TestCase):
         self.assertEqual(self.store.job(job["id"])["state"], "failed")
         self.assertEqual(self.gh.create_comment.call_count, 1)
         self.service.refresh_status()
-        alert = next(a for a in self.service.status["alerts"] if a["job_id"] == job["id"])
+        alert = next(
+            a for a in self.service.status["alerts"] if a["job_id"] == job["id"]
+        )
         self.assertTrue(alert["manual_required"])
         self.assertIsNone(alert["next_retry_at"])
         self.assertEqual(self.service.status["unresolved_claim_count"], 1)
@@ -671,7 +696,9 @@ class TestWorkflow(unittest.TestCase):
     def test_old_unresolved_claim_stays_visible_beyond_recent_job_limit(self):
         job = self.job()
         self.store.update(
-            job["id"], state="failed", claim_attempted=1,
+            job["id"],
+            state="failed",
+            claim_attempted=1,
             error="ambiguous comment creation; remote marker absent; manual reconciliation required",
         )
         newer = self.job(pr=2)
@@ -721,15 +748,23 @@ class TestWorkflow(unittest.TestCase):
     def test_legacy_initial_claim_can_be_resolved_only_with_explicit_evidence(self):
         job = self.job()
         self.store.update(
-            job["id"], state="failed", claim_attempted=1,
+            job["id"],
+            state="failed",
+            claim_attempted=1,
             error="ambiguous comment creation; remote marker absent; manual reconciliation required",
         )
-        args = {"job_id": job["id"], "head": job["head"], "post_not_sent": True,
-                "reason": "service log proves GET failed before POST"}
+        args = {
+            "job_id": job["id"],
+            "head": job["head"],
+            "post_not_sent": True,
+            "reason": "service log proves GET failed before POST",
+        }
         result = self.service.command("resolve_review_claim", args)
         self.assertEqual(result["state"], "queued")
         self.assertEqual(result["claim_attempted"], 0)
-        self.assertEqual(result["data"]["claim_resolutions"][0]["reason"], args["reason"])
+        self.assertEqual(
+            result["data"]["claim_resolutions"][0]["reason"], args["reason"]
+        )
         self.assertEqual(len(self.store.jobs()), 1)
         self.gh.create_comment.assert_not_called()
         self.gh.submit_review.assert_not_called()
@@ -737,12 +772,22 @@ class TestWorkflow(unittest.TestCase):
     def test_legacy_claim_resolution_rejects_unproven_or_changed_targets(self):
         job = self.job()
         self.store.update(
-            job["id"], state="failed", claim_attempted=1,
+            job["id"],
+            state="failed",
+            claim_attempted=1,
             error="ambiguous comment creation; remote marker absent; manual reconciliation required",
         )
-        args = {"job_id": job["id"], "head": job["head"], "post_not_sent": True,
-                "reason": "GET failed before the POST was issued"}
-        for change in ({"head": "b" * 40}, {"post_not_sent": False}, {"reason": "short"}):
+        args = {
+            "job_id": job["id"],
+            "head": job["head"],
+            "post_not_sent": True,
+            "reason": "GET failed before the POST was issued",
+        }
+        for change in (
+            {"head": "b" * 40},
+            {"post_not_sent": False},
+            {"reason": "short"},
+        ):
             with self.subTest(change=change), self.assertRaises(ValueError):
                 self.service.command("resolve_review_claim", {**args, **change})
         self.gh.find_comment.return_value = {"id": 5}
@@ -768,17 +813,29 @@ class TestWorkflow(unittest.TestCase):
         metadata = json.loads(job["metadata"])
         metadata["forced"] = False
         self.store.update(
-            job["id"], state="failed", claim_attempted=1, metadata=json.dumps(metadata),
+            job["id"],
+            state="failed",
+            claim_attempted=1,
+            metadata=json.dumps(metadata),
             error="ambiguous comment creation; remote marker absent; manual reconciliation required",
         )
         self.service.command(
             "resolve_review_claim",
-            {"job_id": job["id"], "head": job["head"], "post_not_sent": True,
-             "reason": "log identifies the failed GET before POST"},
+            {
+                "job_id": job["id"],
+                "head": job["head"],
+                "post_not_sent": True,
+                "reason": "log identifies the failed GET before POST",
+            },
         )
         self.assertNotIn(job["id"], self.service.eligible)
-        self.service.scan({"heads": {"1": job["head"]}, "candidates": [
-            {**candidate(), "forced": False}], "admission": {}})
+        self.service.scan(
+            {
+                "heads": {"1": job["head"]},
+                "candidates": [{**candidate(), "forced": False}],
+                "admission": {},
+            }
+        )
         self.assertIn(job["id"], self.service.eligible)
 
     def test_publication_checkpoint_survives_retry_without_model(self):
@@ -1036,6 +1093,34 @@ class TestWorkflow(unittest.TestCase):
         self.assertGreaterEqual(queued["retry_at"], time.time() + 50)
         self.assertNotIn(0, self.service.model_recoveries)
         self.assertEqual(self.store.slots()[0]["model"], "gpt-6-astra")
+
+    def test_fallback_lookup_failure_requeues_completed_review(self):
+        self.service.config = replace(
+            self.config,
+            model_fallbacks=(ModelFallback(r"cyberPolicy", "gpt-6-luna"),),
+        )
+        self.service.models = [
+            {
+                "model": "gpt-6-luna",
+                "supportedReasoningEfforts": [{"reasoningEffort": "xhigh"}],
+            }
+        ]
+        self.service.backend = Mock(dead=False)
+        self.gh.pr.side_effect = RuntimeError("GitHub unavailable")
+        job = self.store.claim(0) if self.job() else None
+        message = '{"message":"upstream rejected by cyberPolicy"}'
+        old = Mock(completed=True, error=message, final=None, schema=None)
+        old.result.side_effect = RuntimeError(message)
+        self.service.turns[0] = (old, job["id"])
+
+        self.service.finish(0, old, job["id"])
+
+        queued = self.store.job(job["id"])
+        self.assertEqual(queued["state"], "queued")
+        self.assertGreaterEqual(queued["retry_at"], time.time() + 50)
+        self.assertNotIn(0, self.service.turns)
+        self.service.backend.start.assert_not_called()
+        old.release.assert_called_once()
 
     def test_failed_native_interruption_fences_model_switch(self):
         self.service.models = [
@@ -1331,7 +1416,9 @@ class TestWorkflow(unittest.TestCase):
             "commit_id": c["headRefOid"],
             "submitted_at": "2026-11-19T00:00:00Z",
             "user": {"login": "me"},
-            "body": marker("test-bot", {"id": "prior", "head": c["headRefOid"]}, "review"),
+            "body": marker(
+                "test-bot", {"id": "prior", "head": c["headRefOid"]}, "review"
+            ),
         }
         self.gh.evidence.return_value = {"reviews": [prior]}
         self.store.enqueue(c)
@@ -1360,11 +1447,13 @@ class TestWorkflow(unittest.TestCase):
             ("already-reviewed", []),
             ("discussion-updated", [follow_up]),
         ):
-            self.service.scan({
-                "heads": {"1": c["headRefOid"]},
-                "candidates": candidates,
-                "admission": {"1": {"head": c["headRefOid"], "reason": reason}},
-            })
+            self.service.scan(
+                {
+                    "heads": {"1": c["headRefOid"]},
+                    "candidates": candidates,
+                    "admission": {"1": {"head": c["headRefOid"], "reason": reason}},
+                }
+            )
             self.assertIn(new["id"], self.service.eligible)
             self.assertEqual(len(self.store.jobs()), 2)
 
@@ -1391,7 +1480,9 @@ class TestWorkflow(unittest.TestCase):
                 metadata = json.loads(prepared["job"]["metadata"])
                 metadata.pop("review_base_branch")
                 self.store.update(job["id"], metadata=json.dumps(metadata))
-                self.service.save_result(self.store.job(job["id"]), slot, assessment(job))
+                self.service.save_result(
+                    self.store.job(job["id"]), slot, assessment(job)
+                )
                 self.gh.pr.return_value["base"] = {"ref": target, "sha": "d" * 40}
                 self.service.publish(self.store.job(job["id"]))
                 self.assertEqual(

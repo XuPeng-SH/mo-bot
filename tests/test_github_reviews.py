@@ -24,7 +24,9 @@ class TestFormalReviews(unittest.TestCase):
 
     def test_comment_fence_is_written_immediately_before_post(self):
         calls = []
-        self.gh.api.side_effect = lambda *args, **kwargs: calls.append((args, kwargs)) or {"id": 42}
+        self.gh.api.side_effect = lambda *args, **kwargs: (
+            calls.append((args, kwargs)) or {"id": 42}
+        )
 
         def fence():
             self.assertEqual(calls, [])

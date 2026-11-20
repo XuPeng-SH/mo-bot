@@ -314,7 +314,9 @@ class TestWorker(unittest.TestCase):
 
     def test_comment_preflight_failure_can_retry_without_creating_a_write_fence(self):
         job = self.job()
-        with patch.object(self.gh, "find_comment", side_effect=RuntimeError("GET timeout")):
+        with patch.object(
+            self.gh, "find_comment", side_effect=RuntimeError("GET timeout")
+        ):
             with self.assertRaisesRegex(RuntimeError, "GET timeout"):
                 self.w.launch(self.slot, job)
         self.assertEqual(self.s.store.job(job["id"])["claim_attempted"], 0)

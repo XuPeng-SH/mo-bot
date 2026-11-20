@@ -367,9 +367,7 @@ class Service:
         heads = snapshot["heads"]
         for job in self.store.jobs(("queued", "reviewing", "publishing")):
             status = admission.get(str(job["pr"]), {})
-            metadata = (
-                json.loads(job["metadata"]) if job["kind"] == "review" else {}
-            )
+            metadata = json.loads(job["metadata"]) if job["kind"] == "review" else {}
             forced_review = metadata.get("forced")
             if status.get("reason") == "owner-wip" and not forced_review:
                 self.eligible.discard(job["id"])
@@ -450,11 +448,14 @@ class Service:
             previous = latest_reviews.get(identity)
             existing = self.store.job(key)
             if (
-                existing and existing["state"] == "superseded"
+                existing
+                and existing["state"] == "superseded"
                 and identity not in active_reviews
-                and previous and previous["state"] == "superseded"
+                and previous
+                and previous["state"] == "superseded"
                 and not previous["review_attempted"]
-                and previous["error"] in (
+                and previous["error"]
+                in (
                     "linked issue or PR description changed before publication",
                     "discussion changed before publication",
                 )
@@ -927,8 +928,15 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
                 effort,
             )
             return False
-        pr = self.github.pr(job)
-        if pr["state"] != "open" or pr["head"]["sha"] != job["head"]:
+        try:
+            pr = self.github.pr(job)
+            is_current = pr["state"] == "open" and pr["head"]["sha"] == job["head"]
+        except (OSError, ValueError, RuntimeError, KeyError, TypeError) as error:
+            # A failed read must not trap a completed turn in the scheduler.
+            # Continue through the normal bounded review retry path.
+            LOG.warning("model fallback PR lookup failed job=%s: %s", job["id"], error)
+            return False
+        if not is_current:
             return False
         data = json.loads(job["data"])
         data["model_fallback_attempt"] = job["attempts"]
@@ -957,9 +965,7 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
             )
         except Exception:
             self.turns[slot_id] = (turn, job["id"])
-            self.store.update(
-                job["id"], turn_dir=str(turn.directory), error=turn.error
-            )
+            self.store.update(job["id"], turn_dir=str(turn.directory), error=turn.error)
             raise
         self.turns[slot_id] = (replacement, job["id"])
         self.model_recoveries[slot_id] = {
@@ -1204,9 +1210,7 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
                 self.model_fallback_for(slot, job, turn, message) if job else None
             )
             if fallback:
-                fallback_started = self.start_model_fallback(
-                    slot, job, turn, fallback
-                )
+                fallback_started = self.start_model_fallback(slot, job, turn, fallback)
                 if fallback_started:
                     return
             if not turn.completed:
@@ -1339,7 +1343,9 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
                     self.job_dir(job) / f"attempt-{job['attempts']}" / "evidence.json"
                 )
                 if manifest.is_file():
-                    previous_base = json.loads(manifest.read_text()).get("review_base", {})
+                    previous_base = json.loads(manifest.read_text()).get(
+                        "review_base", {}
+                    )
                     base_branch = previous_base.get("branch")
             if base_branch and base_branch != pr["base"]["ref"]:
                 self.replace_unpublished_review(
@@ -2551,7 +2557,8 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
         if args.get("head") != job["head"]:
             raise ValueError("confirm the exact frozen head")
         if (
-            job["error"] != "ambiguous comment creation; remote marker absent; manual reconciliation required"
+            job["error"]
+            != "ambiguous comment creation; remote marker absent; manual reconciliation required"
             or not job["claim_attempted"]
             or job["comment_id"] is not None
             or job["attempts"] != 0
@@ -2561,11 +2568,12 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
             or job["review_event"] is not None
             or job["slot_id"] is not None
             or any(
-                job["id"] in turn_jobs(turn, key)
-                for turn, key in self.turns.values()
+                job["id"] in turn_jobs(turn, key) for turn, key in self.turns.values()
             )
         ):
-            raise ValueError("job has effects or activity outside initial claim recovery")
+            raise ValueError(
+                "job has effects or activity outside initial claim recovery"
+            )
         data = json.loads(job["data"])
         if data.get("paused") or data.get("manual_reconciliation"):
             raise ValueError("job has another operator or publication fence")
@@ -2573,9 +2581,13 @@ This is attempt {attempt} of the SAME logical job; consult earlier attempt artif
         if pr["state"] != "open" or pr["head"]["sha"] != job["head"]:
             raise SourceChanged("PR changed; cannot resume old review")
         if self.github.find_comment(job) is not None:
-            raise ValueError("matching remote claim exists; do not clear the write fence")
+            raise ValueError(
+                "matching remote claim exists; do not clear the write fence"
+            )
         if self.github.find_review(job) is not None:
-            raise ValueError("matching remote review exists; do not clear the write fence")
+            raise ValueError(
+                "matching remote review exists; do not clear the write fence"
+            )
         history = data.setdefault("claim_resolutions", [])
         if not isinstance(history, list):
             raise ValueError("invalid claim resolution history")

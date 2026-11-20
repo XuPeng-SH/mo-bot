@@ -203,7 +203,9 @@ class Workspace:
         )
         if entry is None:
             return None
-        paths = self.git("ls-tree", "-d", "--name-only", base, "--", *roots).splitlines()
+        paths = self.git(
+            "ls-tree", "-d", "--name-only", base, "--", *roots
+        ).splitlines()
         archive = self.git("archive", "--format=tar", base, *paths, binary=True)
         snapshot = directory / "review-policy"
         snapshot.mkdir()
@@ -222,7 +224,10 @@ class Workspace:
                         raise ValueError(f"unexpected policy path {member.name!r}")
                     target = snapshot / relative
                     target.parent.mkdir(parents=True, exist_ok=True)
-                    with tree.extractfile(member) as source, target.open("xb") as output:
+                    with (
+                        tree.extractfile(member) as source,
+                        target.open("xb") as output,
+                    ):
                         shutil.copyfileobj(source, output)
         except (tarfile.TarError, ValueError) as error:
             raise RuntimeError(

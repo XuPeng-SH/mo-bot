@@ -98,12 +98,12 @@ def set_trust(state, selected):
         raise ValueError("entry IDs must be copied exactly from a diagnostic")
     report = diagnose(state)
     available = {
-        item["entry_id"]: item
-        for item in report["blocked"]
-        if item["eligible"]
+        item["entry_id"]: item for item in report["blocked"] if item["eligible"]
     }
     if not set(selected) <= available.keys():
-        raise ValueError("a selected service identity changed; diagnose and review it again")
+        raise ValueError(
+            "a selected service identity changed; diagnose and review it again"
+        )
     entries = [
         {key: available[item][key] for key in inspection.TRUST_FIELDS}
         for item in selected

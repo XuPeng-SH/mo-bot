@@ -353,7 +353,9 @@ def _load_trust(root, uid, proc):
                 or info.st_nlink != 1
                 or info.st_size > MAX_TRUST_BYTES
             ):
-                raise OSError("scratch trust policy has unsafe ownership or permissions")
+                raise OSError(
+                    "scratch trust policy has unsafe ownership or permissions"
+                )
             with os.fdopen(fd, "rb", closefd=False) as stream:
                 raw = stream.read(MAX_TRUST_BYTES + 1)
             if len(raw) > MAX_TRUST_BYTES:

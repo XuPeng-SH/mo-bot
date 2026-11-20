@@ -298,7 +298,7 @@ class Queue:
         fields = []
         for pr in prs:
             number = int(pr["number"])
-            fields.append(f'''p{number}: pullRequest(number: {number}) {{
+            fields.append(f"""p{number}: pullRequest(number: {number}) {{
               headRefOid statusCheckRollup {{ contexts(first: 100) {{
                 pageInfo {{ hasNextPage }}
                 nodes {{ __typename
@@ -306,14 +306,24 @@ class Queue:
                   ... on StatusContext {{ context state updatedAt isRequired(pullRequestNumber: {number}) }}
                 }}
               }} }}
-            }}''')
-        query = 'query($owner:String!, $repo:String!) { repository(owner:$owner,name:$repo) {' + ' '.join(fields) + '} }'
-        payload = self.github.api("graphql", method="POST", body={"query": query, "variables": {"owner": owner, "repo": repo}})
+            }}""")
+        query = (
+            "query($owner:String!, $repo:String!) { repository(owner:$owner,name:$repo) {"
+            + " ".join(fields)
+            + "} }"
+        )
+        payload = self.github.api(
+            "graphql",
+            method="POST",
+            body={"query": query, "variables": {"owner": owner, "repo": repo}},
+        )
         if payload.get("errors"):
-            raise RuntimeError("GitHub required-check discovery returned GraphQL errors")
+            raise RuntimeError(
+                "GitHub required-check discovery returned GraphQL errors"
+            )
         repository = payload["data"]["repository"]
         for pr in prs:
-            detail = repository.get(f'p{int(pr["number"])}')
+            detail = repository.get(f"p{int(pr['number'])}")
             if not detail or detail.get("headRefOid") != pr.get("headRefOid"):
                 pr["statusCheckRollup"] = None
                 continue

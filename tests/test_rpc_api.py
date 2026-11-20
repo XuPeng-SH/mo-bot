@@ -362,8 +362,10 @@ class TestHTTP(unittest.TestCase):
                     "job_id": "wrong",
                 }
                 c.request(
-                    "POST", "/api/jobs/job-A/resolve-review-claim",
-                    json.dumps(recovery), headers,
+                    "POST",
+                    "/api/jobs/job-A/resolve-review-claim",
+                    json.dumps(recovery),
+                    headers,
                 )
                 r = c.getresponse()
                 self.assertEqual(r.status, 200)
